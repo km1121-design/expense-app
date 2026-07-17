@@ -135,6 +135,12 @@
 
       <!-- ===== 個人ダッシュボード ===== -->
       <section class="panel" data-panel="personal">
+        <div class="month-nav">
+          <button id="personalPrev" type="button" class="btn btn--ghost btn--sm">◀</button>
+          <input id="personalMonth" type="month" class="month-input" />
+          <button id="personalNext" type="button" class="btn btn--ghost btn--sm">▶</button>
+          <button id="personalAll" type="button" class="btn btn--ghost btn--sm">全期間</button>
+        </div>
         <div class="stats" id="personalStats"></div>
         <div class="card">
           <div class="card__head">
@@ -185,11 +191,31 @@
 
       <!-- ===== 管理者ダッシュボード ===== -->
       <section class="panel" data-panel="admin">
+        <div class="month-nav">
+          <button id="adminPrev" type="button" class="btn btn--ghost btn--sm">◀</button>
+          <input id="adminMonth" type="month" class="month-input" />
+          <button id="adminNext" type="button" class="btn btn--ghost btn--sm">▶</button>
+          <button id="adminAll" type="button" class="btn btn--ghost btn--sm">全期間</button>
+        </div>
         <div class="stats" id="adminStats"></div>
 
-        <div class="card">
-          <h2 class="card__title">科目別 承認済み金額</h2>
-          <div class="bars" id="adminByCategory"></div>
+        <div class="grid grid--charts">
+          <div class="card">
+            <div class="card__head">
+              <h2 class="card__title" id="adminGroupTitle">グループ別 承認済み金額</h2>
+              <select id="adminGroupBy" class="mini-select">
+                <option value="category">区分（科目）別</option>
+                <option value="department">事業部別</option>
+                <option value="applicant">スタッフ別</option>
+              </select>
+            </div>
+            <div class="bars" id="adminByGroup"></div>
+          </div>
+
+          <div class="card">
+            <h2 class="card__title">月次推移（承認済み金額・直近6ヶ月）</h2>
+            <div class="bars" id="adminTrend"></div>
+          </div>
         </div>
 
         <div class="card">
@@ -203,6 +229,14 @@
                 <option value="approved">承認済み</option>
                 <option value="rejected">却下</option>
               </select>
+              <select id="adminSort" class="mini-select">
+                <option value="date_desc">日付（新しい順）</option>
+                <option value="date_asc">日付（古い順）</option>
+                <option value="amount_desc">金額（大きい順）</option>
+                <option value="applicant">スタッフ順</option>
+                <option value="department">事業部順</option>
+                <option value="category">区分（科目）順</option>
+              </select>
               <button id="csvBtn" type="button" class="btn btn--ghost btn--sm">
                 CSV書き出し
               </button>
@@ -213,6 +247,7 @@
               <thead>
                 <tr>
                   <th>申請者</th>
+                  <th>事業部</th>
                   <th>日付</th>
                   <th>科目</th>
                   <th>支払先</th>
@@ -241,6 +276,7 @@
                 <tr>
                   <th>ユーザーID</th>
                   <th>表示名</th>
+                  <th>事業部</th>
                   <th>権限</th>
                   <th>状態</th>
                   <th>操作</th>
@@ -259,6 +295,10 @@
             <div class="form__row">
               <label for="nuDisplayName">表示名</label>
               <input id="nuDisplayName" type="text" required />
+            </div>
+            <div class="form__row">
+              <label for="nuDept">事業部</label>
+              <input id="nuDept" type="text" placeholder="例：運送事業部" />
             </div>
             <div class="form__row">
               <label for="nuPassword">初期パスワード（8文字以上）</label>

@@ -27,6 +27,9 @@ const state = {
   config: { endpoint: "" },
   session: null, // { token, user:{username,displayName,role} }
   authEnabled: false,
+  autoApprove: false, // クラウド側の自動承認モード
+  personalMonth: "", // "yyyy-MM" または "all"
+  adminMonth: "",
   syncStatus: "local",
 };
 
@@ -119,11 +122,26 @@ function normalizeDateStr(v) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+/* ---------- 月表示ヘルパー ---------- */
+function currentMonth() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function shiftMonth(m, delta) {
+  const [y, mo] = m.split("-").map(Number);
+  const d = new Date(y, mo - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function inMonth(e, m) {
+  return m === "all" || (e.date || "").startsWith(m);
+}
+
 function normalizeRecord(r) {
   return {
     id: r.id,
     applicant: r.applicant || "",
     applicantId: r.applicantId || "",
+    department: r.department || "",
     date: normalizeDateStr(r.date),
     category: r.category || "",
     vendor: r.vendor || "",
@@ -397,11 +415,15 @@ function renderUsers(users) {
       <tr>
         <td>${escapeHtml(u.username)}</td>
         <td>${escapeHtml(u.displayName)}</td>
+        <td>${escapeHtml(u.department || "—")}</td>
         <td><span class="role-badge ${u.role === "admin" ? "" : "is-user"}">${
             u.role === "admin" ? "管理者" : "一般"
           }</span></td>
         <td>${u.active ? "有効" : '<span style="color:var(--red)">無効</span>'}</td>
         <td>
+          <button class="btn btn--ghost btn--sm" data-user-dept="${escapeHtml(
+            u.username
+          )}" data-dept="${escapeHtml(u.department || "")}">事業部変更</button>
           ${
             u.username === me
               ? '<span class="empty" style="padding:0">（自分）</span>'
@@ -416,7 +438,7 @@ function renderUsers(users) {
       </tr>`
         )
         .join("")
-    : `<tr><td colspan="5" class="empty">ユーザーがいません。</td></tr>`;
+    : `<tr><td colspan="6" class="empty">ユーザーがいません。</td></tr>`;
 }
 
 async function handleUserAdd(evt) {
@@ -427,6 +449,7 @@ async function handleUserAdd(evt) {
       user: {
         username: $("#nuUsername").value.trim(),
         displayName: $("#nuDisplayName").value.trim(),
+        department: $("#nuDept").value.trim(),
         password: $("#nuPassword").value,
         role: $("#nuRole").value,
       },
@@ -443,8 +466,16 @@ async function handleUserAdd(evt) {
 async function handleUserTableClick(e) {
   const toggle = e.target.closest("[data-user-toggle]");
   const pw = e.target.closest("[data-user-pw]");
+  const dept = e.target.closest("[data-user-dept]");
   try {
-    if (toggle) {
+    if (dept) {
+      const username = dept.dataset.userDept;
+      const next = window.prompt(`${username} の事業部`, dept.dataset.dept || "");
+      if (next === null) return;
+      await apiPost({ action: "upsertUser", user: { username, department: next.trim() } });
+      toast("事業部を更新しました（以降の申請から反映）");
+      await loadUsers();
+    } else if (toggle) {
       const username = toggle.dataset.userToggle;
       const nowActive = toggle.dataset.active === "true";
       if (!window.confirm(`${username} を${nowActive ? "無効化" : "有効化"}しますか？`)) return;
@@ -700,7 +731,11 @@ async function submitExpense(evt) {
       try {
         await apiPost({ action: "create", record });
         await refreshFromCloud();
-        toast("申請を保存しました（スプレッドシート／ドライブへ同期）");
+        toast(
+          state.autoApprove
+            ? "申請を保存しました（自動承認済み）"
+            : "申請を保存しました（スプレッドシート／ドライブへ同期）"
+        );
       } catch (err) {
         if (err instanceof AuthError) {
           handleAuthError();
@@ -757,9 +792,22 @@ function myExpenses() {
   return state.expenses.filter((e) => e.applicant === state.currentUser);
 }
 
+/** 月ナビUIを状態に同期 */
+function syncMonthNav(prefix, month) {
+  const input = $(`#${prefix}Month`);
+  const allBtn = $(`#${prefix}All`);
+  input.value = month === "all" ? "" : month;
+  allBtn.classList.toggle("is-on", month === "all");
+}
+
 function renderPersonal() {
+  if (!state.personalMonth) state.personalMonth = currentMonth();
+  syncMonthNav("personal", state.personalMonth);
+
   const identified = cloudEnabled() ? !!state.session : !!state.currentUser;
-  const mine = identified ? myExpenses() : [];
+  const mine = identified
+    ? myExpenses().filter((e) => inMonth(e, state.personalMonth))
+    : [];
 
   const sum = (arr) => arr.reduce((t, e) => t + e.amount, 0);
   const pending = mine.filter((e) => e.status === "pending");
@@ -811,48 +859,110 @@ function renderPersonal() {
     .join("");
 }
 
+/** バー横棒グラフのHTML（[ラベル, 金額] の配列から） */
+function barsHtml(entries, emptyMsg) {
+  if (!entries.length) return `<p class="empty">${escapeHtml(emptyMsg)}</p>`;
+  const max = Math.max(...entries.map(([, v]) => v));
+  return entries
+    .map(
+      ([label, val]) => `
+    <div class="bar-row">
+      <span>${escapeHtml(label)}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${
+        max ? (val / max) * 100 : 0
+      }%"></div></div>
+      <span class="bar-val">${yen(val)}</span>
+    </div>`
+    )
+    .join("");
+}
+
+const GROUP_LABEL = {
+  category: "区分（科目）別",
+  department: "事業部別",
+  applicant: "スタッフ別",
+};
+
 function renderAdmin() {
+  if (!state.adminMonth) state.adminMonth = currentMonth();
+  syncMonthNav("admin", state.adminMonth);
+
   const all = state.expenses;
+  const monthRecs = all.filter((e) => inMonth(e, state.adminMonth));
   const sum = (arr) => arr.reduce((t, e) => t + e.amount, 0);
-  const pending = all.filter((e) => e.status === "pending");
-  const approved = all.filter((e) => e.status === "approved");
+  const pending = monthRecs.filter((e) => e.status === "pending");
+  const approved = monthRecs.filter((e) => e.status === "approved");
 
   $("#adminStats").innerHTML = [
-    statCard("総申請件数", all.length + " 件"),
+    statCard("申請件数", monthRecs.length + " 件"),
     statCard("承認待ち", pending.length + " 件", "is-accent"),
     statCard("承認待ち金額", yen(sum(pending)), "is-accent"),
     statCard("承認済み金額", yen(sum(approved)), "is-green"),
   ].join("");
 
-  const byCat = {};
-  for (const e of approved) byCat[e.category] = (byCat[e.category] || 0) + e.amount;
-  const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
-  const max = cats.length ? cats[0][1] : 0;
-  $("#adminByCategory").innerHTML = cats.length
-    ? cats
-        .map(
-          ([cat, val]) => `
-      <div class="bar-row">
-        <span>${escapeHtml(cat)}</span>
-        <div class="bar-track"><div class="bar-fill" style="width:${
-          max ? (val / max) * 100 : 0
-        }%"></div></div>
-        <span class="bar-val">${yen(val)}</span>
-      </div>`
-        )
-        .join("")
-    : `<p class="empty">承認済みの経費はまだありません。</p>`;
+  // グループ別集計（表示中の月の承認済み金額）
+  const groupBy = $("#adminGroupBy").value;
+  $("#adminGroupTitle").textContent = GROUP_LABEL[groupBy] + " 承認済み金額";
+  const byGroup = {};
+  for (const e of approved) {
+    const key = (e[groupBy] || "未設定").trim() || "未設定";
+    byGroup[key] = (byGroup[key] || 0) + e.amount;
+  }
+  $("#adminByGroup").innerHTML = barsHtml(
+    Object.entries(byGroup).sort((a, b) => b[1] - a[1]),
+    "承認済みの経費はまだありません。"
+  );
 
+  // 月次推移（直近6ヶ月・全データの承認済み金額）
+  const months = [];
+  let m = currentMonth();
+  for (let i = 5; i >= 0; i--) months.push(shiftMonth(m, -i));
+  const trend = months.map((mo) => [
+    mo.replace("-", "/"),
+    sum(all.filter((e) => e.status === "approved" && inMonth(e, mo))),
+  ]);
+  $("#adminTrend").innerHTML = barsHtml(trend, "データがありません。");
+
+  // 一覧（検索・状態フィルタ・ソート）
   const q = $("#adminSearch").value.trim().toLowerCase();
   const sf = $("#adminStatusFilter").value;
-  const rows = all.filter((e) => {
+  let rows = monthRecs.filter((e) => {
     const matchQ =
       !q ||
       e.applicant.toLowerCase().includes(q) ||
-      (e.vendor || "").toLowerCase().includes(q);
+      (e.vendor || "").toLowerCase().includes(q) ||
+      (e.department || "").toLowerCase().includes(q);
     const matchS = sf === "all" || e.status === sf;
     return matchQ && matchS;
   });
+
+  const sortKey = $("#adminSort").value;
+  const cmp = {
+    date_desc: (a, b) => (b.date || "").localeCompare(a.date || ""),
+    date_asc: (a, b) => (a.date || "").localeCompare(b.date || ""),
+    amount_desc: (a, b) => b.amount - a.amount,
+    applicant: (a, b) =>
+      a.applicant.localeCompare(b.applicant, "ja") ||
+      (b.date || "").localeCompare(a.date || ""),
+    department: (a, b) =>
+      (a.department || "").localeCompare(b.department || "", "ja") ||
+      (b.date || "").localeCompare(a.date || ""),
+    category: (a, b) =>
+      a.category.localeCompare(b.category, "ja") ||
+      (b.date || "").localeCompare(a.date || ""),
+  }[sortKey];
+  if (cmp) rows = rows.slice().sort(cmp);
+
+  // 操作列: 自動承認モードでは削除のみ、フローモードでは承認/却下/差戻＋削除
+  const flowMode = !(cloudEnabled() && state.autoApprove);
+  const ops = (e) => {
+    const del = `<button class="btn btn--ghost btn--sm btn--reject" data-remove="${e.id}">削除</button>`;
+    if (!flowMode) return del;
+    return e.status === "pending"
+      ? `<button class="btn btn--sm btn--approve" data-approve="${e.id}">承認</button>
+         <button class="btn btn--sm btn--reject" data-reject="${e.id}">却下</button> ${del}`
+      : `<button class="btn btn--ghost btn--sm" data-reset="${e.id}">差戻</button> ${del}`;
+  };
 
   const tbody = $("#adminTable tbody");
   tbody.innerHTML = rows.length
@@ -861,22 +971,18 @@ function renderAdmin() {
           (e) => `
       <tr>
         <td>${escapeHtml(e.applicant)}</td>
+        <td>${escapeHtml(e.department || "—")}</td>
         <td>${escapeHtml(e.date)}</td>
         <td>${escapeHtml(e.category)}</td>
         <td>${escapeHtml(e.vendor || "—")}</td>
         <td class="num">${yen(e.amount)}</td>
         <td>${receiptCell(e)}</td>
         <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
-        <td>${
-          e.status === "pending"
-            ? `<button class="btn btn--sm btn--approve" data-approve="${e.id}">承認</button>
-               <button class="btn btn--sm btn--reject" data-reject="${e.id}">却下</button>`
-            : `<button class="btn btn--ghost btn--sm" data-reset="${e.id}">差戻</button>`
-        }</td>
+        <td>${ops(e)}</td>
       </tr>`
         )
         .join("")
-    : `<tr><td colspan="8" class="empty">該当する申請はありません。</td></tr>`;
+    : `<tr><td colspan="9" class="empty">該当する申請はありません。</td></tr>`;
 }
 
 function render() {
@@ -982,9 +1088,9 @@ async function deleteExpense(id) {
 
 function exportCsv() {
   const cols = [
-    "id", "createdAt", "applicant", "applicantId", "date", "category",
-    "vendor", "amount", "description", "status", "reviewedAt", "reviewer",
-    "reviewComment", "imageUrl",
+    "id", "createdAt", "applicant", "applicantId", "department", "date",
+    "category", "vendor", "amount", "description", "status", "reviewedAt",
+    "reviewer", "reviewComment", "imageUrl",
   ];
   const esc = (v) => {
     const s = v == null ? "" : String(v);
@@ -1082,6 +1188,7 @@ async function initMode() {
   try {
     const st = await apiPost({ action: "status", token: "" });
     state.authEnabled = !!st.authEnabled;
+    state.autoApprove = !!st.autoApprove;
 
     if (!state.authEnabled) {
       // 初期設定（最初の管理者作成）が必要
@@ -1198,10 +1305,40 @@ function init() {
     const a = e.target.closest("[data-approve]");
     const r = e.target.closest("[data-reject]");
     const rs = e.target.closest("[data-reset]");
+    const rm = e.target.closest("[data-remove]");
     if (a) approve(a.dataset.approve);
     else if (r) reject(r.dataset.reject);
     else if (rs) resetStatus(rs.dataset.reset);
+    else if (rm) deleteExpense(rm.dataset.remove);
   });
+
+  // 月ナビ（個人・管理者）
+  const bindMonthNav = (prefix, key, rerender) => {
+    $(`#${prefix}Prev`).addEventListener("click", () => {
+      const cur = state[key] === "all" ? currentMonth() : state[key];
+      state[key] = shiftMonth(cur, -1);
+      rerender();
+    });
+    $(`#${prefix}Next`).addEventListener("click", () => {
+      const cur = state[key] === "all" ? currentMonth() : state[key];
+      state[key] = shiftMonth(cur, 1);
+      rerender();
+    });
+    $(`#${prefix}Month`).addEventListener("change", (e) => {
+      state[key] = e.target.value || currentMonth();
+      rerender();
+    });
+    $(`#${prefix}All`).addEventListener("click", () => {
+      state[key] = state[key] === "all" ? currentMonth() : "all";
+      rerender();
+    });
+  };
+  bindMonthNav("personal", "personalMonth", renderPersonal);
+  bindMonthNav("admin", "adminMonth", renderAdmin);
+
+  // グループ別集計・ソート
+  $("#adminGroupBy").addEventListener("change", renderAdmin);
+  $("#adminSort").addEventListener("change", renderAdmin);
 
   // 設定モーダル
   $("#settingsBtn").addEventListener("click", openSettings);

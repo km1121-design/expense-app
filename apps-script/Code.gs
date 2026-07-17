@@ -40,6 +40,7 @@ const HEADERS = [
   "imageUrl",
   "imageFileId",
   "applicantId",
+  "department",
 ];
 
 const USERS_SHEET = "users";
@@ -51,12 +52,21 @@ const USER_HEADERS = [
   "role",
   "active",
   "createdAt",
+  "department",
 ];
 
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
 
 function getProp_(key) {
   return PropertiesService.getScriptProperties().getProperty(key);
+}
+
+/**
+ * 自動承認モード。既定は有効（申請は即 approved になる）。
+ * 承認フローを復活させる場合はスクリプトプロパティ AUTO_APPROVE を "false" に設定。
+ */
+function isAutoApprove_() {
+  return getProp_("AUTO_APPROVE") !== "false";
 }
 
 /* ========================= ストレージ ========================= */
@@ -239,7 +249,7 @@ function validatePassword_(password) {
   }
 }
 
-function createUserRow_(username, displayName, password, role) {
+function createUserRow_(username, displayName, password, role, department) {
   validateUsername_(username);
   validatePassword_(password);
   if (findUser_(username)) throw new Error("そのユーザーIDは既に存在します");
@@ -252,6 +262,7 @@ function createUserRow_(username, displayName, password, role) {
     role === "admin" ? "admin" : "user",
     true,
     new Date().toISOString(),
+    department || "",
   ]);
 }
 
@@ -262,6 +273,7 @@ function publicUser_(u) {
     role: String(u.role || "user"),
     active: !(u.active === false || String(u.active) === "false"),
     createdAt: String(u.createdAt || ""),
+    department: String(u.department || ""),
   };
 }
 
@@ -269,7 +281,7 @@ function publicUser_(u) {
 
 function actionSetup_(body) {
   if (usersExist_()) throw new Error("既に管理者が設定されています");
-  createUserRow_(body.username, body.displayName, body.password, "admin");
+  createUserRow_(body.username, body.displayName, body.password, "admin", body.department);
   const user = publicUser_(findUser_(body.username));
   return { ok: true, token: issueToken_(user), user: user };
 }
@@ -318,7 +330,7 @@ function actionUpsertUser_(body) {
   const u = body.user || {};
   const existing = findUser_(u.username);
   if (!existing) {
-    createUserRow_(u.username, u.displayName, u.password, u.role);
+    createUserRow_(u.username, u.displayName, u.password, u.role, u.department);
     return { ok: true, created: true };
   }
   const sheet = getUsersSheet_();
@@ -326,6 +338,7 @@ function actionUpsertUser_(body) {
     sheet.getRange(existing._row, USER_HEADERS.indexOf(col) + 1).setValue(val);
   };
   if (u.displayName != null) set("displayName", u.displayName);
+  if (u.department != null) set("department", u.department);
   if (u.role != null) set("role", u.role === "admin" ? "admin" : "user");
   if (u.active != null) {
     // 自分自身の無効化・降格による締め出しを防止
@@ -430,7 +443,11 @@ function doPost(e) {
     switch (body.action) {
       // ---- 認証（トークン不要） ----
       case "status":
-        return json_({ ok: true, authEnabled: usersExist_() });
+        return json_({
+          ok: true,
+          authEnabled: usersExist_(),
+          autoApprove: isAutoApprove_(),
+        });
       case "setup":
         return json_(actionSetup_(body));
       case "login":
@@ -488,13 +505,20 @@ function createExpense_(record, user) {
     imageFileId = file.getId();
     imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
   }
-  // 認証有効時は申請者名をサーバー側で強制（なりすまし防止）
+  // 認証有効時は申請者名・事業部をサーバー側で強制（なりすまし防止）
   const applicant = user.legacy
     ? String(record.applicant || "")
     : user.displayName;
   const applicantId = user.legacy
     ? String(record.applicantId || record.applicant || "")
     : user.username;
+  let department = String(record.department || "");
+  if (!user.legacy) {
+    const profile = findUser_(user.username);
+    department = String((profile && profile.department) || "");
+  }
+  // 自動承認モードでは申請と同時に承認済みにする
+  const auto = isAutoApprove_();
   const rec = {
     id: record.id,
     createdAt: record.createdAt || new Date().toISOString(),
@@ -504,13 +528,14 @@ function createExpense_(record, user) {
     vendor: record.vendor || "",
     amount: Number(record.amount) || 0,
     description: record.description || "",
-    status: "pending",
-    reviewedAt: "",
-    reviewer: "",
+    status: auto ? "approved" : "pending",
+    reviewedAt: auto ? new Date().toISOString() : "",
+    reviewer: auto ? "自動承認" : "",
     reviewComment: "",
     imageUrl: imageUrl,
     imageFileId: imageFileId,
     applicantId: applicantId,
+    department: department,
   };
   sheet.appendRow(
     HEADERS.map(function (h) {

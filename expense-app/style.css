@@ -180,10 +180,41 @@ body {
 .grid--apply {
   grid-template-columns: 1fr 1fr;
 }
+.grid--charts {
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 0;
+}
+.grid--charts .card {
+  margin-bottom: 20px;
+}
 @media (max-width: 860px) {
-  .grid--apply {
+  .grid--apply,
+  .grid--charts {
     grid-template-columns: 1fr;
   }
+}
+
+/* ===== Month nav ===== */
+.month-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.month-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 0.9rem;
+  font-family: inherit;
+}
+.month-nav .btn.is-on {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  background: var(--accent-soft);
 }
 
 /* ===== Card ===== */
