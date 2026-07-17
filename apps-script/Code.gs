@@ -9,8 +9,10 @@
  * デプロイ手順は apps-script/README.md を参照。
  *
  * スクリプトプロパティ（プロジェクトの設定 > スクリプト プロパティ）で上書き可能:
- *   SPREADSHEET_ID  : 保存先スプレッドシートID（未設定ならバインド先／新規作成）
- *   DRIVE_FOLDER_ID : 領収書画像の保存先フォルダID（未設定なら「経費領収書」を自動作成）
+ *   SPREADSHEET_ID  : 保存先スプレッドシートID（未設定なら初回に「経費申請データ」を
+ *                     自動作成し、そのIDをここへ自動保存して以降再利用）
+ *   DRIVE_FOLDER_ID : 領収書画像の保存先フォルダID（未設定なら「経費領収書」を
+ *                     自動作成・自動保存して以降再利用）
  *   SHARED_TOKEN    : 共有トークン（設定時はリクエストの token と一致必須）
  */
 
@@ -37,11 +39,19 @@ function getProp_(key) {
 }
 
 function getSheet_() {
-  const id = getProp_("SPREADSHEET_ID");
-  const ss = id
-    ? SpreadsheetApp.openById(id)
-    : SpreadsheetApp.getActiveSpreadsheet() ||
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty("SPREADSHEET_ID");
+  let ss;
+  if (id) {
+    ss = SpreadsheetApp.openById(id);
+  } else {
+    // スタンドアロン型では getActiveSpreadsheet() が null になるため、
+    // 初回に作成したスプレッドシートのIDを保存し、以降は必ず同じものを使う
+    ss =
+      SpreadsheetApp.getActiveSpreadsheet() ||
       SpreadsheetApp.create("経費申請データ");
+    props.setProperty("SPREADSHEET_ID", ss.getId());
+  }
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(SHEET_NAME);
   if (sheet.getLastRow() === 0) {
@@ -52,11 +62,14 @@ function getSheet_() {
 }
 
 function getFolder_() {
-  const id = getProp_("DRIVE_FOLDER_ID");
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty("DRIVE_FOLDER_ID");
   if (id) return DriveApp.getFolderById(id);
   const name = "経費領収書";
   const it = DriveApp.getFoldersByName(name);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  const folder = it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  props.setProperty("DRIVE_FOLDER_ID", folder.getId());
+  return folder;
 }
 
 function checkToken_(token) {
