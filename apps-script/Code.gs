@@ -83,6 +83,17 @@ function json_(obj) {
   );
 }
 
+/** シートが自動変換した Date 型を文字列へ戻す（date 列は yyyy-MM-dd） */
+function normalizeValue_(header, value) {
+  if (value instanceof Date) {
+    if (header === "date") {
+      return Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    }
+    return value.toISOString();
+  }
+  return value;
+}
+
 function rowsToRecords_(sheet) {
   const values = sheet.getDataRange().getValues();
   if (values.length < 2) return [];
@@ -92,7 +103,7 @@ function rowsToRecords_(sheet) {
     const row = values[i];
     if (!row[0]) continue;
     const rec = {};
-    head.forEach((h, j) => (rec[h] = row[j]));
+    head.forEach((h, j) => (rec[h] = normalizeValue_(h, row[j])));
     rec.amount = Number(rec.amount) || 0;
     records.push(rec);
   }
@@ -202,4 +213,45 @@ function deleteExpense_(id) {
   }
   sheet.deleteRow(row);
   return { ok: true };
+}
+
+/**
+ * メンテナンス用：エディタから手動実行する（デプロイ不要）。
+ * 正本（SPREADSHEET_ID に保存されたもの）以外の「経費申請データ」と、
+ * 領収書フォルダ内の動作検証用テスト画像（e-verify-test*）をゴミ箱へ移動する。
+ * 実行前に getSheet_() を一度でも通っていること（= SPREADSHEET_ID が保存済み）。
+ */
+function cleanupStrayFiles() {
+  const keepId = getProp_("SPREADSHEET_ID");
+  if (!keepId) throw new Error("SPREADSHEET_ID が未保存です。先に一度アプリ／doGet を実行してください。");
+  let trashed = [];
+
+  const files = DriveApp.getFilesByName("経費申請データ");
+  while (files.hasNext()) {
+    const f = files.next();
+    if (
+      f.getId() !== keepId &&
+      f.getMimeType() === "application/vnd.google-apps.spreadsheet" &&
+      !f.isTrashed()
+    ) {
+      f.setTrashed(true);
+      trashed.push("スプレッドシート: " + f.getId());
+    }
+  }
+
+  try {
+    const folderFiles = getFolder_().getFiles();
+    while (folderFiles.hasNext()) {
+      const f = folderFiles.next();
+      if (f.getName().indexOf("e-verify-test") === 0 && !f.isTrashed()) {
+        f.setTrashed(true);
+        trashed.push("テスト画像: " + f.getName());
+      }
+    }
+  } catch (err) {
+    trashed.push("(フォルダ走査でエラー: " + err + ")");
+  }
+
+  Logger.log("ゴミ箱へ移動 %s 件:\n%s", trashed.length, trashed.join("\n"));
+  return trashed;
 }

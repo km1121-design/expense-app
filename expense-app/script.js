@@ -99,11 +99,22 @@ function toast(msg) {
   toastTimer = setTimeout(() => (el.hidden = true), 3200);
 }
 
+/** シート由来のISO日時文字列を yyyy-MM-dd へ整形（既に日付形式ならそのまま） */
+function normalizeDateStr(v) {
+  if (!v) return "";
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 function normalizeRecord(r) {
   return {
     id: r.id,
     applicant: r.applicant || "",
-    date: r.date || "",
+    date: normalizeDateStr(r.date),
     category: r.category || "",
     vendor: r.vendor || "",
     amount: Number(r.amount) || 0,
