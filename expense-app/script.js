@@ -25,7 +25,8 @@ const state = {
   lastImageThumb: null,
   lastImageFile: null,
   config: { endpoint: "" },
-  session: null, // { token, user:{username,displayName,role} }
+  session: null, // { token, user:{username,displayName,role,department} }
+  departments: [], // 登録済み事業部の一覧（申請フォームの候補）
   authEnabled: false,
   autoApprove: false, // クラウド側の自動承認モード
   personalMonth: "", // "yyyy-MM" または "all"
@@ -297,12 +298,25 @@ function applySessionUI() {
   }
 }
 
+/** 申請フォームの事業部候補と既定値を反映 */
+function applyDeptUI() {
+  const dl = $("#deptList");
+  dl.innerHTML = state.departments
+    .map((d) => `<option value="${escapeHtml(d)}"></option>`)
+    .join("");
+  const input = $("#expDept");
+  input.value =
+    cloudEnabled() && state.session ? state.session.user.department || "" : "";
+}
+
 function setSessionFromResponse(data) {
   state.session = { token: data.token, user: data.user };
   saveSession();
+  if (data.departments) state.departments = data.departments;
   state.isAdmin = data.user.role === "admin";
   syncAdminUI();
   applySessionUI();
+  applyDeptUI();
 }
 
 function handleAuthError() {
@@ -702,6 +716,8 @@ async function submitExpense(evt) {
       : state.currentUser,
     date: $("#expDate").value,
     category: $("#expCategory").value,
+    // 空の場合はサーバー側でプロフィールの事業部が入る
+    department: $("#expDept").value.trim(),
     vendor: $("#expVendor").value.trim(),
     amount,
     description: $("#expDesc").value.trim(),
@@ -754,6 +770,7 @@ async function submitExpense(evt) {
     }
     $("#expenseForm").reset();
     $("#expDate").valueAsDate = new Date();
+    applyDeptUI(); // 事業部の既定値を再設定
     clearImage();
     render();
   } finally {
@@ -849,11 +866,7 @@ function renderPersonal() {
       <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
       <td>${receiptCell(e)}</td>
       <td>${escapeHtml(e.reviewComment || "")}</td>
-      <td>${
-        e.status === "pending"
-          ? `<button class="btn btn--ghost btn--sm" data-del="${e.id}">取消</button>`
-          : ""
-      }</td>
+      <td><button class="btn btn--ghost btn--sm" data-del="${e.id}">取消</button></td>
     </tr>`
     )
     .join("");
@@ -1179,6 +1192,7 @@ async function initMode() {
     loadCache();
     setSync("local");
     syncAdminUI();
+    applyDeptUI();
     render();
     return;
   }
@@ -1203,9 +1217,11 @@ async function initMode() {
         const me = await apiPost({ action: "me" });
         state.session.user = me.user;
         saveSession();
+        if (me.departments) state.departments = me.departments;
         state.isAdmin = me.user.role === "admin";
         syncAdminUI();
         applySessionUI();
+        applyDeptUI();
         hideAuthOverlay();
         await refreshFromCloud();
         return;

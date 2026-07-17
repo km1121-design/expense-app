@@ -60,11 +60,12 @@
       <section class="panel is-active" data-panel="apply">
         <div class="grid grid--apply">
           <div class="card">
-            <h2 class="card__title">レシート画像から自動入力</h2>
+            <h2 class="card__title">レシート画像から自動入力（任意）</h2>
             <p class="card__hint">
               レシートや領収書の写真をアップロードすると、画像を端末内で解析して
               金額・日付・店名を自動で読み取ります。クラウド連携が有効な場合、申請時に
               画像は Google ドライブへ、内容はスプレッドシートへ保存されます。
+              <strong>領収書がない場合は、画像なしのまま右のフォームだけで申請できます。</strong>
             </p>
 
             <label class="dropzone" id="dropzone">
@@ -111,6 +112,16 @@
                   <option value="宿泊費">宿泊費</option>
                   <option value="その他">その他</option>
                 </select>
+              </div>
+              <div class="form__row">
+                <label for="expDept">事業部</label>
+                <input
+                  id="expDept"
+                  type="text"
+                  list="deptList"
+                  placeholder="未入力の場合は自分の所属事業部"
+                />
+                <datalist id="deptList"></datalist>
               </div>
               <div class="form__row">
                 <label for="expVendor">支払先 / 店名</label>

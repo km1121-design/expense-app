@@ -279,11 +279,26 @@ function publicUser_(u) {
 
 /* --------- 認証系アクション --------- */
 
+/** 登録ユーザーの事業部一覧（重複なし・空を除く） */
+function listDepartments_() {
+  const set = {};
+  readUsers_().forEach(function (u) {
+    const d = String(u.department || "").trim();
+    if (d) set[d] = true;
+  });
+  return Object.keys(set).sort();
+}
+
 function actionSetup_(body) {
   if (usersExist_()) throw new Error("既に管理者が設定されています");
   createUserRow_(body.username, body.displayName, body.password, "admin", body.department);
   const user = publicUser_(findUser_(body.username));
-  return { ok: true, token: issueToken_(user), user: user };
+  return {
+    ok: true,
+    token: issueToken_(user),
+    user: user,
+    departments: listDepartments_(),
+  };
 }
 
 function actionLogin_(body) {
@@ -297,7 +312,12 @@ function actionLogin_(body) {
     throw new Error("ユーザーIDまたはパスワードが違います");
   }
   const user = publicUser_(rec);
-  return { ok: true, token: issueToken_(user), user: user };
+  return {
+    ok: true,
+    token: issueToken_(user),
+    user: user,
+    departments: listDepartments_(),
+  };
 }
 
 function actionChangePassword_(body) {
@@ -455,9 +475,16 @@ function doPost(e) {
       // ---- 認証（トークン必要） ----
       case "me": {
         const u = requireUser_(body.token, false);
+        const profile = u.legacy ? null : findUser_(u.username);
         return json_({
           ok: true,
-          user: { username: u.username, displayName: u.displayName, role: u.role },
+          user: {
+            username: u.username,
+            displayName: u.displayName,
+            role: u.role,
+            department: String((profile && profile.department) || ""),
+          },
+          departments: listDepartments_(),
         });
       }
       case "changePassword":
@@ -512,8 +539,9 @@ function createExpense_(record, user) {
   const applicantId = user.legacy
     ? String(record.applicantId || record.applicant || "")
     : user.username;
-  let department = String(record.department || "");
-  if (!user.legacy) {
+  // 事業部: 申請時に指定があればそれを優先、なければプロフィールの既定値
+  let department = String(record.department || "").trim();
+  if (!user.legacy && !department) {
     const profile = findUser_(user.username);
     department = String((profile && profile.department) || "");
   }
@@ -564,15 +592,12 @@ function deleteExpense_(id, user) {
   const sheet = getSheet_();
   const row = findRow_(sheet, id);
   if (row < 0) return { ok: false, error: "not found" };
-  // 一般ユーザーは「自分の申請」かつ「申請中」のみ取消可能
+  // 一般ユーザーは「自分の申請」のみ取消可能（状態は問わない＝ミス時の自己取消）
   if (!user.legacy && user.role !== "admin") {
     const applicantId = String(
       sheet.getRange(row, HEADERS.indexOf("applicantId") + 1).getValue()
     );
-    const status = String(
-      sheet.getRange(row, HEADERS.indexOf("status") + 1).getValue()
-    );
-    if (applicantId !== user.username || status !== "pending") {
+    if (applicantId !== user.username) {
       throw new Error("forbidden");
     }
   }
