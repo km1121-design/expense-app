@@ -36,8 +36,13 @@ docs/           仕様書
 - バックエンド構築: [`apps-script/README.md`](apps-script/README.md)
 - アプリ詳細: [`expense-app/README.md`](expense-app/README.md)
 
-## デプロイ（任意）
+## デプロイ
 
-静的サイトのため、任意の静的ホスティングで公開できます。GitHub Pages を使う場合は
-リポジトリの Settings → Pages で公開設定してください（private リポジトリの Pages は
-対応プランが必要です）。`expense-app/` 配下をサイトルートとして配信します。
+`.github/workflows/deploy-pages.yml` により、`main` への push で GitHub Pages へ
+自動デプロイされます（`expense-app/` 配下をサイトルートとして配信）。
+
+- 公開URL: `https://km1121-design.github.io/expense-app/`
+- Public リポジトリならそのまま利用できます。Private の場合は GitHub Pages が
+  対応プランに限られるため、Public にするか対応プランで有効化してください。
+- 静的サイトのため、任意の静的ホスティングや `expense-app/index.html` を直接開いても
+  動作します。
