@@ -3,53 +3,62 @@
 /* =========================================================================
  * 経費申請アプリ
  *
- * 保存方式:
- *   - クラウド連携ON（設定でWebアプリURLを指定）:
- *       申請データ → Googleスプレッドシート（DB）
- *       領収書画像 → Google ドライブ
- *       スプレッドシートを正とし、localStorage は読み取りキャッシュ／
- *       オフライン時の再送信キューとして使用
- *   - クラウド連携OFF（未設定）: この端末の localStorage にのみ保存
+ * モード:
+ *   - クラウドモード（⚙️でWebアプリURLを設定）:
+ *       ログイン必須。申請データ → Googleスプレッドシート、領収書画像 → ドライブ。
+ *       権限: user = 自分の申請のみ / admin = 全件・承認・ユーザー管理。
+ *       localStorage は読み取りキャッシュ／オフライン時の再送信キュー。
+ *   - ローカルモード（未設定）: 認証なしの試用モード。この端末にのみ保存。
  * ========================================================================= */
 
 const STORE_KEY = "expense-app:expenses"; // ローカルキャッシュ
-const USER_KEY = "expense-app:currentUser";
+const USER_KEY = "expense-app:currentUser"; // ローカルモードの氏名
 const CONFIG_KEY = "expense-app:config";
 const QUEUE_KEY = "expense-app:queue"; // 未同期の作成申請
-
-/** @typedef {{
- *   id:string, applicant:string, date:string, category:string, vendor:string,
- *   amount:number, description:string, imageThumb?:string|null,
- *   imageUrl?:string, imageFileId?:string,
- *   status:'pending'|'approved'|'rejected', createdAt:string,
- *   reviewedAt:string|null, reviewer:string|null, reviewComment:string|null
- * }} Expense */
+const SESSION_KEY = "expense-app:session"; // クラウドモードのセッション
 
 const state = {
-  /** @type {Expense[]} */
   expenses: [],
-  currentUser: "",
+  currentUser: "", // ローカルモードの氏名
   isAdmin: false,
   activeTab: "apply",
-  lastImageThumb: /** @type {string|null} */ (null),
-  lastImageFile: /** @type {File|null} */ (null),
-  config: { endpoint: "", token: "" },
-  syncStatus: "local", // 'local' | 'syncing' | 'synced' | 'error'
+  lastImageThumb: null,
+  lastImageFile: null,
+  config: { endpoint: "" },
+  session: null, // { token, user:{username,displayName,role} }
+  authEnabled: false,
+  syncStatus: "local",
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
+const isCloudAuthed = () => cloudEnabled() && !!state.session;
 
 /* ---------- storage ---------- */
 function loadConfig() {
   try {
     const raw = localStorage.getItem(CONFIG_KEY);
-    if (raw) state.config = { endpoint: "", token: "", ...JSON.parse(raw) };
+    if (raw) state.config = { endpoint: "", ...JSON.parse(raw) };
   } catch {
     /* noop */
   }
 }
 function saveConfig() {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(state.config));
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    state.session = raw ? JSON.parse(raw) : null;
+  } catch {
+    state.session = null;
+  }
+}
+function saveSession() {
+  if (state.session) {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(state.session));
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
 }
 function loadCache() {
   try {
@@ -114,6 +123,7 @@ function normalizeRecord(r) {
   return {
     id: r.id,
     applicant: r.applicant || "",
+    applicantId: r.applicantId || "",
     date: normalizeDateStr(r.date),
     category: r.category || "",
     vendor: r.vendor || "",
@@ -135,24 +145,34 @@ function normalizeRecord(r) {
  *   POST は text/plain で送信し CORS プリフライトを回避
  * ========================================================================= */
 
+class AuthError extends Error {}
+
 async function apiPost(payload) {
+  const body = { ...payload };
+  if (state.session && body.token === undefined) body.token = state.session.token;
   const res = await fetch(state.config.endpoint, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ ...payload, token: state.config.token }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
-  if (!data.ok) throw new Error(data.error || "APIエラー");
+  if (!data.ok) {
+    if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
+    throw new Error(data.error || "APIエラー");
+  }
   return data;
 }
 
 async function apiGet() {
+  const token = state.session ? state.session.token : "";
   const url =
-    state.config.endpoint +
-    (state.config.token ? "?token=" + encodeURIComponent(state.config.token) : "");
+    state.config.endpoint + (token ? "?token=" + encodeURIComponent(token) : "");
   const res = await fetch(url);
   const data = await res.json();
-  if (!data.ok) throw new Error(data.error || "APIエラー");
+  if (!data.ok) {
+    if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
+    throw new Error(data.error || "APIエラー");
+  }
   return (data.records || []).map(normalizeRecord);
 }
 
@@ -193,6 +213,7 @@ async function refreshFromCloud() {
     setSync("synced");
     await flushQueue();
   } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
     console.error(err);
     setSync("error");
     loadCache();
@@ -209,7 +230,13 @@ async function flushQueue() {
   for (const rec of q) {
     try {
       await apiPost({ action: "create", record: rec });
-    } catch {
+    } catch (err) {
+      if (err instanceof AuthError) {
+        remaining.push(rec, ...q.slice(q.indexOf(rec) + 1));
+        saveQueue(remaining);
+        updatePendingUI();
+        return handleAuthError();
+      }
       remaining.push(rec);
     }
   }
@@ -219,6 +246,221 @@ async function flushQueue() {
     state.expenses = await apiGet();
     saveCache();
     setSync("synced");
+  }
+}
+
+/* =========================================================================
+ * 認証（クラウドモード）
+ * ========================================================================= */
+
+function showAuthOverlay(mode) {
+  $("#authOverlay").hidden = false;
+  $("#loginForm").hidden = mode !== "login";
+  $("#setupForm").hidden = mode !== "setup";
+  $("#loginError").hidden = true;
+  $("#setupError").hidden = true;
+}
+function hideAuthOverlay() {
+  $("#authOverlay").hidden = true;
+}
+
+function applySessionUI() {
+  const cloud = cloudEnabled();
+  $("#localUserBox").hidden = cloud;
+  $("#sessionBox").hidden = !(cloud && state.session);
+  $("#passwordCard").hidden = !(cloud && state.session && state.authEnabled);
+  $("#userMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  if (cloud && state.session) {
+    $("#sessionName").textContent = state.session.user.displayName;
+    const roleEl = $("#sessionRole");
+    const isAdmin = state.session.user.role === "admin";
+    roleEl.textContent = isAdmin ? "管理者" : "一般";
+    roleEl.className = "role-badge" + (isAdmin ? "" : " is-user");
+  }
+}
+
+function setSessionFromResponse(data) {
+  state.session = { token: data.token, user: data.user };
+  saveSession();
+  state.isAdmin = data.user.role === "admin";
+  syncAdminUI();
+  applySessionUI();
+}
+
+function handleAuthError() {
+  // トークン失効・無効化など。セッションを破棄してログイン画面へ
+  state.session = null;
+  saveSession();
+  state.isAdmin = false;
+  syncAdminUI();
+  applySessionUI();
+  setSync("error");
+  toast("セッションの有効期限が切れました。再ログインしてください。");
+  showAuthOverlay("login");
+}
+
+async function logout() {
+  state.session = null;
+  saveSession();
+  state.isAdmin = false;
+  state.expenses = [];
+  saveCache();
+  syncAdminUI();
+  applySessionUI();
+  render();
+  showAuthOverlay("login");
+}
+
+async function handleLogin(evt) {
+  evt.preventDefault();
+  const errEl = $("#loginError");
+  errEl.hidden = true;
+  try {
+    const data = await apiPost({
+      action: "login",
+      token: "",
+      username: $("#loginUsername").value.trim(),
+      password: $("#loginPassword").value,
+    });
+    setSessionFromResponse(data);
+    hideAuthOverlay();
+    $("#loginForm").reset();
+    toast(`ようこそ、${data.user.displayName} さん`);
+    await refreshFromCloud();
+  } catch (err) {
+    errEl.textContent = err.message || "ログインに失敗しました";
+    errEl.hidden = false;
+  }
+}
+
+async function handleSetup(evt) {
+  evt.preventDefault();
+  const errEl = $("#setupError");
+  errEl.hidden = true;
+  try {
+    const data = await apiPost({
+      action: "setup",
+      token: "",
+      username: $("#setupUsername").value.trim(),
+      displayName: $("#setupDisplayName").value.trim(),
+      password: $("#setupPassword").value,
+    });
+    state.authEnabled = true;
+    setSessionFromResponse(data);
+    hideAuthOverlay();
+    $("#setupForm").reset();
+    toast("管理者アカウントを作成しました");
+    await refreshFromCloud();
+  } catch (err) {
+    errEl.textContent = err.message || "作成に失敗しました";
+    errEl.hidden = false;
+  }
+}
+
+async function handleChangePassword(evt) {
+  evt.preventDefault();
+  try {
+    await apiPost({
+      action: "changePassword",
+      currentPassword: $("#pwCurrent").value,
+      newPassword: $("#pwNew").value,
+    });
+    $("#passwordForm").reset();
+    toast("パスワードを変更しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "変更に失敗しました");
+  }
+}
+
+/* =========================================================================
+ * ユーザー管理（管理者のみ）
+ * ========================================================================= */
+
+async function loadUsers() {
+  try {
+    const data = await apiPost({ action: "listUsers" });
+    renderUsers(data.users || []);
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "ユーザー一覧の取得に失敗しました");
+  }
+}
+
+function renderUsers(users) {
+  const tbody = $("#userTable tbody");
+  const me = state.session ? state.session.user.username : "";
+  tbody.innerHTML = users.length
+    ? users
+        .map(
+          (u) => `
+      <tr>
+        <td>${escapeHtml(u.username)}</td>
+        <td>${escapeHtml(u.displayName)}</td>
+        <td><span class="role-badge ${u.role === "admin" ? "" : "is-user"}">${
+            u.role === "admin" ? "管理者" : "一般"
+          }</span></td>
+        <td>${u.active ? "有効" : '<span style="color:var(--red)">無効</span>'}</td>
+        <td>
+          ${
+            u.username === me
+              ? '<span class="empty" style="padding:0">（自分）</span>'
+              : `<button class="btn btn--ghost btn--sm" data-user-toggle="${escapeHtml(
+                  u.username
+                )}" data-active="${u.active}">${u.active ? "無効化" : "有効化"}</button>
+                 <button class="btn btn--ghost btn--sm" data-user-pw="${escapeHtml(
+                   u.username
+                 )}">PW再設定</button>`
+          }
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5" class="empty">ユーザーがいません。</td></tr>`;
+}
+
+async function handleUserAdd(evt) {
+  evt.preventDefault();
+  try {
+    await apiPost({
+      action: "upsertUser",
+      user: {
+        username: $("#nuUsername").value.trim(),
+        displayName: $("#nuDisplayName").value.trim(),
+        password: $("#nuPassword").value,
+        role: $("#nuRole").value,
+      },
+    });
+    $("#userAddForm").reset();
+    toast("ユーザーを追加しました");
+    await loadUsers();
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "追加に失敗しました");
+  }
+}
+
+async function handleUserTableClick(e) {
+  const toggle = e.target.closest("[data-user-toggle]");
+  const pw = e.target.closest("[data-user-pw]");
+  try {
+    if (toggle) {
+      const username = toggle.dataset.userToggle;
+      const nowActive = toggle.dataset.active === "true";
+      if (!window.confirm(`${username} を${nowActive ? "無効化" : "有効化"}しますか？`)) return;
+      await apiPost({ action: "upsertUser", user: { username, active: !nowActive } });
+      toast(nowActive ? "無効化しました" : "有効化しました");
+      await loadUsers();
+    } else if (pw) {
+      const username = pw.dataset.userPw;
+      const newPw = window.prompt(`${username} の新しいパスワード（8文字以上）`);
+      if (newPw === null) return;
+      await apiPost({ action: "upsertUser", user: { username, password: newPw } });
+      toast("パスワードを再設定しました");
+    }
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "操作に失敗しました");
   }
 }
 
@@ -406,9 +648,13 @@ function clearImage() {
 
 async function submitExpense(evt) {
   evt.preventDefault();
-  if (!state.currentUser) {
-    toast("先に画面右上でログインユーザー（氏名）を入力してください");
+  if (!cloudEnabled() && !state.currentUser) {
+    toast("先に画面右上で氏名を入力してください");
     $("#currentUser").focus();
+    return;
+  }
+  if (cloudEnabled() && !state.session) {
+    showAuthOverlay("login");
     return;
   }
   const amount = Number($("#expAmount").value);
@@ -419,7 +665,10 @@ async function submitExpense(evt) {
 
   const base = {
     id: uid(),
-    applicant: state.currentUser,
+    // クラウドモードでは申請者はサーバー側でセッションから強制される
+    applicant: cloudEnabled()
+      ? state.session.user.displayName
+      : state.currentUser,
     date: $("#expDate").value,
     category: $("#expCategory").value,
     vendor: $("#expVendor").value.trim(),
@@ -437,7 +686,6 @@ async function submitExpense(evt) {
 
   try {
     if (!cloudEnabled()) {
-      // ローカルのみ
       state.expenses.unshift({ ...base, imageThumb: state.lastImageThumb });
       saveCache();
       toast("経費を申請しました（この端末に保存）");
@@ -454,8 +702,11 @@ async function submitExpense(evt) {
         await refreshFromCloud();
         toast("申請を保存しました（スプレッドシート／ドライブへ同期）");
       } catch (err) {
+        if (err instanceof AuthError) {
+          handleAuthError();
+          return;
+        }
         console.error(err);
-        // 失敗時はキューに積んでローカルにも反映
         const q = loadQueue();
         q.push(record);
         saveQueue(q);
@@ -492,28 +743,47 @@ function receiptCell(e) {
     : "—";
 }
 
+/** 「自分の申請」を返す（モード・権限に応じて） */
+function myExpenses() {
+  if (cloudEnabled() && state.session) {
+    if (state.session.user.role === "admin") {
+      // 管理者は全件取得しているため自分の分を抽出
+      return state.expenses.filter(
+        (e) => e.applicantId === state.session.user.username
+      );
+    }
+    return state.expenses; // 一般はサーバー側で自分の分のみ返却
+  }
+  return state.expenses.filter((e) => e.applicant === state.currentUser);
+}
+
 function renderPersonal() {
-  const user = state.currentUser;
-  const mine = state.expenses.filter((e) => e.applicant === user);
+  const identified = cloudEnabled() ? !!state.session : !!state.currentUser;
+  const mine = identified ? myExpenses() : [];
+
   const sum = (arr) => arr.reduce((t, e) => t + e.amount, 0);
   const pending = mine.filter((e) => e.status === "pending");
   const approved = mine.filter((e) => e.status === "approved");
 
-  $("#personalStats").innerHTML = user
+  $("#personalStats").innerHTML = identified
     ? [
         statCard("申請件数", mine.length + " 件"),
         statCard("申請中", pending.length + " 件"),
         statCard("承認済み金額", yen(sum(approved)), "is-green"),
         statCard("申請中金額", yen(sum(pending)), "is-accent"),
       ].join("")
-    : `<div class="stat"><p class="stat__label">氏名未入力</p><p class="stat__value">—</p></div>`;
+    : `<div class="stat"><p class="stat__label">未ログイン</p><p class="stat__value">—</p></div>`;
 
   const filter = $("#personalFilter").value;
   const rows = mine.filter((e) => filter === "all" || e.status === filter);
   const tbody = $("#personalTable tbody");
 
-  if (!user) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">右上で氏名を入力すると、自分の申請が表示されます。</td></tr>`;
+  if (!identified) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">${
+      cloudEnabled()
+        ? "ログインすると自分の申請が表示されます。"
+        : "右上で氏名を入力すると、自分の申請が表示されます。"
+    }</td></tr>`;
     return;
   }
   if (!rows.length) {
@@ -615,7 +885,7 @@ function render() {
 }
 
 /* =========================================================================
- * 承認・却下・差戻・取消（クラウド連携時はスプレッドシートへ反映）
+ * 承認・却下・差戻・取消
  * ========================================================================= */
 
 function findExpense(id) {
@@ -630,9 +900,10 @@ async function applyReview(id, fields, message) {
       await refreshFromCloud();
       toast(message);
     } catch (err) {
+      if (err instanceof AuthError) return handleAuthError();
       console.error(err);
       setSync("error");
-      toast("クラウド更新に失敗しました。");
+      toast(err.message || "クラウド更新に失敗しました。");
     }
   } else {
     const e = findExpense(id);
@@ -649,7 +920,9 @@ function approve(id) {
     {
       status: "approved",
       reviewedAt: new Date().toISOString(),
-      reviewer: state.currentUser || "管理者",
+      reviewer: cloudEnabled()
+        ? state.session.user.displayName
+        : state.currentUser || "管理者",
       reviewComment: "",
     },
     "承認しました"
@@ -664,7 +937,9 @@ function reject(id) {
     {
       status: "rejected",
       reviewedAt: new Date().toISOString(),
-      reviewer: state.currentUser || "管理者",
+      reviewer: cloudEnabled()
+        ? state.session.user.displayName
+        : state.currentUser || "管理者",
       reviewComment: comment.trim(),
     },
     "却下しました"
@@ -688,9 +963,10 @@ async function deleteExpense(id) {
       await refreshFromCloud();
       toast("申請を取り消しました");
     } catch (err) {
+      if (err instanceof AuthError) return handleAuthError();
       console.error(err);
       setSync("error");
-      toast("クラウド削除に失敗しました。");
+      toast(err.message || "クラウド削除に失敗しました。");
     }
   } else {
     state.expenses = state.expenses.filter((e) => e.id !== id);
@@ -706,8 +982,8 @@ async function deleteExpense(id) {
 
 function exportCsv() {
   const cols = [
-    "id", "createdAt", "applicant", "date", "category", "vendor",
-    "amount", "description", "status", "reviewedAt", "reviewer",
+    "id", "createdAt", "applicant", "applicantId", "date", "category",
+    "vendor", "amount", "description", "status", "reviewedAt", "reviewer",
     "reviewComment", "imageUrl",
   ];
   const esc = (v) => {
@@ -729,7 +1005,7 @@ function exportCsv() {
 }
 
 /* =========================================================================
- * タブ / ユーザー / 管理者 / 設定
+ * タブ / モード切替 / 設定
  * ========================================================================= */
 
 function setTab(tab) {
@@ -739,75 +1015,147 @@ function setTab(tab) {
   $$(".panel").forEach((p) =>
     p.classList.toggle("is-active", p.dataset.panel === tab)
   );
+  if (tab === "admin" && cloudEnabled() && state.isAdmin && state.authEnabled) {
+    loadUsers();
+  }
 }
 
-function setAdmin(on) {
-  state.isAdmin = on;
+function syncAdminUI() {
+  $(".is-admin-only").hidden = !state.isAdmin;
   const btn = $("#adminToggle");
-  btn.classList.toggle("is-on", on);
-  btn.textContent = on ? "管理者モード ON" : "管理者モード";
-  $(".is-admin-only").hidden = !on;
-  if (!on && state.activeTab === "admin") setTab("apply");
+  btn.classList.toggle("is-on", state.isAdmin);
+  btn.textContent = state.isAdmin ? "管理者モード ON" : "管理者モード";
+  if (!state.isAdmin && state.activeTab === "admin") setTab("apply");
   render();
 }
 
 function openSettings() {
   $("#cfgEndpoint").value = state.config.endpoint;
-  $("#cfgToken").value = state.config.token;
   $("#settingsModal").hidden = false;
 }
 function closeSettings() {
   $("#settingsModal").hidden = true;
 }
 async function saveSettings() {
+  const prev = state.config.endpoint;
   state.config.endpoint = $("#cfgEndpoint").value.trim();
-  state.config.token = $("#cfgToken").value.trim();
   saveConfig();
   closeSettings();
-  if (cloudEnabled()) {
-    toast("クラウド連携を有効化しました。データを読み込みます…");
-    await refreshFromCloud();
-  } else {
-    setSync("local");
-    loadCache();
-    render();
+  if (state.config.endpoint !== prev) {
+    state.session = null;
+    saveSession();
   }
-  updatePendingUI();
+  await initMode();
 }
-function clearSettings() {
-  state.config = { endpoint: "", token: "" };
+async function clearSettings() {
+  state.config = { endpoint: "" };
   saveConfig();
+  state.session = null;
+  saveSession();
   $("#cfgEndpoint").value = "";
-  $("#cfgToken").value = "";
-  setSync("local");
-  loadCache();
-  updatePendingUI();
-  render();
   toast("クラウド連携を解除しました（以降はこの端末に保存）");
+  await initMode();
 }
 
 /* =========================================================================
- * 初期化
+ * 起動フロー
  * ========================================================================= */
 
-async function init() {
+async function initMode() {
+  hideAuthOverlay();
+  applySessionUI();
+  updatePendingUI();
+
+  if (!cloudEnabled()) {
+    // ローカル（試用）モード
+    state.authEnabled = false;
+    state.isAdmin = false;
+    loadCache();
+    setSync("local");
+    syncAdminUI();
+    render();
+    return;
+  }
+
+  // クラウドモード: 認証状態を確認
+  setSync("syncing");
+  try {
+    const st = await apiPost({ action: "status", token: "" });
+    state.authEnabled = !!st.authEnabled;
+
+    if (!state.authEnabled) {
+      // 初期設定（最初の管理者作成）が必要
+      setSync("synced");
+      showAuthOverlay("setup");
+      return;
+    }
+
+    loadSession();
+    if (state.session) {
+      try {
+        const me = await apiPost({ action: "me" });
+        state.session.user = me.user;
+        saveSession();
+        state.isAdmin = me.user.role === "admin";
+        syncAdminUI();
+        applySessionUI();
+        hideAuthOverlay();
+        await refreshFromCloud();
+        return;
+      } catch (err) {
+        state.session = null;
+        saveSession();
+      }
+    }
+    state.isAdmin = false;
+    syncAdminUI();
+    applySessionUI();
+    showAuthOverlay("login");
+    setSync("synced");
+  } catch (err) {
+    console.error(err);
+    setSync("error");
+    loadCache();
+    syncAdminUI();
+    render();
+    toast("サーバーに接続できません。ローカルのキャッシュを表示します。");
+  }
+}
+
+function init() {
   loadConfig();
-  loadCache();
 
   state.currentUser = localStorage.getItem(USER_KEY) || "";
   $("#currentUser").value = state.currentUser;
   $("#expDate").valueAsDate = new Date();
 
+  // タブ
   $("#tabs").addEventListener("click", (e) => {
     const btn = e.target.closest(".tab");
     if (btn) setTab(btn.dataset.tab);
   });
+
+  // ローカルモード: 氏名・管理者トグル
   $("#currentUser").addEventListener("input", (e) => {
     state.currentUser = e.target.value.trim();
     localStorage.setItem(USER_KEY, state.currentUser);
     render();
   });
-  $("#adminToggle").addEventListener("click", () => setAdmin(!state.isAdmin));
+  $("#adminToggle").addEventListener("click", () => {
+    state.isAdmin = !state.isAdmin;
+    syncAdminUI();
+  });
+
+  // 認証
+  $("#loginForm").addEventListener("submit", handleLogin);
+  $("#setupForm").addEventListener("submit", handleSetup);
+  $("#logoutBtn").addEventListener("click", logout);
+  $("#passwordForm").addEventListener("submit", handleChangePassword);
+
+  // ユーザー管理
+  $("#userAddForm").addEventListener("submit", handleUserAdd);
+  $("#userTable").addEventListener("click", handleUserTableClick);
+  $("#userReloadBtn").addEventListener("click", loadUsers);
 
   // 画像入力
   const dropzone = $("#dropzone");
@@ -832,13 +1180,16 @@ async function init() {
   });
   $("#clearImage").addEventListener("click", clearImage);
 
+  // フォーム
   $("#expenseForm").addEventListener("submit", submitExpense);
 
+  // フィルタ
   $("#personalFilter").addEventListener("change", renderPersonal);
   $("#adminSearch").addEventListener("input", renderAdmin);
   $("#adminStatusFilter").addEventListener("change", renderAdmin);
   $("#csvBtn").addEventListener("click", exportCsv);
 
+  // テーブル操作
   $("#personalTable").addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
     if (del) deleteExpense(del.dataset.del);
@@ -859,16 +1210,8 @@ async function init() {
   $("#reSyncBtn").addEventListener("click", () => refreshFromCloud());
   $$("[data-close]").forEach((el) => el.addEventListener("click", closeSettings));
 
-  setAdmin(false);
   setTab("apply");
-  updatePendingUI();
-
-  if (cloudEnabled()) {
-    await refreshFromCloud();
-  } else {
-    setSync("local");
-    render();
-  }
+  initMode();
 }
 
 document.addEventListener("DOMContentLoaded", init);

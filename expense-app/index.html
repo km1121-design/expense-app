@@ -15,16 +15,32 @@
           <button id="reSyncBtn" type="button" class="btn btn--ghost btn--sm" hidden>
             再同期
           </button>
-          <label for="currentUser">ログインユーザー</label>
-          <input
-            id="currentUser"
-            type="text"
-            placeholder="氏名を入力"
-            autocomplete="off"
-          />
-          <button id="adminToggle" type="button" class="btn btn--ghost">
-            管理者モード
-          </button>
+
+          <!-- ローカル（試用）モード用 -->
+          <span class="local-only" id="localUserBox">
+            <label for="currentUser">氏名</label>
+            <input
+              id="currentUser"
+              type="text"
+              placeholder="氏名を入力"
+              autocomplete="off"
+            />
+            <button id="adminToggle" type="button" class="btn btn--ghost">
+              管理者モード
+            </button>
+          </span>
+
+          <!-- クラウド（認証）モード用 -->
+          <span class="cloud-only" id="sessionBox" hidden>
+            <span class="user-chip">
+              <span id="sessionName"></span>
+              <span class="role-badge" id="sessionRole"></span>
+            </span>
+            <button id="logoutBtn" type="button" class="btn btn--ghost btn--sm">
+              ログアウト
+            </button>
+          </span>
+
           <button id="settingsBtn" type="button" class="btn btn--ghost" title="クラウド連携設定">
             ⚙️
           </button>
@@ -148,6 +164,23 @@
             </table>
           </div>
         </div>
+
+        <div class="card cloud-only" id="passwordCard" hidden>
+          <h2 class="card__title">パスワード変更</h2>
+          <form id="passwordForm" class="form form--grid">
+            <div class="form__row">
+              <label for="pwCurrent">現在のパスワード</label>
+              <input id="pwCurrent" type="password" autocomplete="current-password" required />
+            </div>
+            <div class="form__row">
+              <label for="pwNew">新しいパスワード（8文字以上）</label>
+              <input id="pwNew" type="password" autocomplete="new-password" minlength="8" required />
+            </div>
+            <div class="form__actions">
+              <button type="submit" class="btn btn--ghost">変更する</button>
+            </div>
+          </form>
+        </div>
       </section>
 
       <!-- ===== 管理者ダッシュボード ===== -->
@@ -193,8 +226,104 @@
             </table>
           </div>
         </div>
+
+        <!-- ユーザー管理（クラウド＋認証モードのみ） -->
+        <div class="card cloud-only" id="userMgmtCard" hidden>
+          <div class="card__head">
+            <h2 class="card__title">ユーザー管理</h2>
+            <button id="userReloadBtn" type="button" class="btn btn--ghost btn--sm">
+              再読込
+            </button>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="userTable">
+              <thead>
+                <tr>
+                  <th>ユーザーID</th>
+                  <th>表示名</th>
+                  <th>権限</th>
+                  <th>状態</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <h3 class="card__subtitle">ユーザーを追加</h3>
+          <form id="userAddForm" class="form form--grid">
+            <div class="form__row">
+              <label for="nuUsername">ユーザーID（半角英数 3〜32字）</label>
+              <input id="nuUsername" type="text" pattern="[a-zA-Z0-9._\-]{3,32}" required />
+            </div>
+            <div class="form__row">
+              <label for="nuDisplayName">表示名</label>
+              <input id="nuDisplayName" type="text" required />
+            </div>
+            <div class="form__row">
+              <label for="nuPassword">初期パスワード（8文字以上）</label>
+              <input id="nuPassword" type="text" minlength="8" required />
+            </div>
+            <div class="form__row">
+              <label for="nuRole">権限</label>
+              <select id="nuRole">
+                <option value="user">一般（自分の申請のみ）</option>
+                <option value="admin">管理者（全件・承認・ユーザー管理）</option>
+              </select>
+            </div>
+            <div class="form__actions">
+              <button type="submit" class="btn btn--primary">追加する</button>
+            </div>
+          </form>
+        </div>
       </section>
     </main>
+
+    <!-- ===== ログイン / 初期設定 ===== -->
+    <div class="auth-overlay" id="authOverlay" hidden>
+      <div class="auth-box">
+        <h1 class="app-title">経費申請アプリ</h1>
+
+        <form id="loginForm" class="form" hidden>
+          <h2 class="card__title">ログイン</h2>
+          <div class="form__row">
+            <label for="loginUsername">ユーザーID</label>
+            <input id="loginUsername" type="text" autocomplete="username" required />
+          </div>
+          <div class="form__row">
+            <label for="loginPassword">パスワード</label>
+            <input id="loginPassword" type="password" autocomplete="current-password" required />
+          </div>
+          <p class="form-error" id="loginError" hidden></p>
+          <div class="form__actions">
+            <button type="submit" class="btn btn--primary btn--wide">ログイン</button>
+          </div>
+        </form>
+
+        <form id="setupForm" class="form" hidden>
+          <h2 class="card__title">初期設定：管理者アカウントの作成</h2>
+          <p class="card__hint">
+            最初にシステム管理者のアカウントを作成します。作成後は全員ログインが必要になります。
+          </p>
+          <div class="form__row">
+            <label for="setupUsername">ユーザーID（半角英数 3〜32字）</label>
+            <input id="setupUsername" type="text" pattern="[a-zA-Z0-9._\-]{3,32}" required />
+          </div>
+          <div class="form__row">
+            <label for="setupDisplayName">表示名（氏名）</label>
+            <input id="setupDisplayName" type="text" required />
+          </div>
+          <div class="form__row">
+            <label for="setupPassword">パスワード（8文字以上）</label>
+            <input id="setupPassword" type="password" minlength="8" required />
+          </div>
+          <p class="form-error" id="setupError" hidden></p>
+          <div class="form__actions">
+            <button type="submit" class="btn btn--primary btn--wide">作成してはじめる</button>
+          </div>
+        </form>
+      </div>
+    </div>
 
     <!-- ===== 設定モーダル ===== -->
     <div class="modal" id="settingsModal" hidden>
@@ -203,10 +332,9 @@
         <h2 class="card__title">クラウド連携設定</h2>
         <p class="card__hint">
           Google Apps Script で公開した Web アプリの URL を設定すると、申請データが
-          スプレッドシートに、領収書画像が Google ドライブに保存され、複数端末・
-          分析ツールから同じデータを参照できます。未設定の場合はこの端末内
-          （localStorage）にのみ保存されます。設定手順は
-          <code>apps-script/README.md</code> を参照してください。
+          スプレッドシートに、領収書画像が Google ドライブに保存され、ログインと権限管理が
+          有効になります。未設定の場合はこの端末内（localStorage）のみの試用モードです。
+          設定手順は <code>apps-script/README.md</code> を参照してください。
         </p>
         <div class="form__row">
           <label for="cfgEndpoint">Web アプリ URL</label>
@@ -215,10 +343,6 @@
             type="url"
             placeholder="https://script.google.com/macros/s/.../exec"
           />
-        </div>
-        <div class="form__row">
-          <label for="cfgToken">共有トークン（任意）</label>
-          <input id="cfgToken" type="text" placeholder="GAS の SHARED_TOKEN と一致させる" />
         </div>
         <div class="form__actions">
           <button id="cfgSave" type="button" class="btn btn--primary">保存して接続</button>

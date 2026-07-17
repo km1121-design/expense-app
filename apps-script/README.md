@@ -24,7 +24,8 @@
      | --- | --- |
      | `SPREADSHEET_ID` | 保存先スプレッドシートID。未設定なら初回に「経費申請データ」を自動作成し、IDをこのプロパティへ自動保存して以降再利用 |
      | `DRIVE_FOLDER_ID` | 領収書画像の保存先フォルダID。未設定なら「経費領収書」を自動作成し、同様にIDを自動保存 |
-     | `SHARED_TOKEN` | 共有トークン。設定するとアプリ側の「共有トークン」と一致しないリクエストを拒否 |
+     | `SHARED_TOKEN` | 分析ツール用の読み取りトークン。設定すると GET `?token=<この値>` で全件を読み取り専用取得できる（Looker Studio 等の定期取得用） |
+     | `AUTH_SECRET` | セッショントークンの署名鍵（初回に自動生成・自動保存。手動設定不要） |
 
 4. **Web アプリとしてデプロイ**
    - 右上「デプロイ」>「新しいデプロイ」>「種類：ウェブアプリ」
@@ -33,10 +34,20 @@
    - デプロイして表示される **ウェブアプリ URL**（`.../exec` で終わる）を控えます。
    - 初回は権限承認（スプレッドシート・ドライブへのアクセス）を求められます。
 
-5. **アプリに接続**
-   - 経費申請アプリを開き、右上「⚙️」→ ウェブアプリ URL（と、設定した場合は
-     共有トークン）を入力して「保存して接続」。
-   - ステータスが「クラウド同期済み」になれば連携完了です。
+5. **アプリに接続して初期設定**
+   - 経費申請アプリを開き、右上「⚙️」→ ウェブアプリ URL を入力して「保存して接続」。
+   - 初回は「初期設定：管理者アカウントの作成」画面が表示されるので、
+     最初の管理者（ユーザーID・表示名・パスワード）を作成します。
+   - 以降は全員ログインが必要になります。ユーザーの追加は管理者ダッシュボードの
+     「ユーザー管理」から行います。
+
+## 認証・権限
+
+- パスワードは `users` シートにソルト付き SHA-256 ハッシュで保存されます（平文保存なし）。
+- ログイン成功で HMAC 署名付きセッショントークン（12時間有効）を発行します。
+- 権限は `user`（自分の申請のみ・申請/取消）と `admin`（全件閲覧・承認/却下/差戻・
+  ユーザー管理）の2種類。申請者名・承認者名はサーバー側でセッションから強制されます。
+- `users` シートが空の間は認証なしの互換モードで動作します（初期設定前の状態）。
 
 ## データ構造（スプレッドシート `expenses` シート）
 
@@ -59,18 +70,28 @@
 | `reviewComment` | 却下理由など |
 | `imageUrl` | 領収書画像の Google ドライブ URL |
 | `imageFileId` | 同 ファイルID |
+| `applicantId` | 申請者のユーザーID（権限フィルタに使用） |
+
+このほか `users` シート（`username, displayName, passwordHash, salt, role, active,
+createdAt`）が同じスプレッドシートに作成されます。
 
 ## API（分析ツール・他システム連携用）
 
-- **GET** `?token=...` → `{ ok:true, records:[...] }` 全申請を JSON で取得
-- **POST**（`Content-Type: text/plain`、本文は JSON）
-  - `{action:"create", record:{...}}` … 申請作成（`record.imageBase64` があれば
-    ドライブへ画像保存）
-  - `{action:"update", id, fields:{...}}` … 状態更新（承認・却下など）
-  - `{action:"delete", id}` … 申請削除（画像もゴミ箱へ）
-
-`SHARED_TOKEN` を設定した場合は、GET はクエリ `token`、POST は本文 `token` に
-同じ値を含めてください。
+- **GET** `?token=...` → `{ ok:true, records:[...] }`
+  - セッショントークン: `user` は自分の申請のみ、`admin` は全件
+  - `SHARED_TOKEN` の値: 全件（読み取り専用・分析ツールの定期取得向け）
+- **POST**（`Content-Type: text/plain`、本文は JSON、認証系以外は `token` 必須）
+  - `{action:"status"}` … 認証が有効か（初期設定済みか）
+  - `{action:"setup", username, displayName, password}` … 最初の管理者作成（初回のみ）
+  - `{action:"login", username, password}` … ログイン → `{token, user}`
+  - `{action:"me", token}` … セッション検証
+  - `{action:"changePassword", token, currentPassword, newPassword}`
+  - `{action:"create", token, record:{...}}` … 申請作成（`record.imageBase64` が
+    あればドライブへ画像保存。申請者はセッションから強制）
+  - `{action:"update", token, id, fields:{...}}` … 承認・却下・差戻（admin のみ）
+  - `{action:"delete", token, id}` … 取消（user は自分の申請中のみ。画像もゴミ箱へ）
+  - `{action:"listUsers", token}` / `{action:"upsertUser", token, user:{...}}`
+    … ユーザー管理（admin のみ）
 
 ## 分析・実績管理への連携例
 
