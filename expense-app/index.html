@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>経費申請アプリ</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header__inner">
+        <h1 class="app-title">経費申請アプリ</h1>
+        <div class="user-box">
+          <span class="sync-badge" id="syncBadge">ローカルのみ</span>
+          <button id="reSyncBtn" type="button" class="btn btn--ghost btn--sm" hidden>
+            再同期
+          </button>
+          <label for="currentUser">ログインユーザー</label>
+          <input
+            id="currentUser"
+            type="text"
+            placeholder="氏名を入力"
+            autocomplete="off"
+          />
+          <button id="adminToggle" type="button" class="btn btn--ghost">
+            管理者モード
+          </button>
+          <button id="settingsBtn" type="button" class="btn btn--ghost" title="クラウド連携設定">
+            ⚙️
+          </button>
+        </div>
+      </div>
+      <nav class="tabs" id="tabs">
+        <button class="tab is-active" data-tab="apply" type="button">経費を申請</button>
+        <button class="tab" data-tab="personal" type="button">個人ダッシュボード</button>
+        <button class="tab is-admin-only" data-tab="admin" type="button" hidden>
+          管理者ダッシュボード
+        </button>
+      </nav>
+    </header>
+
+    <main class="container">
+      <!-- ===== 申請タブ ===== -->
+      <section class="panel is-active" data-panel="apply">
+        <div class="grid grid--apply">
+          <div class="card">
+            <h2 class="card__title">レシート画像から自動入力</h2>
+            <p class="card__hint">
+              レシートや領収書の写真をアップロードすると、画像を端末内で解析して
+              金額・日付・店名を自動で読み取ります。クラウド連携が有効な場合、申請時に
+              画像は Google ドライブへ、内容はスプレッドシートへ保存されます。
+            </p>
+
+            <label class="dropzone" id="dropzone">
+              <input id="imageInput" type="file" accept="image/*" hidden />
+              <span class="dropzone__icon">📷</span>
+              <span class="dropzone__text">
+                クリックして画像を選択、またはドラッグ＆ドロップ
+              </span>
+            </label>
+
+            <div class="preview" id="preview" hidden>
+              <img id="previewImg" alt="レシートプレビュー" />
+              <button id="clearImage" type="button" class="btn btn--ghost btn--sm">
+                画像を削除
+              </button>
+            </div>
+
+            <div class="ocr-status" id="ocrStatus" hidden>
+              <div class="ocr-bar"><div class="ocr-bar__fill" id="ocrBarFill"></div></div>
+              <span id="ocrStatusText">解析中…</span>
+            </div>
+
+            <details class="ocr-raw" id="ocrRawWrap" hidden>
+              <summary>読み取ったテキストを表示</summary>
+              <pre id="ocrRaw"></pre>
+            </details>
+          </div>
+
+          <div class="card">
+            <h2 class="card__title">申請内容</h2>
+            <form id="expenseForm" class="form">
+              <div class="form__row">
+                <label for="expDate">日付 <span class="req">*</span></label>
+                <input id="expDate" type="date" required />
+              </div>
+              <div class="form__row">
+                <label for="expCategory">科目 <span class="req">*</span></label>
+                <select id="expCategory" required>
+                  <option value="交通費">交通費</option>
+                  <option value="交際費">交際費</option>
+                  <option value="会議費">会議費</option>
+                  <option value="消耗品費">消耗品費</option>
+                  <option value="通信費">通信費</option>
+                  <option value="宿泊費">宿泊費</option>
+                  <option value="その他">その他</option>
+                </select>
+              </div>
+              <div class="form__row">
+                <label for="expVendor">支払先 / 店名</label>
+                <input id="expVendor" type="text" placeholder="例：〇〇商店" />
+              </div>
+              <div class="form__row">
+                <label for="expAmount">金額（円） <span class="req">*</span></label>
+                <input id="expAmount" type="number" min="0" step="1" required />
+              </div>
+              <div class="form__row">
+                <label for="expDesc">摘要 / 目的</label>
+                <textarea id="expDesc" rows="3" placeholder="例：取引先との打合せ"></textarea>
+              </div>
+              <div class="form__actions">
+                <button type="submit" class="btn btn--primary" id="submitBtn">申請する</button>
+                <button type="reset" class="btn btn--ghost">クリア</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 個人ダッシュボード ===== -->
+      <section class="panel" data-panel="personal">
+        <div class="stats" id="personalStats"></div>
+        <div class="card">
+          <div class="card__head">
+            <h2 class="card__title">自分の申請一覧</h2>
+            <select id="personalFilter" class="mini-select">
+              <option value="all">すべて</option>
+              <option value="pending">申請中</option>
+              <option value="approved">承認済み</option>
+              <option value="rejected">却下</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="personalTable">
+              <thead>
+                <tr>
+                  <th>日付</th>
+                  <th>科目</th>
+                  <th>支払先</th>
+                  <th class="num">金額</th>
+                  <th>状態</th>
+                  <th>領収書</th>
+                  <th>備考</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 管理者ダッシュボード ===== -->
+      <section class="panel" data-panel="admin">
+        <div class="stats" id="adminStats"></div>
+
+        <div class="card">
+          <h2 class="card__title">科目別 承認済み金額</h2>
+          <div class="bars" id="adminByCategory"></div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <h2 class="card__title">全申請一覧</h2>
+            <div class="filters">
+              <input id="adminSearch" type="search" placeholder="申請者・店名で検索" />
+              <select id="adminStatusFilter" class="mini-select">
+                <option value="all">すべての状態</option>
+                <option value="pending">申請中</option>
+                <option value="approved">承認済み</option>
+                <option value="rejected">却下</option>
+              </select>
+              <button id="csvBtn" type="button" class="btn btn--ghost btn--sm">
+                CSV書き出し
+              </button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="adminTable">
+              <thead>
+                <tr>
+                  <th>申請者</th>
+                  <th>日付</th>
+                  <th>科目</th>
+                  <th>支払先</th>
+                  <th class="num">金額</th>
+                  <th>領収書</th>
+                  <th>状態</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 設定モーダル ===== -->
+    <div class="modal" id="settingsModal" hidden>
+      <div class="modal__backdrop" data-close></div>
+      <div class="modal__box">
+        <h2 class="card__title">クラウド連携設定</h2>
+        <p class="card__hint">
+          Google Apps Script で公開した Web アプリの URL を設定すると、申請データが
+          スプレッドシートに、領収書画像が Google ドライブに保存され、複数端末・
+          分析ツールから同じデータを参照できます。未設定の場合はこの端末内
+          （localStorage）にのみ保存されます。設定手順は
+          <code>apps-script/README.md</code> を参照してください。
+        </p>
+        <div class="form__row">
+          <label for="cfgEndpoint">Web アプリ URL</label>
+          <input
+            id="cfgEndpoint"
+            type="url"
+            placeholder="https://script.google.com/macros/s/.../exec"
+          />
+        </div>
+        <div class="form__row">
+          <label for="cfgToken">共有トークン（任意）</label>
+          <input id="cfgToken" type="text" placeholder="GAS の SHARED_TOKEN と一致させる" />
+        </div>
+        <div class="form__actions">
+          <button id="cfgSave" type="button" class="btn btn--primary">保存して接続</button>
+          <button id="cfgClear" type="button" class="btn btn--ghost">連携を解除</button>
+          <button type="button" class="btn btn--ghost" data-close>閉じる</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <!-- レシート画像OCR（端末内で完結） -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="./script.js"></script>
+  </body>
+</html>
