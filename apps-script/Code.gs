@@ -17,6 +17,8 @@
  *                     自動作成・自動保存して以降再利用）
  *   AUTH_SECRET     : セッショントークン署名鍵（初回に自動生成・自動保存）
  *   SHARED_TOKEN    : 分析ツール用の読み取りトークン（設定時、doGet ?token= で全件取得可）
+ *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効になる
+ *   OCR_MODEL       : AI解析のモデルID（既定: claude-opus-4-8。安価にするなら claude-haiku-4-5）
  *
  * 認証モード:
  *   users シートが空の間は「オープンモード」（認証なし・従来互換）。
@@ -532,6 +534,7 @@ function doPost(e) {
           ok: true,
           authEnabled: usersExist_(),
           autoApprove: isAutoApprove_(),
+          aiOcr: !!getProp_("ANTHROPIC_API_KEY"),
         });
       case "setup":
         return json_(actionSetup_(body));
@@ -567,6 +570,9 @@ function doPost(e) {
         return json_(actionAddDepartment_(body));
       case "deleteDepartment":
         return json_(actionDeleteDepartment_(body));
+      // ---- AIレシート解析 ----
+      case "analyzeReceipt":
+        return json_(actionAnalyzeReceipt_(body));
       // ---- 経費データ ----
       case "create": {
         const u = requireUser_(body.token, false);
@@ -687,6 +693,115 @@ function deleteExpense_(id, user) {
   }
   sheet.deleteRow(row);
   return { ok: true };
+}
+
+/* ========================= AIレシート解析 ========================= */
+
+/**
+ * Claude API（vision + 構造化出力）でレシート画像から
+ * 日付・金額・店名・科目・摘要を抽出する。
+ * スクリプトプロパティ ANTHROPIC_API_KEY の設定時のみ有効。
+ * モデルは OCR_MODEL で変更可（既定: claude-opus-4-8）。
+ */
+function actionAnalyzeReceipt_(body) {
+  requireUser_(body.token, false);
+  const apiKey = getProp_("ANTHROPIC_API_KEY");
+  if (!apiKey) throw new Error("AI解析は未設定です（ANTHROPIC_API_KEY を設定してください）");
+  if (!body.imageBase64) throw new Error("画像がありません");
+
+  const model = getProp_("OCR_MODEL") || "claude-opus-4-8";
+  const categories = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
+
+  const schema = {
+    type: "object",
+    properties: {
+      date: {
+        type: "string",
+        description: "レシートの発行日（yyyy-MM-dd）。読み取れない場合は空文字",
+      },
+      amount: {
+        type: "integer",
+        description: "税込の合計支払金額（円）。お預り・お釣りではない。読み取れない場合は0",
+      },
+      vendor: {
+        type: "string",
+        description: "店名・支払先。読み取れない場合は空文字",
+      },
+      category: {
+        type: "string",
+        enum: categories,
+        description: "購入内容から最も適切な経費科目",
+      },
+      description: {
+        type: "string",
+        description: "購入内容の短い摘要（15文字以内、例: 打合せ飲食代）。不明なら空文字",
+      },
+    },
+    required: ["date", "amount", "vendor", "category", "description"],
+    additionalProperties: false,
+  };
+
+  const payload = {
+    model: model,
+    max_tokens: 1024,
+    output_config: { format: { type: "json_schema", schema: schema } },
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: String(body.imageMime || "image/jpeg"),
+              data: String(body.imageBase64),
+            },
+          },
+          {
+            type: "text",
+            text:
+              "これは経費申請用のレシートまたは領収書の写真です。" +
+              "画像から発行日・税込合計金額・店名を正確に読み取り、" +
+              "購入内容から経費科目を推定してJSONで返してください。" +
+              "合計金額は「合計」「税込」等の行を優先し、「お預り」「お釣り」の金額と混同しないこと。",
+          },
+        ],
+      },
+    ],
+  };
+
+  const res = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  let data;
+  try {
+    data = JSON.parse(res.getContentText());
+  } catch (err) {
+    throw new Error("AI解析の応答を読み取れませんでした（HTTP " + code + "）");
+  }
+  if (code !== 200) {
+    const msg = data && data.error && data.error.message ? data.error.message : "HTTP " + code;
+    throw new Error("AI解析エラー: " + msg);
+  }
+  if (data.stop_reason === "refusal") {
+    throw new Error("AI解析が画像を処理できませんでした");
+  }
+
+  let text = "";
+  (data.content || []).forEach(function (b) {
+    if (b.type === "text") text += b.text;
+  });
+  const fields = JSON.parse(text); // output_config.format により有効なJSONが保証される
+  return { ok: true, fields: fields, model: String(data.model || model) };
 }
 
 /* ========================= メンテナンス ========================= */

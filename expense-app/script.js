@@ -34,6 +34,7 @@ const state = {
   departments: [], // 登録済み事業部の一覧（申請フォームの候補）
   authEnabled: false,
   autoApprove: false, // クラウド側の自動承認モード
+  aiOcr: false, // サーバー側AIレシート解析（ANTHROPIC_API_KEY設定時）
   personalMonth: "", // "yyyy-MM" または "all"
   adminMonth: "",
   syncStatus: "local",
@@ -620,23 +621,32 @@ function parseAmount(str) {
 
 function extractAmount(text) {
   const lines = text.split(/\r?\n/);
-  const keywords = /(合\s*計|税込|お?支払|総額|請求|計)/;
+  // 合計金額と誤認しやすい行は除外
+  const negative = /(預り|預かり|お釣|釣り?銭|現金|クレジット|カード|ポイント|残高|値引|割引|チャージ)/;
+  const strong = /(合\s*計|総額|ご?請求)/; // 最優先
+  const medium = /(税込|お?支払)/;
+  const weak = /計/; // 小計なども含むため弱い
   const candidates = [];
   for (const line of lines) {
+    if (negative.test(line)) continue;
     const hasMoneyMark = /[¥￥]|円/.test(line);
-    const hasKeyword = keywords.test(line);
-    if (!hasMoneyMark && !hasKeyword) continue;
+    let weight = 0;
+    if (strong.test(line)) weight = 3;
+    else if (medium.test(line)) weight = 2;
+    else if (weak.test(line)) weight = 1;
+    if (!hasMoneyMark && !weight) continue;
     const nums = line.match(/[¥￥]?\s*[\d０-９][\d０-９,，]*/g) || [];
     for (const raw of nums) {
       const v = parseAmount(raw);
       if (!isNaN(v) && v >= 10 && v <= 100000000) {
-        candidates.push({ v, weight: hasKeyword ? 2 : 1 });
+        candidates.push({ v, weight: weight || 1 });
       }
     }
   }
   if (!candidates.length) return null;
-  const keyed = candidates.filter((c) => c.weight === 2);
-  const pool = keyed.length ? keyed : candidates;
+  // 最も強いキーワード群の中の最大値を採用
+  const top = Math.max(...candidates.map((c) => c.weight));
+  const pool = candidates.filter((c) => c.weight === top);
   return pool.reduce((m, c) => Math.max(m, c.v), 0);
 }
 
@@ -702,6 +712,156 @@ async function makeUploadBase64(file) {
   return dataUrl ? { base64: dataUrl.split(",")[1], mime: "image/jpeg" } : null;
 }
 
+/**
+ * OCR前処理: 適正解像度へ拡大 → グレースケール → 大津の二値化。
+ * レシートの薄い印字・低解像度写真での認識精度を上げる。
+ */
+function preprocessForOcr(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const target = 1600;
+      const maxDim = Math.max(img.width, img.height);
+      const scale = Math.min(2.5, Math.max(1, target / maxDim)); // 小さい画像は拡大
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      try {
+        const im = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = im.data;
+        // グレースケール + ヒストグラム
+        const hist = new Array(256).fill(0);
+        for (let i = 0; i < d.length; i += 4) {
+          const g = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+          d[i] = d[i + 1] = d[i + 2] = g;
+          hist[g]++;
+        }
+        // 大津の方法で二値化しきい値を求める
+        const total = d.length / 4;
+        let sum = 0;
+        for (let t = 0; t < 256; t++) sum += t * hist[t];
+        let sumB = 0, wB = 0, maxVar = 0, threshold = 127;
+        for (let t = 0; t < 256; t++) {
+          wB += hist[t];
+          if (!wB) continue;
+          const wF = total - wB;
+          if (!wF) break;
+          sumB += t * hist[t];
+          const mB = sumB / wB;
+          const mF = (sum - sumB) / wF;
+          const v = wB * wF * (mB - mF) * (mB - mF);
+          if (v > maxVar) {
+            maxVar = v;
+            threshold = t;
+          }
+        }
+        for (let i = 0; i < d.length; i += 4) {
+          const v = d[i] > threshold ? 255 : 0;
+          d[i] = d[i + 1] = d[i + 2] = v;
+        }
+        ctx.putImageData(im, 0, 0);
+      } catch (err) {
+        // 前処理に失敗しても拡大済みキャンバスをそのまま使う
+        console.warn("preprocess failed", err);
+      }
+      resolve(canvas);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+/** Tesseract をレシート向け設定（単一ブロック・空白保持）で実行 */
+async function tesseractRecognize(input, onProgress) {
+  if (Tesseract.createWorker) {
+    let worker;
+    try {
+      worker = await Tesseract.createWorker("jpn+eng", 1, { logger: onProgress });
+      await worker.setParameters({
+        tessedit_pageseg_mode: "6", // 単一の均一テキストブロックとして解析
+        preserve_interword_spaces: "1",
+      });
+      const { data } = await worker.recognize(input);
+      return data.text || "";
+    } catch (err) {
+      console.warn("worker OCR failed, falling back", err);
+    } finally {
+      if (worker) {
+        try { await worker.terminate(); } catch { /* noop */ }
+      }
+    }
+  }
+  const { data } = await Tesseract.recognize(input, "jpn+eng", { logger: onProgress });
+  return data.text || "";
+}
+
+/**
+ * AIレシート解析（クラウド側 Claude vision）。
+ * 成功時はフォームへ反映して true、未設定・失敗時は false（OCRへフォールバック）。
+ */
+async function runAiAnalyze(file) {
+  const statusEl = $("#ocrStatus");
+  const barFill = $("#ocrBarFill");
+  const statusText = $("#ocrStatusText");
+  statusEl.hidden = false;
+  $("#ocrRawWrap").hidden = true;
+  barFill.style.width = "60%";
+  statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
+  try {
+    const img = await makeUploadBase64(file);
+    if (!img) return false;
+    const data = await apiPost({
+      action: "analyzeReceipt",
+      imageBase64: img.base64,
+      imageMime: img.mime,
+    });
+    const f = data.fields || {};
+    const filled = [];
+    if (f.amount) {
+      $("#expAmount").value = f.amount;
+      filled.push("金額");
+    }
+    if (f.date) {
+      $("#expDate").value = f.date;
+      filled.push("日付");
+    }
+    if (f.vendor) {
+      $("#expVendor").value = f.vendor;
+      filled.push("店名");
+    }
+    if (f.category) {
+      $("#expCategory").value = f.category;
+      filled.push("科目");
+    }
+    if (f.description && !$("#expDesc").value) {
+      $("#expDesc").value = f.description;
+      filled.push("摘要");
+    }
+    barFill.style.width = "100%";
+    statusText.textContent = filled.length
+      ? `AI解析完了：${filled.join("・")}を自動入力しました（内容をご確認ください）`
+      : "AI解析完了：読み取れた項目がありません。手入力してください。";
+    return true;
+  } catch (err) {
+    if (err instanceof AuthError) {
+      handleAuthError();
+      return true; // ログイン画面へ誘導済み。OCRへは進まない
+    }
+    console.error(err);
+    statusText.textContent = "AI解析に失敗しました。端末内OCRで再試行します…";
+    return false;
+  }
+}
+
 async function runOcr(file) {
   const statusEl = $("#ocrStatus");
   const barFill = $("#ocrBarFill");
@@ -720,19 +880,17 @@ async function runOcr(file) {
   statusText.textContent = "画像を解析中…";
 
   try {
-    const { data } = await Tesseract.recognize(file, "jpn+eng", {
-      logger: (m) => {
-        if (m.status === "recognizing text") {
-          const pct = Math.round(m.progress * 100);
-          barFill.style.width = pct + "%";
-          statusText.textContent = `文字を認識中… ${pct}%`;
-        } else {
-          statusText.textContent = m.status;
-        }
-      },
-    });
+    statusText.textContent = "画像を前処理中…";
+    const canvas = await preprocessForOcr(file);
+    const input = canvas || file;
 
-    const text = data.text || "";
+    const text = await tesseractRecognize(input, (m) => {
+      if (m.status === "recognizing text") {
+        const pct = Math.round(m.progress * 100);
+        barFill.style.width = pct + "%";
+        statusText.textContent = `文字を認識中… ${pct}%`;
+      }
+    });
     rawEl.textContent = text.trim() || "(テキストを検出できませんでした)";
     rawWrap.hidden = false;
 
@@ -775,6 +933,12 @@ async function handleImageFile(file) {
   state.lastImageThumb = thumb;
   $("#previewImg").src = thumb || "";
   $("#preview").hidden = false;
+
+  // AI解析（高精度）→ 失敗・未設定時は端末内OCRへフォールバック
+  if (cloudEnabled() && state.session && state.aiOcr) {
+    const done = await runAiAnalyze(file);
+    if (done) return;
+  }
   runOcr(file);
 }
 
@@ -1301,6 +1465,7 @@ async function initMode() {
     const st = await apiPost({ action: "status", token: "" });
     state.authEnabled = !!st.authEnabled;
     state.autoApprove = !!st.autoApprove;
+    state.aiOcr = !!st.aiOcr;
 
     if (!state.authEnabled) {
       // 初期設定（最初の管理者作成）が必要
