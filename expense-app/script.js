@@ -17,6 +17,11 @@ const CONFIG_KEY = "expense-app:config";
 const QUEUE_KEY = "expense-app:queue"; // 未同期の作成申請
 const SESSION_KEY = "expense-app:session"; // クラウドモードのセッション
 
+// ローカル（試用）モードの事業部プルダウン初期値（クラウド時はサーバーのマスタを使用）
+const DEFAULT_DEPARTMENTS = [
+  "BAR", "人材", "運送", "本部", "ARTGRAGE", "クリニック", "GoonerHouse",
+];
+
 const state = {
   expenses: [],
   currentUser: "", // ローカルモードの氏名
@@ -289,6 +294,7 @@ function applySessionUI() {
   $("#sessionBox").hidden = !(cloud && state.session);
   $("#passwordCard").hidden = !(cloud && state.session && state.authEnabled);
   $("#userMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  $("#deptMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
     const roleEl = $("#sessionRole");
@@ -298,15 +304,98 @@ function applySessionUI() {
   }
 }
 
-/** 申請フォームの事業部候補と既定値を反映 */
+/** 事業部プルダウン・管理UIを state.departments に同期 */
 function applyDeptUI() {
-  const dl = $("#deptList");
-  dl.innerHTML = state.departments
-    .map((d) => `<option value="${escapeHtml(d)}"></option>`)
-    .join("");
-  const input = $("#expDept");
-  input.value =
+  const depts = state.departments || [];
+  const myDept =
     cloudEnabled() && state.session ? state.session.user.department || "" : "";
+
+  // 申請フォームの事業部プルダウン（既定=自分の所属。無ければ先頭）
+  const opts = depts
+    .map((d) => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`)
+    .join("");
+  const expDept = $("#expDept");
+  if (expDept) {
+    expDept.innerHTML =
+      `<option value="">（未選択）</option>` + opts;
+    expDept.value = myDept && depts.includes(myDept) ? myDept : "";
+  }
+
+  // ユーザー追加フォームの事業部プルダウン
+  const nuDept = $("#nuDept");
+  if (nuDept) nuDept.innerHTML = `<option value="">（未設定）</option>` + opts;
+
+  // 管理画面の事業部チップ一覧
+  const chips = $("#deptChips");
+  if (chips) {
+    chips.innerHTML = depts.length
+      ? depts
+          .map(
+            (d) => `
+        <span class="dept-chip">${escapeHtml(d)}
+          <button type="button" data-dept-del="${escapeHtml(d)}" title="削除">×</button>
+        </span>`
+          )
+          .join("")
+      : `<span class="empty" style="padding:0">事業部が未登録です。</span>`;
+  }
+}
+
+/** 事業部の選択肢HTML（インライン用・指定値をselected） */
+function deptOptionsHtml(selected) {
+  const blank = `<option value=""${selected ? "" : " selected"}>（未設定）</option>`;
+  return (
+    blank +
+    (state.departments || [])
+      .map(
+        (d) =>
+          `<option value="${escapeHtml(d)}"${
+            d === selected ? " selected" : ""
+          }>${escapeHtml(d)}</option>`
+      )
+      .join("")
+  );
+}
+
+async function refreshDepartments() {
+  try {
+    const data = await apiPost({ action: "listDepartments" });
+    if (data.departments) state.departments = data.departments;
+    applyDeptUI();
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+  }
+}
+
+async function handleDeptAdd(evt) {
+  evt.preventDefault();
+  const name = $("#newDeptName").value.trim();
+  if (!name) return;
+  try {
+    const data = await apiPost({ action: "addDepartment", name });
+    if (data.departments) state.departments = data.departments;
+    $("#newDeptName").value = "";
+    applyDeptUI();
+    loadUsers();
+    toast("事業部を追加しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "追加に失敗しました");
+  }
+}
+
+async function deleteDepartment(name) {
+  if (!window.confirm(`事業部「${name}」を選択肢から削除しますか？\n（過去の申請データの事業部名は残ります）`)) return;
+  try {
+    const data = await apiPost({ action: "deleteDepartment", name });
+    if (data.departments) state.departments = data.departments;
+    applyDeptUI();
+    loadUsers();
+    toast("事業部を削除しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "削除に失敗しました");
+  }
 }
 
 function setSessionFromResponse(data) {
@@ -429,15 +518,14 @@ function renderUsers(users) {
       <tr>
         <td>${escapeHtml(u.username)}</td>
         <td>${escapeHtml(u.displayName)}</td>
-        <td>${escapeHtml(u.department || "—")}</td>
+        <td><select class="dept-inline-select" data-user-setdept="${escapeHtml(
+          u.username
+        )}">${deptOptionsHtml(u.department || "")}</select></td>
         <td><span class="role-badge ${u.role === "admin" ? "" : "is-user"}">${
             u.role === "admin" ? "管理者" : "一般"
           }</span></td>
         <td>${u.active ? "有効" : '<span style="color:var(--red)">無効</span>'}</td>
         <td>
-          <button class="btn btn--ghost btn--sm" data-user-dept="${escapeHtml(
-            u.username
-          )}" data-dept="${escapeHtml(u.department || "")}">事業部変更</button>
           ${
             u.username === me
               ? '<span class="empty" style="padding:0">（自分）</span>'
@@ -477,19 +565,28 @@ async function handleUserAdd(evt) {
   }
 }
 
+async function handleUserDeptChange(e) {
+  const sel = e.target.closest("[data-user-setdept]");
+  if (!sel) return;
+  const username = sel.dataset.userSetdept;
+  try {
+    await apiPost({
+      action: "upsertUser",
+      user: { username, department: sel.value },
+    });
+    toast("事業部を更新しました（以降の申請から反映）");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "更新に失敗しました");
+    loadUsers();
+  }
+}
+
 async function handleUserTableClick(e) {
   const toggle = e.target.closest("[data-user-toggle]");
   const pw = e.target.closest("[data-user-pw]");
-  const dept = e.target.closest("[data-user-dept]");
   try {
-    if (dept) {
-      const username = dept.dataset.userDept;
-      const next = window.prompt(`${username} の事業部`, dept.dataset.dept || "");
-      if (next === null) return;
-      await apiPost({ action: "upsertUser", user: { username, department: next.trim() } });
-      toast("事業部を更新しました（以降の申請から反映）");
-      await loadUsers();
-    } else if (toggle) {
+    if (toggle) {
       const username = toggle.dataset.userToggle;
       const nowActive = toggle.dataset.active === "true";
       if (!window.confirm(`${username} を${nowActive ? "無効化" : "有効化"}しますか？`)) return;
@@ -1189,6 +1286,7 @@ async function initMode() {
     // ローカル（試用）モード
     state.authEnabled = false;
     state.isAdmin = false;
+    state.departments = DEFAULT_DEPARTMENTS.slice();
     loadCache();
     setSync("local");
     syncAdminUI();
@@ -1278,7 +1376,15 @@ function init() {
   // ユーザー管理
   $("#userAddForm").addEventListener("submit", handleUserAdd);
   $("#userTable").addEventListener("click", handleUserTableClick);
+  $("#userTable").addEventListener("change", handleUserDeptChange);
   $("#userReloadBtn").addEventListener("click", loadUsers);
+
+  // 事業部マスタ管理
+  $("#deptAddForm").addEventListener("submit", handleDeptAdd);
+  $("#deptChips").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-dept-del]");
+    if (del) deleteDepartment(del.dataset.deptDel);
+  });
 
   // 画像入力
   const dropzone = $("#dropzone");

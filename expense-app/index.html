@@ -115,13 +115,7 @@
               </div>
               <div class="form__row">
                 <label for="expDept">事業部</label>
-                <input
-                  id="expDept"
-                  type="text"
-                  list="deptList"
-                  placeholder="未入力の場合は自分の所属事業部"
-                />
-                <datalist id="deptList"></datalist>
+                <select id="expDept"></select>
               </div>
               <div class="form__row">
                 <label for="expVendor">支払先 / 店名</label>
@@ -273,6 +267,20 @@
           </div>
         </div>
 
+        <!-- 事業部マスタ管理（クラウド＋認証モードのみ） -->
+        <div class="card cloud-only" id="deptMgmtCard" hidden>
+          <h2 class="card__title">事業部の管理</h2>
+          <p class="card__hint">
+            ここで登録した事業部が、申請フォームとユーザー登録のプルダウンに反映されます。
+            削除しても過去の申請データの事業部名は残ります（選択肢から外れるだけ）。
+          </p>
+          <div id="deptChips" class="dept-chips"></div>
+          <form id="deptAddForm" class="form form--inline-add">
+            <input id="newDeptName" type="text" placeholder="新しい事業部名" maxlength="40" required />
+            <button type="submit" class="btn btn--primary">追加</button>
+          </form>
+        </div>
+
         <!-- ユーザー管理（クラウド＋認証モードのみ） -->
         <div class="card cloud-only" id="userMgmtCard" hidden>
           <div class="card__head">
@@ -309,7 +317,7 @@
             </div>
             <div class="form__row">
               <label for="nuDept">事業部</label>
-              <input id="nuDept" type="text" placeholder="例：運送事業部" />
+              <select id="nuDept"></select>
             </div>
             <div class="form__row">
               <label for="nuPassword">初期パスワード（8文字以上）</label>

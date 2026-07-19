@@ -55,6 +55,17 @@ const USER_HEADERS = [
   "department",
 ];
 
+const DEPARTMENTS_SHEET = "departments";
+const DEFAULT_DEPARTMENTS = [
+  "BAR",
+  "人材",
+  "運送",
+  "本部",
+  "ARTGRAGE",
+  "クリニック",
+  "GoonerHouse",
+];
+
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
 
 function getProp_(key) {
@@ -109,6 +120,24 @@ function getSheet_() {
 
 function getUsersSheet_() {
   return ensureSheet_(USERS_SHEET, USER_HEADERS);
+}
+
+/** 事業部マスタ。初回作成時に既定事業部をシードする。 */
+function getDepartmentsSheet_() {
+  const ss = getSpreadsheet_();
+  let sheet = ss.getSheetByName(DEPARTMENTS_SHEET);
+  const fresh = !sheet;
+  if (!sheet) sheet = ss.insertSheet(DEPARTMENTS_SHEET);
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(["name"]);
+    sheet.setFrozenRows(1);
+    if (fresh) {
+      DEFAULT_DEPARTMENTS.forEach(function (d) {
+        sheet.appendRow([d]);
+      });
+    }
+  }
+  return sheet;
 }
 
 function getFolder_() {
@@ -279,14 +308,50 @@ function publicUser_(u) {
 
 /* --------- 認証系アクション --------- */
 
-/** 登録ユーザーの事業部一覧（重複なし・空を除く） */
+/** 事業部マスタの一覧（シート登録順） */
 function listDepartments_() {
-  const set = {};
-  readUsers_().forEach(function (u) {
-    const d = String(u.department || "").trim();
-    if (d) set[d] = true;
-  });
-  return Object.keys(set).sort();
+  const sheet = getDepartmentsSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  return sheet
+    .getRange(2, 1, last - 1, 1)
+    .getValues()
+    .map(function (r) {
+      return String(r[0] || "").trim();
+    })
+    .filter(function (d) {
+      return d;
+    });
+}
+
+function actionAddDepartment_(body) {
+  requireUser_(body.token, true);
+  const name = String(body.name || "").trim();
+  if (!name) throw new Error("事業部名を入力してください");
+  if (name.length > 40) throw new Error("事業部名が長すぎます");
+  if (listDepartments_().indexOf(name) >= 0) {
+    throw new Error("その事業部は既に存在します");
+  }
+  getDepartmentsSheet_().appendRow([name]);
+  return { ok: true, departments: listDepartments_() };
+}
+
+function actionDeleteDepartment_(body) {
+  requireUser_(body.token, true);
+  const name = String(body.name || "").trim();
+  const sheet = getDepartmentsSheet_();
+  const last = sheet.getLastRow();
+  if (last >= 2) {
+    const vals = sheet.getRange(2, 1, last - 1, 1).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      if (String(vals[i][0]).trim() === name) {
+        sheet.deleteRow(i + 2);
+        break;
+      }
+    }
+  }
+  // 既存ユーザー・申請に付与済みの事業部名（履歴）はそのまま残す（選択肢から外すだけ）
+  return { ok: true, departments: listDepartments_() };
 }
 
 function actionSetup_(body) {
@@ -493,6 +558,15 @@ function doPost(e) {
         return json_(actionListUsers_(body));
       case "upsertUser":
         return json_(actionUpsertUser_(body));
+      // ---- 事業部マスタ ----
+      case "listDepartments": {
+        requireUser_(body.token, false);
+        return json_({ ok: true, departments: listDepartments_() });
+      }
+      case "addDepartment":
+        return json_(actionAddDepartment_(body));
+      case "deleteDepartment":
+        return json_(actionDeleteDepartment_(body));
       // ---- 経費データ ----
       case "create": {
         const u = requireUser_(body.token, false);
