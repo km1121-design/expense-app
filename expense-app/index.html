@@ -70,11 +70,23 @@
 
             <label class="dropzone" id="dropzone">
               <input id="imageInput" type="file" accept="image/*" hidden />
-              <span class="dropzone__icon">📷</span>
+              <span class="dropzone__icon">🖼️</span>
               <span class="dropzone__text">
                 クリックして画像を選択、またはドラッグ＆ドロップ
               </span>
             </label>
+            <div class="upload-actions">
+              <label class="btn btn--ghost" id="cameraBtn">
+                📷 その場で撮影
+                <input
+                  id="cameraInput"
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  hidden
+                />
+              </label>
+            </div>
 
             <div class="preview" id="preview" hidden>
               <img id="previewImg" alt="レシートプレビュー" />

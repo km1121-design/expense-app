@@ -707,8 +707,14 @@ function scaleImage(file, maxSize, quality) {
   });
 }
 const makeThumb = (file) => scaleImage(file, 480, 0.7);
+// ドライブ保存用（サイズ節約）
 async function makeUploadBase64(file) {
   const dataUrl = await scaleImage(file, 1600, 0.8);
+  return dataUrl ? { base64: dataUrl.split(",")[1], mime: "image/jpeg" } : null;
+}
+// AI解析用（高精度優先：高解像度・低圧縮）
+async function makeAiBase64(file) {
+  const dataUrl = await scaleImage(file, 2200, 0.92);
   return dataUrl ? { base64: dataUrl.split(",")[1], mime: "image/jpeg" } : null;
 }
 
@@ -817,7 +823,7 @@ async function runAiAnalyze(file) {
   barFill.style.width = "60%";
   statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
   try {
-    const img = await makeUploadBase64(file);
+    const img = await makeAiBase64(file);
     if (!img) return false;
     const data = await apiPost({
       action: "analyzeReceipt",
@@ -1555,6 +1561,11 @@ function init() {
   const dropzone = $("#dropzone");
   $("#imageInput").addEventListener("change", (e) => {
     if (e.target.files[0]) handleImageFile(e.target.files[0]);
+  });
+  // その場で撮影（モバイルではカメラ起動、PCでは対応環境でWebカメラ）
+  $("#cameraInput").addEventListener("change", (e) => {
+    if (e.target.files[0]) handleImageFile(e.target.files[0]);
+    e.target.value = "";
   });
   ["dragenter", "dragover"].forEach((ev) =>
     dropzone.addEventListener(ev, (e) => {

@@ -278,6 +278,15 @@ body {
 .dropzone__text {
   font-size: 0.85rem;
 }
+.upload-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.upload-actions .btn {
+  cursor: pointer;
+}
 .preview {
   margin-top: 16px;
   display: flex;
