@@ -17,8 +17,11 @@
  *                     自動作成・自動保存して以降再利用）
  *   AUTH_SECRET     : セッショントークン署名鍵（初回に自動生成・自動保存）
  *   SHARED_TOKEN    : 分析ツール用の読み取りトークン（設定時、doGet ?token= で全件取得可）
- *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効になる
- *   OCR_MODEL       : AI解析のモデルID（既定: claude-opus-4-8。安価にするなら claude-haiku-4-5）
+ *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）が有効
+ *   GEMINI_MODEL      : Geminiのモデル（既定: gemini-2.5-flash）
+ *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効
+ *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-4-8。安価なら claude-haiku-4-5）
+ *   OCR_PROVIDER      : 併用時の優先プロバイダ "gemini"/"claude"（未指定なら gemini 優先）
  *
  * 認証モード:
  *   users シートが空の間は「オープンモード」（認証なし・従来互換）。
@@ -578,7 +581,7 @@ function doPost(e) {
           ok: true,
           authEnabled: usersExist_(),
           autoApprove: isAutoApprove_(),
-          aiOcr: !!getProp_("ANTHROPIC_API_KEY"),
+          aiOcr: !!resolveOcrProvider_(),
         });
       case "setup":
         return json_(actionSetup_(body));
@@ -749,50 +752,141 @@ function deleteExpense_(id, user) {
 
 /* ========================= AIレシート解析 ========================= */
 
+const RECEIPT_CATEGORIES = [
+  "交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他",
+];
+
+const RECEIPT_PROMPT =
+  "これは経費申請用のレシートまたは領収書の写真です。" +
+  "画像から発行日（yyyy-MM-dd形式）・税込の合計支払金額（円）・店名を正確に読み取り、" +
+  "購入内容から最も適切な経費科目を選び、15文字以内の短い摘要を作成してください。" +
+  "合計金額は「合計」「税込」「ご請求」等の行を優先し、「お預り」「お釣り」「現金」の金額と混同しないこと。" +
+  "読み取れない項目は空文字（金額は0）にしてください。";
+
 /**
- * Claude API（vision + 構造化出力）でレシート画像から
- * 日付・金額・店名・科目・摘要を抽出する。
- * スクリプトプロパティ ANTHROPIC_API_KEY の設定時のみ有効。
- * モデルは OCR_MODEL で変更可（既定: claude-opus-4-8）。
+ * 使用するAI解析プロバイダを決定する。
+ * 優先: スクリプトプロパティ OCR_PROVIDER（"gemini" / "claude"）。
+ * 未指定ならキーが設定されている方（両方あれば gemini）。無ければ ""。
  */
+function resolveOcrProvider_() {
+  const pref = String(getProp_("OCR_PROVIDER") || "").toLowerCase();
+  const hasGemini = !!getProp_("GEMINI_API_KEY");
+  const hasClaude = !!getProp_("ANTHROPIC_API_KEY");
+  if (pref === "gemini" && hasGemini) return "gemini";
+  if (pref === "claude" && hasClaude) return "claude";
+  if (hasGemini) return "gemini";
+  if (hasClaude) return "claude";
+  return "";
+}
+
+/** 抽出結果を正規化（型・既定値をそろえる） */
+function normalizeReceiptFields_(o) {
+  o = o || {};
+  const cat = RECEIPT_CATEGORIES.indexOf(o.category) >= 0 ? o.category : "その他";
+  return {
+    date: String(o.date || "").slice(0, 10),
+    amount: Math.max(0, Math.round(Number(o.amount) || 0)),
+    vendor: String(o.vendor || ""),
+    category: cat,
+    description: String(o.description || ""),
+  };
+}
+
+/** レシート解析（AI）。プロバイダはサーバー設定で選択、3段フォールバックの1段目 */
 function actionAnalyzeReceipt_(body) {
   requireUser_(body.token, false);
-  const apiKey = getProp_("ANTHROPIC_API_KEY");
-  if (!apiKey) throw new Error("AI解析は未設定です（ANTHROPIC_API_KEY を設定してください）");
   if (!body.imageBase64) throw new Error("画像がありません");
+  const provider = resolveOcrProvider_();
+  if (!provider) {
+    throw new Error("AI解析は未設定です（GEMINI_API_KEY または ANTHROPIC_API_KEY を設定してください）");
+  }
+  const fields =
+    provider === "gemini" ? analyzeWithGemini_(body) : analyzeWithClaude_(body);
+  return { ok: true, fields: fields, provider: provider };
+}
 
+/** Gemini（無料枠可）で解析。モデルは GEMINI_MODEL で変更可（既定 gemini-2.5-flash） */
+function analyzeWithGemini_(body) {
+  const apiKey = getProp_("GEMINI_API_KEY");
+  const model = getProp_("GEMINI_MODEL") || "gemini-2.5-flash";
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      date: { type: "STRING" },
+      amount: { type: "INTEGER" },
+      vendor: { type: "STRING" },
+      category: { type: "STRING", enum: RECEIPT_CATEGORIES },
+      description: { type: "STRING" },
+    },
+    required: ["date", "amount", "vendor", "category", "description"],
+  };
+  const payload = {
+    contents: [
+      {
+        parts: [
+          {
+            inline_data: {
+              mime_type: String(body.imageMime || "image/jpeg"),
+              data: String(body.imageBase64),
+            },
+          },
+          { text: RECEIPT_PROMPT },
+        ],
+      },
+    ],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: schema,
+      temperature: 0,
+    },
+  };
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+  const code = res.getResponseCode();
+  let data;
+  try {
+    data = JSON.parse(res.getContentText());
+  } catch (err) {
+    throw new Error("Gemini解析の応答を読み取れませんでした（HTTP " + code + "）");
+  }
+  if (code !== 200) {
+    const msg = data && data.error && data.error.message ? data.error.message : "HTTP " + code;
+    throw new Error("Gemini解析エラー: " + msg);
+  }
+  const cand = (data.candidates || [])[0];
+  if (!cand || !cand.content) throw new Error("Gemini解析が応答を返しませんでした");
+  let text = "";
+  (cand.content.parts || []).forEach(function (p) {
+    if (p.text) text += p.text;
+  });
+  return normalizeReceiptFields_(JSON.parse(text));
+}
+
+/** Claude で解析。モデルは OCR_MODEL で変更可（既定 claude-opus-4-8） */
+function analyzeWithClaude_(body) {
+  const apiKey = getProp_("ANTHROPIC_API_KEY");
   const model = getProp_("OCR_MODEL") || "claude-opus-4-8";
-  const categories = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
-
   const schema = {
     type: "object",
     properties: {
-      date: {
-        type: "string",
-        description: "レシートの発行日（yyyy-MM-dd）。読み取れない場合は空文字",
-      },
-      amount: {
-        type: "integer",
-        description: "税込の合計支払金額（円）。お預り・お釣りではない。読み取れない場合は0",
-      },
-      vendor: {
-        type: "string",
-        description: "店名・支払先。読み取れない場合は空文字",
-      },
-      category: {
-        type: "string",
-        enum: categories,
-        description: "購入内容から最も適切な経費科目",
-      },
-      description: {
-        type: "string",
-        description: "購入内容の短い摘要（15文字以内、例: 打合せ飲食代）。不明なら空文字",
-      },
+      date: { type: "string" },
+      amount: { type: "integer" },
+      vendor: { type: "string" },
+      category: { type: "string", enum: RECEIPT_CATEGORIES },
+      description: { type: "string" },
     },
     required: ["date", "amount", "vendor", "category", "description"],
     additionalProperties: false,
   };
-
   const payload = {
     model: model,
     max_tokens: 1024,
@@ -809,30 +903,18 @@ function actionAnalyzeReceipt_(body) {
               data: String(body.imageBase64),
             },
           },
-          {
-            type: "text",
-            text:
-              "これは経費申請用のレシートまたは領収書の写真です。" +
-              "画像から発行日・税込合計金額・店名を正確に読み取り、" +
-              "購入内容から経費科目を推定してJSONで返してください。" +
-              "合計金額は「合計」「税込」等の行を優先し、「お預り」「お釣り」の金額と混同しないこと。",
-          },
+          { type: "text", text: RECEIPT_PROMPT },
         ],
       },
     ],
   };
-
   const res = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
     method: "post",
     contentType: "application/json",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true,
   });
-
   const code = res.getResponseCode();
   let data;
   try {
@@ -847,13 +929,11 @@ function actionAnalyzeReceipt_(body) {
   if (data.stop_reason === "refusal") {
     throw new Error("AI解析が画像を処理できませんでした");
   }
-
   let text = "";
   (data.content || []).forEach(function (b) {
     if (b.type === "text") text += b.text;
   });
-  const fields = JSON.parse(text); // output_config.format により有効なJSONが保証される
-  return { ok: true, fields: fields, model: String(data.model || model) };
+  return normalizeReceiptFields_(JSON.parse(text));
 }
 
 /* ========================= 月次フォルダの自動生成 ========================= */
