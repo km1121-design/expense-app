@@ -153,6 +153,48 @@ function getFolder_() {
   return folder;
 }
 
+/* --------- 領収書フォルダ体系: 経費領収書/<事業部>/<yyyy-MM>/ --------- */
+
+function getOrCreateSubfolder_(parent, name) {
+  const it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+/** 事業部フォルダ（無ければ作成）。事業部が未設定の申請は「未設定」へ */
+function getDeptFolder_(department) {
+  const name = String(department || "").trim() || "未設定";
+  return getOrCreateSubfolder_(getFolder_(), name);
+}
+
+/** 対象月フォルダ（無ければ作成）。月は経費の日付から決定 */
+function getReceiptMonthFolder_(department, dateStr) {
+  const m = String(dateStr || "").match(/^(\d{4})-(\d{2})/);
+  const month = m
+    ? m[1] + "-" + m[2]
+    : Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
+  return getOrCreateSubfolder_(getDeptFolder_(department), month);
+}
+
+/** ファイル名に使えない文字と空白を除去 */
+function sanitizeFileName_(s) {
+  return String(s || "").replace(/[\\\/:*?"<>|\s]/g, "") || "不明";
+}
+
+/** 命名規則: 日付_申請者_採番(001〜)。同日・同申請者内で連番 */
+function buildReceiptFileName_(folder, dateStr, applicant, mime) {
+  const date =
+    String(dateStr || "").slice(0, 10) ||
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  const base = date + "_" + sanitizeFileName_(applicant) + "_";
+  let count = 0;
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    if (it.next().getName().indexOf(base) === 0) count++;
+  }
+  const ext = String(mime || "").indexOf("png") >= 0 ? ".png" : ".jpg";
+  return base + String(count + 1).padStart(3, "0") + ext;
+}
+
 /* ========================= 認証 ========================= */
 
 function getSecret_() {
@@ -335,6 +377,7 @@ function actionAddDepartment_(body) {
     throw new Error("その事業部は既に存在します");
   }
   getDepartmentsSheet_().appendRow([name]);
+  getDeptFolder_(name); // 領収書フォルダを自動作成
   return { ok: true, departments: listDepartments_() };
 }
 
@@ -352,7 +395,8 @@ function actionDeleteDepartment_(body) {
       }
     }
   }
-  // 既存ユーザー・申請に付与済みの事業部名（履歴）はそのまま残す（選択肢から外すだけ）
+  // 既存ユーザー・申請に付与済みの事業部名（履歴）と、Drive上の領収書フォルダは
+  // そのまま残す（選択肢から外すだけ）
   return { ok: true, departments: listDepartments_() };
 }
 
@@ -598,20 +642,6 @@ function doPost(e) {
 
 function createExpense_(record, user) {
   const sheet = getSheet_();
-  let imageUrl = "";
-  let imageFileId = "";
-  if (record.imageBase64) {
-    const folder = getFolder_();
-    const bytes = Utilities.base64Decode(record.imageBase64);
-    const blob = Utilities.newBlob(
-      bytes,
-      record.imageMime || "image/jpeg",
-      (record.id || "receipt") + ".jpg"
-    );
-    const file = folder.createFile(blob);
-    imageFileId = file.getId();
-    imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
-  }
   // 認証有効時は申請者名・事業部をサーバー側で強制（なりすまし防止）
   const applicant = user.legacy
     ? String(record.applicant || "")
@@ -624,6 +654,28 @@ function createExpense_(record, user) {
   if (!user.legacy && !department) {
     const profile = findUser_(user.username);
     department = String((profile && profile.department) || "");
+  }
+
+  // 領収書画像: 経費領収書/<事業部>/<yyyy-MM>/日付_申請者_採番 で保存
+  let imageUrl = "";
+  let imageFileId = "";
+  if (record.imageBase64) {
+    const folder = getReceiptMonthFolder_(department, record.date);
+    const fileName = buildReceiptFileName_(
+      folder,
+      record.date,
+      applicant,
+      record.imageMime
+    );
+    const bytes = Utilities.base64Decode(record.imageBase64);
+    const blob = Utilities.newBlob(
+      bytes,
+      record.imageMime || "image/jpeg",
+      fileName
+    );
+    const file = folder.createFile(blob);
+    imageFileId = file.getId();
+    imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
   }
   // 自動承認モードでは申請と同時に承認済みにする
   const auto = isAutoApprove_();
@@ -802,6 +854,45 @@ function actionAnalyzeReceipt_(body) {
   });
   const fields = JSON.parse(text); // output_config.format により有効なJSONが保証される
   return { ok: true, fields: fields, model: String(data.model || model) };
+}
+
+/* ========================= 月次フォルダの自動生成 ========================= */
+
+/**
+ * 全事業部（＋未設定）に翌月の領収書フォルダを作成する。
+ * setupMonthlyFolderTrigger() で毎月末（28日）の自動実行を有効化できるほか、
+ * エディタから手動実行も可能。申請保存時にも対象月フォルダは自動作成されるため、
+ * トリガー未設定でも運用に支障はない（事前生成が不要ならこの設定は省略可）。
+ */
+function createNextMonthFolders() {
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const month = Utilities.formatDate(next, tz, "yyyy-MM");
+  const targets = listDepartments_().concat([""]); // "" = 未設定
+  targets.forEach(function (d) {
+    getOrCreateSubfolder_(getDeptFolder_(d), month);
+  });
+  Logger.log("翌月フォルダを作成: %s（%s事業部）", month, targets.length);
+}
+
+/**
+ * メンテナンス用：エディタから一度実行すると、毎月28日23時台に
+ * createNextMonthFolders を自動実行するトリガーを登録する（二重登録は自動で防止）。
+ */
+function setupMonthlyFolderTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "createNextMonthFolders") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger("createNextMonthFolders")
+    .timeBased()
+    .onMonthDay(28)
+    .atHour(23)
+    .create();
+  createNextMonthFolders(); // 登録と同時に翌月分も作成しておく
+  Logger.log("月次フォルダ自動生成トリガーを登録しました（毎月28日）");
 }
 
 /* ========================= メンテナンス ========================= */
