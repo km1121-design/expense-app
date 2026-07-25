@@ -672,6 +672,25 @@ function extractDate(text) {
   return null;
 }
 
+/**
+ * OCRの文字化けらしさを判定。誤った店名で埋めるより空にする方が安全。
+ * 判定: 単語が細かく分断されている／記号や長音記号が多い／日本語らしい塊が無い。
+ */
+function looksGarbled(s) {
+  const v = String(s || "").trim();
+  if (v.length < 2) return true;
+  const tokens = v.split(/\s+/);
+  const shortTokens = tokens.filter((t) => t.length === 1).length;
+  if (tokens.length >= 3 && shortTokens >= 2) return true; // 1文字トークンが散在
+  if ((v.match(/[ー－~ｰ]/g) || []).length >= 3) return true; // 長音記号の連発
+  if ((v.match(/[^\p{L}\p{N}\s()（）・\-＆&']/gu) || []).length >= 3) return true; // 記号過多
+  // 3文字以上つながった日本語/英数の塊が1つも無ければ文字化けとみなす
+  if (!/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}A-Za-z0-9]{3,}/u.test(v)) {
+    return true;
+  }
+  return false;
+}
+
 function extractVendor(text) {
   const lines = text
     .split(/\r?\n/)
@@ -680,7 +699,11 @@ function extractVendor(text) {
   for (const line of lines.slice(0, 5)) {
     if (/^[\d\s¥￥,.\-\/:]+$/.test(line)) continue;
     if (/(領\s*収\s*書|レシート|receipt)/i.test(line)) continue;
-    return line.slice(0, 40);
+    if (/(様|御中)\s*$/.test(line)) continue; // 宛名は店名ではない
+    if (/^T\d{6,}/.test(line)) continue; // インボイス登録番号
+    const v = line.slice(0, 40);
+    if (looksGarbled(v)) continue; // 文字化けは採用しない
+    return v;
   }
   return null;
 }
@@ -878,10 +901,13 @@ async function runAiAnalyze(file) {
     console.error(err);
     // 失敗理由を画面に残す（OCRのメッセージで上書きされないよう別要素に表示）
     const errEl = $("#ocrError");
-    errEl.textContent =
-      "AI解析に失敗したため端末内OCRで解析します。原因: " +
-      (err.message || "不明") +
-      "（設定を見直すと精度が上がります）";
+    const raw = err.message || "不明";
+    // 一時的な混雑（503等）は待って再試行すれば通ることが多い
+    const busy = /503|high demand|overloaded|UNAVAILABLE|quota|RESOURCE_EXHAUSTED|429/i.test(raw);
+    errEl.textContent = busy
+      ? "AIが一時的に混雑して解析できませんでした。数十秒待って「⟳ もう一度AI解析」を押すと成功することが多いです。以下は端末内OCRの結果（精度が低い）なので必ず確認してください。／ 詳細: " +
+        raw
+      : "AI解析に失敗したため端末内OCRで解析します。原因: " + raw;
     errEl.hidden = false;
     statusText.textContent = "端末内OCRで解析します…";
     return false;
@@ -937,8 +963,8 @@ async function runOcr(file) {
       filled.push("店名");
     }
     statusText.textContent = filled.length
-      ? `解析完了：${filled.join("・")}を自動入力しました（内容をご確認ください）`
-      : "解析完了：自動抽出できた項目はありません。手入力してください。";
+      ? `端末内OCRで解析：${filled.join("・")}を自動入力しました。精度が低い場合があるため必ず確認・修正してください`
+      : "端末内OCRで解析：自動抽出できた項目はありません。手入力してください。";
   } catch (err) {
     console.error(err);
     statusText.textContent = "解析に失敗しました。手入力してください。";
@@ -1665,6 +1691,7 @@ function init() {
   });
   $("#clearImage").addEventListener("click", clearImage);
   $("#rotateImage").addEventListener("click", rotateAndReanalyze);
+  $("#retryAnalyze").addEventListener("click", () => analyzeCurrentImage());
 
   // フォーム
   $("#expenseForm").addEventListener("submit", submitExpense);

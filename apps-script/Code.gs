@@ -878,23 +878,37 @@ function actionAnalyzeReceipt_(body) {
 function analyzeWithGemini_(body) {
   const configured = String(getProp_("GEMINI_MODEL") || "").trim();
   const candidates = [];
-  [configured, "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"].forEach(
-    function (m) {
-      if (m && candidates.indexOf(m) < 0) candidates.push(m);
-    }
-  );
+  [
+    configured,
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+  ].forEach(function (m) {
+    if (m && candidates.indexOf(m) < 0) candidates.push(m);
+  });
   let lastErr = null;
-  for (let i = 0; i < candidates.length; i++) {
-    try {
-      return callGemini_(body, candidates[i]);
-    } catch (err) {
-      lastErr = err;
-      const msg = String((err && err.message) || err);
-      // モデル未提供・権限・クォータ系は次の候補を試す。それ以外は即中断
-      if (!/HTTP 40[0349]|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(msg)) {
-        throw err;
+  // 1巡目で全滅した場合は少し待って再挑戦（503は一時的な混雑が多い）
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        return callGemini_(body, candidates[i]);
+      } catch (err) {
+        lastErr = err;
+        const msg = String((err && err.message) || err);
+        // APIキー自体が無効なら、どのモデルでも成功しないので即中断
+        if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
+        // 混雑(503/500/UNAVAILABLE/overloaded)・未提供・権限・クォータは次候補へ
+        if (
+          !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|high demand|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
+            msg
+          )
+        ) {
+          throw err;
+        }
       }
     }
+    if (pass === 0) Utilities.sleep(1500);
   }
   throw lastErr || new Error("Gemini解析に失敗しました");
 }
