@@ -832,18 +832,19 @@ async function runAiAnalyze(file) {
     });
     const f = data.fields || {};
     const filled = [];
+    const missing = [];
     if (f.amount) {
       $("#expAmount").value = f.amount;
       filled.push("金額");
-    }
+    } else missing.push("金額");
     if (f.date) {
       $("#expDate").value = f.date;
       filled.push("日付");
-    }
+    } else missing.push("日付");
     if (f.vendor) {
       $("#expVendor").value = f.vendor;
       filled.push("店名");
-    }
+    } else missing.push("店名");
     if (f.category) {
       $("#expCategory").value = f.category;
       filled.push("科目");
@@ -852,10 +853,21 @@ async function runAiAnalyze(file) {
       $("#expDesc").value = f.description;
       filled.push("摘要");
     }
+
+    // AIが読み取った全文を表示（誤読の確認・報告用）
+    if (f.rawText) {
+      $("#ocrRaw").textContent = f.rawText;
+      $("#ocrRawWrap").hidden = false;
+    }
+
     barFill.style.width = "100%";
-    statusText.textContent = filled.length
+    let msg = filled.length
       ? `AI解析完了：${filled.join("・")}を自動入力しました（内容をご確認ください）`
       : "AI解析完了：読み取れた項目がありません。手入力してください。";
+    if (filled.length && missing.length) {
+      msg += ` ／ ${missing.join("・")}は読み取れませんでした（手入力してください）`;
+    }
+    statusText.textContent = msg;
     return true;
   } catch (err) {
     if (err instanceof AuthError) {

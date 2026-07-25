@@ -756,16 +756,40 @@ const RECEIPT_CATEGORIES = [
   "交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他",
 ];
 
-const RECEIPT_PROMPT =
-  "あなたは日本の経費精算の担当者です。添付はレシートまたは領収書の写真です。" +
-  "手書き・感熱紙のかすれ・斜め・影・低解像度でも、細部まで丁寧に読み取ってください。\n" +
-  "抽出ルール:\n" +
-  "・date: 発行日を yyyy-MM-dd 形式で。和暦（令和/R6 など）は西暦へ変換（令和=2018+年、例 R6→2024、令和8年→2026）。年が無ければ発行年を推測せず月日のみ判明なら当年を補う。\n" +
-  "・amount: 実際に支払った税込の合計金額（整数・円）。『合計』『税込合計』『ご請求額』『お会計』を最優先。『小計』『税抜』『お預り/預り金』『お釣り/釣銭』『現金』『クレジット』『ポイント利用』『前回残高』の数字は絶対に採用しない。割引後の最終金額を採る。\n" +
-  "・vendor: 店名・屋号（通常はレシート最上部やロゴ、『領収書』の宛名ではなく発行店）。法人格（株式会社等）や支店名は付けてよい。\n" +
-  "・category: 購入品目から最適な経費科目を1つ選ぶ（交通費=切符/IC/タクシー/高速, 交際費=飲食接待/手土産, 会議費=打合せ飲食/会議室, 消耗品費=文具/日用品, 通信費=携帯/切手/宅配, 宿泊費=ホテル旅館, それ以外=その他）。\n" +
-  "・description: 何の支払いかを15文字以内で簡潔に（例: 取引先との会食、事務用品購入）。\n" +
-  "読み取れない項目は空文字（amount は 0）。推測が必要な場合も、最も確からしい1案を返すこと。";
+/** 今日の日付（JST等スクリプトTZ）をプロンプトに渡すためのヘルパ */
+function todayStr_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+}
+
+/** レシート解析プロンプト（今日の日付を埋め込む） */
+function buildReceiptPrompt_() {
+  const today = todayStr_();
+  return (
+    "あなたは日本の経費精算の担当者です。添付はレシートまたは領収書の写真です。\n" +
+    "今日の日付は " + today + " です（この日付より未来の発行日はありえません）。\n\n" +
+    "手順を必ず守ってください:\n" +
+    "手順1: まず raw_text に、画像に写っている文字を上から順にできる限り全て書き起こす" +
+    "（店名・住所・電話・日付・品目・金額・合計・支払方法まで。読めない箇所は ? と書く）。\n" +
+    "手順2: その書き起こしを根拠に、他の項目を埋める。書き起こしに無い情報を創作しないこと。\n\n" +
+    "各項目のルール:\n" +
+    "・date: 発行日を yyyy-MM-dd で。和暦は西暦へ変換（令和N年 = 2018+N。例: 令和6年→2024年、R8→2026年）。" +
+    "『2026年7月15日』『26/07/15』『7/15』等の表記に対応。年の記載が無い場合は " + today + " を基準に" +
+    "直近の過去日として補う（未来日にしない）。日と月の判別に迷う場合は日本式（月/日）と解釈する。" +
+    "利用日と発行日が異なる場合は発行日を採用。\n" +
+    "・amount: 実際に支払った税込の合計金額（整数・円）。『合計』『税込合計』『ご請求額』『お会計』『領収金額』を最優先。" +
+    "『小計』『税抜』『内消費税』『お預り/預り金』『お釣り/釣銭』『現金』『クレジット』『ポイント利用』『前回残高』は絶対に採用しない。" +
+    "割引・値引後の最終支払額を採る。\n" +
+    "・vendor: 領収書を発行した店舗・会社の名前（屋号）。判定のヒント: 通常はレシート最上部やロゴ部分、" +
+    "または住所・電話番号・インボイス登録番号（T+13桁）が並ぶ発行者情報ブロックの先頭にある。" +
+    "次のものは店名ではないので絶対に採用しない: 宛名（『〇〇様』『〇〇御中』『上記正に領収いたしました』の相手先）、" +
+    "『領収書』『レシート』『お買上票』等の見出し、住所・電話番号・登録番号そのもの、商品名・品目名、" +
+    "『但し書き』の内容、決済会社名（〇〇Pay/カード会社）。支店名や法人格（株式会社等）は含めてよい。\n" +
+    "・category: 品目から最適な経費科目を1つ（交通費=切符/IC/タクシー/高速/駐車, 交際費=接待飲食/手土産, " +
+    "会議費=打合せ飲食/会議室, 消耗品費=文具/日用品/備品, 通信費=携帯/切手/宅配便, 宿泊費=ホテル/旅館, その他=該当なし）。\n" +
+    "・description: 何の支払いかを15文字以内で簡潔に（例: 取引先との会食、事務用品購入）。\n\n" +
+    "読み取れない項目は空文字（amount は 0）にし、創作しないこと。"
+  );
+}
 
 /**
  * 使用するAI解析プロバイダを決定する。
@@ -783,16 +807,46 @@ function resolveOcrProvider_() {
   return "";
 }
 
-/** 抽出結果を正規化（型・既定値をそろえる） */
+/**
+ * 日付の妥当性チェック。yyyy-MM-dd 以外・実在しない日・未来日・
+ * 10年より前は採用しない（誤った日付で埋めるより空にする方が安全）。
+ */
+function sanitizeReceiptDate_(s) {
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return "";
+  const today = new Date();
+  const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+  if (dt >= tomorrow) return ""; // 未来日は誤読
+  if (y < today.getFullYear() - 10) return "";
+  return m[0];
+}
+
+/** 店名として不適切な値（宛名・見出し・番号など）を除外 */
+function sanitizeReceiptVendor_(s) {
+  let v = String(s || "").trim();
+  if (!v) return "";
+  if (/(領\s*収\s*書|レシート|お?買上票|明細書|請求書|控え)$/.test(v)) return "";
+  if (/(様|御中)\s*$/.test(v)) return ""; // 宛名
+  if (/^T\d{6,}/.test(v)) return ""; // インボイス登録番号
+  if (/^[\d\s\-()+]+$/.test(v)) return ""; // 電話番号・数字のみ
+  if (/^(〒|\d{3}-?\d{4})/.test(v)) return ""; // 住所（郵便番号始まり）
+  return v.slice(0, 60);
+}
+
+/** 抽出結果を正規化（型・既定値をそろえ、明らかな誤りは空にする） */
 function normalizeReceiptFields_(o) {
   o = o || {};
   const cat = RECEIPT_CATEGORIES.indexOf(o.category) >= 0 ? o.category : "その他";
   return {
-    date: String(o.date || "").slice(0, 10),
+    date: sanitizeReceiptDate_(o.date),
     amount: Math.max(0, Math.round(Number(o.amount) || 0)),
-    vendor: String(o.vendor || ""),
+    vendor: sanitizeReceiptVendor_(o.vendor),
     category: cat,
-    description: String(o.description || ""),
+    description: String(o.description || "").slice(0, 60),
+    rawText: String(o.raw_text || o.rawText || ""),
   };
 }
 
@@ -813,16 +867,22 @@ function actionAnalyzeReceipt_(body) {
 function analyzeWithGemini_(body) {
   const apiKey = getProp_("GEMINI_API_KEY");
   const model = getProp_("GEMINI_MODEL") || "gemini-2.5-flash";
+  // raw_text を先に書き起こさせることで抽出の根拠を作り、精度を上げる
   const schema = {
     type: "OBJECT",
     properties: {
+      raw_text: { type: "STRING" },
       date: { type: "STRING" },
       amount: { type: "INTEGER" },
       vendor: { type: "STRING" },
       category: { type: "STRING", enum: RECEIPT_CATEGORIES },
       description: { type: "STRING" },
     },
-    required: ["date", "amount", "vendor", "category", "description"],
+    // プロパティ順（＝生成順）を明示。raw_text を最初に生成させる
+    propertyOrdering: [
+      "raw_text", "date", "amount", "vendor", "category", "description",
+    ],
+    required: ["raw_text", "date", "amount", "vendor", "category", "description"],
   };
   const payload = {
     contents: [
@@ -834,7 +894,7 @@ function analyzeWithGemini_(body) {
               data: String(body.imageBase64),
             },
           },
-          { text: RECEIPT_PROMPT },
+          { text: buildReceiptPrompt_() },
         ],
       },
     ],
@@ -882,13 +942,14 @@ function analyzeWithClaude_(body) {
   const schema = {
     type: "object",
     properties: {
+      raw_text: { type: "string" },
       date: { type: "string" },
       amount: { type: "integer" },
       vendor: { type: "string" },
       category: { type: "string", enum: RECEIPT_CATEGORIES },
       description: { type: "string" },
     },
-    required: ["date", "amount", "vendor", "category", "description"],
+    required: ["raw_text", "date", "amount", "vendor", "category", "description"],
     additionalProperties: false,
   };
   const payload = {
@@ -907,7 +968,7 @@ function analyzeWithClaude_(body) {
               data: String(body.imageBase64),
             },
           },
-          { type: "text", text: RECEIPT_PROMPT },
+          { type: "text", text: buildReceiptPrompt_() },
         ],
       },
     ],
