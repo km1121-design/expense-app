@@ -770,8 +770,9 @@ function buildReceiptPrompt_() {
     "重要: 写真は90度・180度回転している場合や、斜め・影・感熱紙のかすれがある場合があります。" +
     "文字の向きを判断し、必要なら頭の中で回転させて正しく読んでください。\n\n" +
     "手順を必ず守ってください:\n" +
-    "手順1: まず raw_text に、画像に写っている文字を上から順にできる限り全て書き起こす" +
-    "（店名・住所・電話・日付・品目・金額・合計・支払方法まで。読めない箇所は ? と書く）。\n" +
+    "手順1: まず raw_text に、判断の根拠となる行を上から順に書き起こす" +
+    "（店名・日付・合計金額・主要な品目・支払方法。最大20行程度に絞り、住所や電話番号、" +
+    "同種の品目の羅列は省略してよい。読めない箇所は ? と書く）。\n" +
     "手順2: その書き起こしを根拠に、他の項目を埋める。書き起こしに無い情報を創作しないこと。\n\n" +
     "各項目のルール:\n" +
     "・date: 発行日を yyyy-MM-dd で。和暦は西暦へ変換（令和N年 = 2018+N。例: 令和6年→2024年、R8→2026年）。" +
@@ -950,23 +951,48 @@ function callGemini_(body, model) {
       responseMimeType: "application/json",
       responseSchema: schema,
       temperature: 0,
+      maxOutputTokens: 1200, // 出力を絞って生成時間を短縮
     },
   };
+  // 思考時間の短縮（レシート読み取りは推論より知覚のタスク）。
+  // 3.x 系は thinkingLevel、2.5 系は thinkingConfig.thinkingBudget=0 で無効化。
+  const level = String(getProp_("GEMINI_THINKING") || "low").toLowerCase();
+  if (level !== "default") {
+    if (/gemini-3/.test(model)) {
+      payload.generationConfig.thinkingLevel = level; // minimal | low | medium | high
+    } else if (/gemini-2\.5/.test(model)) {
+      payload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    }
+  }
   const url =
     "https://generativelanguage.googleapis.com/v1beta/models/" +
     encodeURIComponent(model) +
     ":generateContent?key=" +
     encodeURIComponent(apiKey);
-  const res = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
-  const code = res.getResponseCode();
+  const fetchOnce = function (p) {
+    return UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(p),
+      muteHttpExceptions: true,
+    });
+  };
+
+  let res = fetchOnce(payload);
+  let code = res.getResponseCode();
+  let body2 = res.getContentText();
+  // 思考制御フィールド非対応モデルは 400 になるため、その場合は外して1回だけ再試行
+  if (code === 400 && /thinking/i.test(body2)) {
+    delete payload.generationConfig.thinkingLevel;
+    delete payload.generationConfig.thinkingConfig;
+    res = fetchOnce(payload);
+    code = res.getResponseCode();
+    body2 = res.getContentText();
+  }
+
   let data;
   try {
-    data = JSON.parse(res.getContentText());
+    data = JSON.parse(body2);
   } catch (err) {
     throw new Error("Gemini解析の応答を読み取れませんでした（HTTP " + code + "）");
   }

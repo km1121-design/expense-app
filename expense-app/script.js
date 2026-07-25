@@ -29,6 +29,7 @@ const state = {
   activeTab: "apply",
   lastImageThumb: null,
   lastImageFile: null,
+  lastAiBase64: null, // AI解析用画像のキャッシュ（再解析を高速化）
   config: { endpoint: "" },
   session: null, // { token, user:{username,displayName,role,department} }
   departments: [], // 登録済み事業部の一覧（申請フォームの候補）
@@ -735,10 +736,42 @@ async function makeUploadBase64(file) {
   const dataUrl = await scaleImage(file, 1600, 0.8);
   return dataUrl ? { base64: dataUrl.split(",")[1], mime: "image/jpeg" } : null;
 }
-// AI解析用（高精度優先：高解像度・低圧縮）
-async function makeAiBase64(file) {
-  const dataUrl = await scaleImage(file, 2200, 0.92);
-  return dataUrl ? { base64: dataUrl.split(",")[1], mime: "image/jpeg" } : null;
+
+/** 1回のデコードで縮小版を複数作る（スマホの大きな写真は decode が重いため） */
+function decodeImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => resolve({ img, url });
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+function imgToDataUrl(img, maxSize, quality) {
+  const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+/**
+ * サムネイルとAI解析用画像を1回のデコードで生成し、結果をキャッシュする。
+ * AI解析用は 1600px/0.85（Geminiは内部でタイル分割するため過大な解像度は
+ * 転送時間だけ増えて精度に寄与しにくい）。
+ */
+async function prepareImageVariants(file) {
+  const decoded = await decodeImage(file);
+  if (!decoded) return null;
+  const { img, url } = decoded;
+  const thumb = imgToDataUrl(img, 480, 0.7);
+  const ai = imgToDataUrl(img, 1600, 0.85);
+  URL.revokeObjectURL(url);
+  return { thumb, aiBase64: ai.split(",")[1] };
 }
 
 /**
@@ -847,12 +880,18 @@ async function runAiAnalyze(file) {
   barFill.style.width = "60%";
   statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
   try {
-    const img = await makeAiBase64(file);
-    if (!img) return false;
+    // アップロード時に作成済みのAI用画像を再利用（再エンコードしないので再解析が速い）
+    let base64 = state.lastAiBase64;
+    if (!base64) {
+      const v = await prepareImageVariants(file);
+      if (!v) return false;
+      base64 = v.aiBase64;
+      state.lastAiBase64 = base64;
+    }
     const data = await apiPost({
       action: "analyzeReceipt",
-      imageBase64: img.base64,
-      imageMime: img.mime,
+      imageBase64: base64,
+      imageMime: "image/jpeg",
     });
     const f = data.fields || {};
     const filled = [];
@@ -981,9 +1020,11 @@ async function handleImageFile(file) {
     return;
   }
   state.lastImageFile = file;
-  const thumb = await makeThumb(file);
-  state.lastImageThumb = thumb;
-  $("#previewImg").src = thumb || "";
+  // 1回のデコードでサムネイルとAI用画像を同時に用意（待ち時間短縮）
+  const v = await prepareImageVariants(file);
+  state.lastImageThumb = v ? v.thumb : null;
+  state.lastAiBase64 = v ? v.aiBase64 : null;
+  $("#previewImg").src = state.lastImageThumb || "";
   $("#preview").hidden = false;
   await analyzeCurrentImage();
 }
@@ -1009,9 +1050,10 @@ async function rotateAndReanalyze() {
     return;
   }
   state.lastImageFile = rotated;
-  const thumb = await makeThumb(rotated);
-  state.lastImageThumb = thumb;
-  $("#previewImg").src = thumb || "";
+  const v = await prepareImageVariants(rotated);
+  state.lastImageThumb = v ? v.thumb : null;
+  state.lastAiBase64 = v ? v.aiBase64 : null; // 回転後は作り直す
+  $("#previewImg").src = state.lastImageThumb || "";
   toast("画像を90°回転しました。再解析します…");
   await analyzeCurrentImage();
 }
@@ -1056,6 +1098,7 @@ function rotateImageFile(file, deg) {
 function clearImage() {
   state.lastImageThumb = null;
   state.lastImageFile = null;
+  state.lastAiBase64 = null;
   $("#preview").hidden = true;
   $("#previewImg").src = "";
   $("#imageInput").value = "";
@@ -1111,7 +1154,13 @@ async function submitExpense(evt) {
       toast("経費を申請しました（この端末に保存）");
     } else {
       setSync("syncing");
-      const img = state.lastImageFile ? await makeUploadBase64(state.lastImageFile) : null;
+      // 解析時に作成した画像を再利用（無ければここで生成）。再エンコードを避けて送信を高速化
+      let img = null;
+      if (state.lastAiBase64) {
+        img = { base64: state.lastAiBase64, mime: "image/jpeg" };
+      } else if (state.lastImageFile) {
+        img = await makeUploadBase64(state.lastImageFile);
+      }
       const record = { ...base };
       if (img) {
         record.imageBase64 = img.base64;
