@@ -820,6 +820,7 @@ async function runAiAnalyze(file) {
   const statusText = $("#ocrStatusText");
   statusEl.hidden = false;
   $("#ocrRawWrap").hidden = true;
+  $("#ocrError").hidden = true;
   barFill.style.width = "60%";
   statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
   try {
@@ -875,7 +876,14 @@ async function runAiAnalyze(file) {
       return true; // ログイン画面へ誘導済み。OCRへは進まない
     }
     console.error(err);
-    statusText.textContent = "AI解析に失敗しました。端末内OCRで再試行します…";
+    // 失敗理由を画面に残す（OCRのメッセージで上書きされないよう別要素に表示）
+    const errEl = $("#ocrError");
+    errEl.textContent =
+      "AI解析に失敗したため端末内OCRで解析します。原因: " +
+      (err.message || "不明") +
+      "（設定を見直すと精度が上がります）";
+    errEl.hidden = false;
+    statusText.textContent = "端末内OCRで解析します…";
     return false;
   }
 }
@@ -951,13 +959,72 @@ async function handleImageFile(file) {
   state.lastImageThumb = thumb;
   $("#previewImg").src = thumb || "";
   $("#preview").hidden = false;
+  await analyzeCurrentImage();
+}
 
-  // AI解析（高精度）→ 失敗・未設定時は端末内OCRへフォールバック
+/** 現在の画像を解析（AI → 端末内OCR の順でフォールバック） */
+async function analyzeCurrentImage() {
+  const file = state.lastImageFile;
+  if (!file) return;
   if (cloudEnabled() && state.session && state.aiOcr) {
     const done = await runAiAnalyze(file);
     if (done) return;
   }
   runOcr(file);
+}
+
+/** 画像を時計回りに90度回転し、再解析する（倒れた写真の精度対策） */
+async function rotateAndReanalyze() {
+  const file = state.lastImageFile;
+  if (!file) return;
+  const rotated = await rotateImageFile(file, 90);
+  if (!rotated) {
+    toast("画像を回転できませんでした");
+    return;
+  }
+  state.lastImageFile = rotated;
+  const thumb = await makeThumb(rotated);
+  state.lastImageThumb = thumb;
+  $("#previewImg").src = thumb || "";
+  toast("画像を90°回転しました。再解析します…");
+  await analyzeCurrentImage();
+}
+
+/** 画像ファイルを指定角度で回転した新しい File を返す */
+function rotateImageFile(file, deg) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const swap = deg % 180 !== 0;
+      const canvas = document.createElement("canvas");
+      canvas.width = swap ? img.height : img.width;
+      canvas.height = swap ? img.width : img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate((deg * Math.PI) / 180);
+      ctx.drawImage(img, -img.width / 2, -img.height / 2);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(
+        (blob) => {
+          resolve(
+            blob
+              ? new File([blob], (file.name || "receipt") + ".jpg", {
+                  type: "image/jpeg",
+                })
+              : null
+          );
+        },
+        "image/jpeg",
+        0.95
+      );
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
 }
 
 function clearImage() {
@@ -968,6 +1035,7 @@ function clearImage() {
   $("#imageInput").value = "";
   $("#ocrStatus").hidden = true;
   $("#ocrRawWrap").hidden = true;
+  $("#ocrError").hidden = true;
 }
 
 async function submitExpense(evt) {
@@ -1596,6 +1664,7 @@ function init() {
     if (file) handleImageFile(file);
   });
   $("#clearImage").addEventListener("click", clearImage);
+  $("#rotateImage").addEventListener("click", rotateAndReanalyze);
 
   // フォーム
   $("#expenseForm").addEventListener("submit", submitExpense);

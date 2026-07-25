@@ -300,6 +300,17 @@ body {
   border-radius: 8px;
   border: 1px solid var(--border);
 }
+.preview__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ocr-error {
+  color: var(--red);
+  font-size: 0.78rem;
+  margin-top: 6px;
+  word-break: break-word;
+}
 
 .ocr-status {
   margin-top: 16px;

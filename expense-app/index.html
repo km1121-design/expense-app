@@ -90,14 +90,20 @@
 
             <div class="preview" id="preview" hidden>
               <img id="previewImg" alt="レシートプレビュー" />
-              <button id="clearImage" type="button" class="btn btn--ghost btn--sm">
-                画像を削除
-              </button>
+              <div class="preview__actions">
+                <button id="rotateImage" type="button" class="btn btn--ghost btn--sm">
+                  ↻ 90°回転して再解析
+                </button>
+                <button id="clearImage" type="button" class="btn btn--ghost btn--sm">
+                  画像を削除
+                </button>
+              </div>
             </div>
 
             <div class="ocr-status" id="ocrStatus" hidden>
               <div class="ocr-bar"><div class="ocr-bar__fill" id="ocrBarFill"></div></div>
               <span id="ocrStatusText">解析中…</span>
+              <p class="ocr-error" id="ocrError" hidden></p>
             </div>
 
             <details class="ocr-raw" id="ocrRawWrap" hidden>

@@ -767,6 +767,8 @@ function buildReceiptPrompt_() {
   return (
     "あなたは日本の経費精算の担当者です。添付はレシートまたは領収書の写真です。\n" +
     "今日の日付は " + today + " です（この日付より未来の発行日はありえません）。\n\n" +
+    "重要: 写真は90度・180度回転している場合や、斜め・影・感熱紙のかすれがある場合があります。" +
+    "文字の向きを判断し、必要なら頭の中で回転させて正しく読んでください。\n\n" +
     "手順を必ず守ってください:\n" +
     "手順1: まず raw_text に、画像に写っている文字を上から順にできる限り全て書き起こす" +
     "（店名・住所・電話・日付・品目・金額・合計・支払方法まで。読めない箇所は ? と書く）。\n" +
@@ -858,15 +860,47 @@ function actionAnalyzeReceipt_(body) {
   if (!provider) {
     throw new Error("AI解析は未設定です（GEMINI_API_KEY または ANTHROPIC_API_KEY を設定してください）");
   }
-  const fields =
+  const out =
     provider === "gemini" ? analyzeWithGemini_(body) : analyzeWithClaude_(body);
-  return { ok: true, fields: fields, provider: provider };
+  return {
+    ok: true,
+    fields: out.fields || out,
+    provider: provider,
+    model: out.model || "",
+  };
 }
 
-/** Gemini（無料枠可）で解析。モデルは GEMINI_MODEL で変更可（既定 gemini-2.5-flash） */
+/**
+ * Gemini（無料枠可）で解析。GEMINI_MODEL 未指定なら無料枠対象の高精度モデルを順に試す。
+ * モデル未提供・クォータ超過（404/403/429）の場合は次の候補へフォールバックし、
+ * 全滅した場合は最後のエラーを投げる（＝原因が画面に出る）。
+ */
 function analyzeWithGemini_(body) {
+  const configured = String(getProp_("GEMINI_MODEL") || "").trim();
+  const candidates = [];
+  [configured, "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"].forEach(
+    function (m) {
+      if (m && candidates.indexOf(m) < 0) candidates.push(m);
+    }
+  );
+  let lastErr = null;
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      return callGemini_(body, candidates[i]);
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err && err.message) || err);
+      // モデル未提供・権限・クォータ系は次の候補を試す。それ以外は即中断
+      if (!/HTTP 40[0349]|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr || new Error("Gemini解析に失敗しました");
+}
+
+function callGemini_(body, model) {
   const apiKey = getProp_("GEMINI_API_KEY");
-  const model = getProp_("GEMINI_MODEL") || "gemini-2.5-flash";
   // raw_text を先に書き起こさせることで抽出の根拠を作り、精度を上げる
   const schema = {
     type: "OBJECT",
@@ -924,15 +958,15 @@ function analyzeWithGemini_(body) {
   }
   if (code !== 200) {
     const msg = data && data.error && data.error.message ? data.error.message : "HTTP " + code;
-    throw new Error("Gemini解析エラー: " + msg);
+    throw new Error("Gemini解析エラー(" + model + " / HTTP " + code + "): " + msg);
   }
   const cand = (data.candidates || [])[0];
-  if (!cand || !cand.content) throw new Error("Gemini解析が応答を返しませんでした");
+  if (!cand || !cand.content) throw new Error("Gemini解析が応答を返しませんでした（" + model + "）");
   let text = "";
   (cand.content.parts || []).forEach(function (p) {
     if (p.text) text += p.text;
   });
-  return normalizeReceiptFields_(JSON.parse(text));
+  return { fields: normalizeReceiptFields_(JSON.parse(text)), model: model };
 }
 
 /** Claude で解析。モデルは OCR_MODEL で変更可（既定 claude-opus-4-8） */
@@ -998,7 +1032,10 @@ function analyzeWithClaude_(body) {
   (data.content || []).forEach(function (b) {
     if (b.type === "text") text += b.text;
   });
-  return normalizeReceiptFields_(JSON.parse(text));
+  return {
+    fields: normalizeReceiptFields_(JSON.parse(text)),
+    model: String(data.model || model),
+  };
 }
 
 /* ========================= 月次フォルダの自動生成 ========================= */
