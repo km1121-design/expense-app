@@ -302,6 +302,38 @@
           </form>
         </div>
 
+        <!-- AI解析の学習データ（クラウド＋認証モードのみ） -->
+        <div class="card cloud-only" id="memoryCard" hidden>
+          <div class="card__head">
+            <h2 class="card__title">AI解析の学習データ（店舗別）</h2>
+            <button id="memoryReloadBtn" type="button" class="btn btn--ghost btn--sm">
+              再読込
+            </button>
+          </div>
+          <p class="card__hint">
+            申請時の手修正を店舗ごとに記憶し、次回同じ店舗のレシートで
+            <strong>店名・科目・摘要</strong>を自動補正します。過去に金額・日付を誤読した店舗では、
+            その事例をAIに伝えたうえで読み直します。
+            学習内容が実態に合わなくなったら「学習を削除」でその店舗の記憶だけを消せます
+            （申請データは消えません）。
+          </p>
+          <div class="table-wrap">
+            <table class="table" id="memoryTable">
+              <thead>
+                <tr>
+                  <th>店名</th>
+                  <th>科目</th>
+                  <th>摘要</th>
+                  <th>学習件数</th>
+                  <th>誤読事例</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
         <!-- ユーザー管理（クラウド＋認証モードのみ） -->
         <div class="card cloud-only" id="userMgmtCard" hidden>
           <div class="card__head">

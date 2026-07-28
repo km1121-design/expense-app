@@ -129,7 +129,34 @@
 | `applicantId` | 申請者のユーザーID（権限フィルタに使用） |
 
 このほか `users` シート（`username, displayName, passwordHash, salt, role, active,
-createdAt`）が同じスプレッドシートに作成されます。
+createdAt`）、`departments` シート（事業部マスタ）、`corrections` シート
+（AI解析の学習ログ）が同じスプレッドシートに作成されます。
+
+### `corrections` シート（AI解析の学習ログ）
+
+AI解析を使った申請ごとに 1 行、「AIが読み取った値」と「利用者が確定した値」を
+記録します。次回以降の解析で、店名をキーに次の 2 つへ再利用されます。
+
+1. **辞書補正** … 同じ店舗の確定値で **店名・科目・摘要** を自動補正する
+   （金額・日付は毎回変わるため辞書では触りません）。摘要は同じ内容が
+   2 回以上確定した場合のみ採用します。
+2. **誤読事例のフィードバック** … その店舗で過去に金額・日付・店名を
+   誤読していた場合、実際の誤りをプロンプトへ添えて **1 回だけ読み直します**。
+   誤読履歴が無い店舗では読み直しは発生しません（＝通常どおりの速度）。
+
+店名が読み取れなかった申請は、次回の手がかりにできないため記録しません。
+直近 600 件を参照します。学習内容は管理者ダッシュボードの
+「AI解析の学習データ（店舗別）」で確認でき、店舗単位で削除（学習のやり直し）が
+できます。削除しても申請データそのものは残ります。
+
+### 学習ロジックのテスト
+
+学習の記録・辞書補正・誤読事例のフィードバックには回帰テストがあります
+（Google への接続不要・依存ライブラリなし）。
+
+```
+node apps-script/tests/memory.test.js
+```
 
 ## API（分析ツール・他システム連携用）
 
@@ -149,7 +176,10 @@ createdAt`）が同じスプレッドシートに作成されます。
   - `{action:"listUsers", token}` / `{action:"upsertUser", token, user:{...}}`
     … ユーザー管理（admin のみ）
   - `{action:"analyzeReceipt", token, imageBase64, imageMime}` … AIレシート解析
-    （`ANTHROPIC_API_KEY` 設定時のみ。日付・金額・店名・科目・摘要をJSONで返却）
+    （`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` 設定時のみ。日付・金額・店名・科目・
+    摘要をJSONで返却。過去の学習を適用した場合は `learned` を併せて返す）
+  - `{action:"listVendorMemory", token}` / `{action:"deleteVendorMemory", token, key}`
+    … AI解析の学習データの確認・店舗単位の削除（admin のみ）
 
 ## 分析・実績管理への連携例
 

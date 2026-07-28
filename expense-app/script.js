@@ -30,6 +30,7 @@ const state = {
   lastImageThumb: null,
   lastImageFile: null,
   lastAiBase64: null, // AI解析用画像のキャッシュ（再解析を高速化）
+  lastAiFields: null, // AIが提案した値（申請時に手修正との差分を学習ログへ送る）
   config: { endpoint: "" },
   session: null, // { token, user:{username,displayName,role,department} }
   departments: [], // 登録済み事業部の一覧（申請フォームの候補）
@@ -297,6 +298,7 @@ function applySessionUI() {
   $("#passwordCard").hidden = !(cloud && state.session && state.authEnabled);
   $("#userMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#deptMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  $("#memoryCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
     const roleEl = $("#sessionRole");
@@ -543,6 +545,61 @@ function renderUsers(users) {
         )
         .join("")
     : `<tr><td colspan="6" class="empty">ユーザーがいません。</td></tr>`;
+}
+
+/* =========================================================================
+ * AI解析の学習データ（管理者のみ）
+ * ========================================================================= */
+
+async function loadVendorMemory() {
+  try {
+    const data = await apiPost({ action: "listVendorMemory" });
+    renderVendorMemory(data.items || []);
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "学習データの取得に失敗しました");
+  }
+}
+
+function renderVendorMemory(items) {
+  const tbody = $("#memoryTable tbody");
+  tbody.innerHTML = items.length
+    ? items
+        .map(
+          (m) => `
+      <tr>
+        <td>${escapeHtml(m.vendor || "（店名なし）")}</td>
+        <td>${escapeHtml(m.category || "—")}</td>
+        <td>${escapeHtml(m.description || "—")}</td>
+        <td>${m.count}</td>
+        <td>${m.mistakes ? `${m.mistakes}件` : "—"}</td>
+        <td>
+          <button class="btn btn--ghost btn--sm" data-memory-del="${escapeHtml(
+            m.key
+          )}" data-memory-name="${escapeHtml(m.vendor || "")}">学習を削除</button>
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="6" class="empty">まだ学習データがありません。AI解析を使って申請すると貯まります。</td></tr>`;
+}
+
+async function deleteVendorMemory(key, name) {
+  if (
+    !window.confirm(
+      `「${name || key}」の学習内容を削除しますか？\n（この店舗の自動補正が初期状態に戻ります。申請データは消えません）`
+    )
+  ) {
+    return;
+  }
+  try {
+    const data = await apiPost({ action: "deleteVendorMemory", key });
+    toast(`学習データを削除しました（${data.deleted || 0}件）`);
+    await loadVendorMemory();
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "削除に失敗しました");
+  }
 }
 
 async function handleUserAdd(evt) {
@@ -877,6 +934,7 @@ async function runAiAnalyze(file) {
   statusEl.hidden = false;
   $("#ocrRawWrap").hidden = true;
   $("#ocrError").hidden = true;
+  state.lastAiFields = null;
   barFill.style.width = "60%";
   statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
   try {
@@ -923,12 +981,29 @@ async function runAiAnalyze(file) {
       $("#ocrRawWrap").hidden = false;
     }
 
+    // AIの提案値を控えておき、送信時に手修正との差分を学習ログへ送る
+    state.lastAiFields = {
+      date: f.date || "",
+      amount: Number(f.amount) || 0,
+      vendor: f.vendor || "",
+      category: f.category || "",
+      description: f.description || "",
+      rawText: (f.rawText || "").slice(0, 400),
+    };
+
     barFill.style.width = "100%";
     let msg = filled.length
       ? `AI解析完了：${filled.join("・")}を自動入力しました（内容をご確認ください）`
       : "AI解析完了：読み取れた項目がありません。手入力してください。";
     if (filled.length && missing.length) {
       msg += ` ／ ${missing.join("・")}は読み取れませんでした（手入力してください）`;
+    }
+    const learned = data.learned || {};
+    if (learned.retried) {
+      msg += " ／ この店舗の過去の誤読を踏まえて読み直しました";
+    }
+    if (learned.applied && learned.applied.length) {
+      msg += ` ／ 過去の修正から${learned.applied.join("・")}を自動補正しました`;
     }
     statusText.textContent = msg;
     return true;
@@ -1099,6 +1174,7 @@ function clearImage() {
   state.lastImageThumb = null;
   state.lastImageFile = null;
   state.lastAiBase64 = null;
+  state.lastAiFields = null;
   $("#preview").hidden = true;
   $("#previewImg").src = "";
   $("#imageInput").value = "";
@@ -1166,6 +1242,8 @@ async function submitExpense(evt) {
         record.imageBase64 = img.base64;
         record.imageMime = img.mime;
       }
+      // AI解析を使った申請は提案値も送り、手修正の差分をサーバー側で学習させる
+      if (state.lastAiFields) record.ai = state.lastAiFields;
       try {
         await apiPost({ action: "create", record });
         await refreshFromCloud();
@@ -1558,6 +1636,7 @@ function setTab(tab) {
   );
   if (tab === "admin" && cloudEnabled() && state.isAdmin && state.authEnabled) {
     loadUsers();
+    loadVendorMemory();
   }
 }
 
@@ -1704,6 +1783,13 @@ function init() {
   $("#userTable").addEventListener("click", handleUserTableClick);
   $("#userTable").addEventListener("change", handleUserDeptChange);
   $("#userReloadBtn").addEventListener("click", loadUsers);
+
+  // AI解析の学習データ
+  $("#memoryReloadBtn").addEventListener("click", loadVendorMemory);
+  $("#memoryTable").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-memory-del]");
+    if (del) deleteVendorMemory(del.dataset.memoryDel, del.dataset.memoryName);
+  });
 
   // 事業部マスタ管理
   $("#deptAddForm").addEventListener("submit", handleDeptAdd);
