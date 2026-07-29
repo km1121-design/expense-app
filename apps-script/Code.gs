@@ -653,6 +653,9 @@ function doPost(e) {
         return json_(actionAddDepartment_(body));
       case "deleteDepartment":
         return json_(actionDeleteDepartment_(body));
+      // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
+      case "receiptImage":
+        return json_(actionReceiptImage_(body));
       // ---- AIレシート解析 ----
       case "analyzeReceipt":
         return json_(actionAnalyzeReceipt_(body));
@@ -798,6 +801,61 @@ function deleteExpense_(id, user) {
   }
   sheet.deleteRow(row);
   return { ok: true };
+}
+
+/* ========================= 領収書画像の取得 ========================= */
+
+/**
+ * 領収書画像をアプリ経由（＝GASの実行アカウント権限）で返す。
+ * ドライブのフォルダを共有していない場合、利用者のブラウザから
+ * drive.google.com のサムネイルを直接読めないため、その代替として使う。
+ * 一般ユーザーは自分の申請の画像のみ取得できる。
+ *
+ * thumb=true のときは Drive 生成のサムネイル（小さく軽い）を優先する。
+ */
+function actionReceiptImage_(body) {
+  const u = requireUser_(body.token, false);
+  const id = String(body.imageFileId || "").trim();
+  if (!id) throw new Error("画像が指定されていません");
+
+  // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）
+  const values = getSheet_().getDataRange().getValues();
+  const head = values[0];
+  const cFile = head.indexOf("imageFileId");
+  const cApplicant = head.indexOf("applicantId");
+  let allowed = false;
+  let found = false;
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][cFile]) !== id) continue;
+    found = true;
+    allowed =
+      !!u.legacy ||
+      u.role === "admin" ||
+      String(values[i][cApplicant]) === u.username;
+    break;
+  }
+  if (!found) throw new Error("画像が見つかりません");
+  if (!allowed) throw new Error("forbidden");
+
+  const file = DriveApp.getFileById(id);
+  let blob = null;
+  if (body.thumb) {
+    try {
+      blob = file.getThumbnail();
+    } catch (err) {
+      blob = null; // サムネイル未生成のファイルは原本で返す
+    }
+  }
+  if (!blob) blob = file.getBlob();
+  if (!blob) throw new Error("画像を取得できませんでした");
+  return {
+    ok: true,
+    dataUrl:
+      "data:" +
+      blob.getContentType() +
+      ";base64," +
+      Utilities.base64Encode(blob.getBytes()),
+  };
 }
 
 /* ==================== AI解析の学習（店舗別の補正記憶） ==================== */

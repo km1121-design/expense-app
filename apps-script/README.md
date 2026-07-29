@@ -180,6 +180,10 @@ node apps-script/tests/memory.test.js
     摘要をJSONで返却。過去の学習を適用した場合は `learned` を併せて返す）
   - `{action:"listVendorMemory", token}` / `{action:"deleteVendorMemory", token, key}`
     … AI解析の学習データの確認・店舗単位の削除（admin のみ）
+  - `{action:"receiptImage", token, imageFileId, thumb}` … 領収書画像を data URL で返す。
+    ドライブのフォルダを共有していない利用者向けのフォールバック（ダッシュボードが
+    サムネイルの読み込みに失敗したときに自動で使う）。シートに登録済みのファイルIDのみ許可し、
+    一般ユーザーは自分の申請の画像に限定。`thumb:true` で Drive 生成の小さいサムネイルを返す
 
 ## 分析・実績管理への連携例
 

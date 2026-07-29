@@ -171,14 +171,21 @@
         <div class="card">
           <div class="card__head">
             <h2 class="card__title">自分の申請一覧</h2>
-            <select id="personalFilter" class="mini-select">
-              <option value="all">すべて</option>
-              <option value="pending">申請中</option>
-              <option value="approved">承認済み</option>
-              <option value="rejected">却下</option>
-            </select>
+            <div class="filters">
+              <select id="personalFilter" class="mini-select">
+                <option value="all">すべて</option>
+                <option value="pending">申請中</option>
+                <option value="approved">承認済み</option>
+                <option value="rejected">却下</option>
+              </select>
+              <div class="view-toggle" id="personalViewToggle" role="group" aria-label="表示切替">
+                <button type="button" data-view="cards" data-scope="personal">🧾 領収書</button>
+                <button type="button" data-view="table" data-scope="personal">≡ 表</button>
+              </div>
+            </div>
           </div>
-          <div class="table-wrap">
+          <div class="cards" id="personalCards" hidden></div>
+          <div class="table-wrap" id="personalTableWrap">
             <table class="table" id="personalTable">
               <thead>
                 <tr>
@@ -255,6 +262,11 @@
                 <option value="approved">承認済み</option>
                 <option value="rejected">却下</option>
               </select>
+              <select id="adminReceiptFilter" class="mini-select">
+                <option value="all">領収書：すべて</option>
+                <option value="yes">領収書あり</option>
+                <option value="no">領収書なし</option>
+              </select>
               <select id="adminSort" class="mini-select">
                 <option value="date_desc">日付（新しい順）</option>
                 <option value="date_asc">日付（古い順）</option>
@@ -263,12 +275,17 @@
                 <option value="department">事業部順</option>
                 <option value="category">区分（科目）順</option>
               </select>
+              <div class="view-toggle" id="adminViewToggle" role="group" aria-label="表示切替">
+                <button type="button" data-view="cards" data-scope="admin">🧾 領収書</button>
+                <button type="button" data-view="table" data-scope="admin">≡ 表</button>
+              </div>
               <button id="csvBtn" type="button" class="btn btn--ghost btn--sm">
                 CSV書き出し
               </button>
             </div>
           </div>
-          <div class="table-wrap">
+          <div class="cards" id="adminCards" hidden></div>
+          <div class="table-wrap" id="adminTableWrap">
             <table class="table" id="adminTable">
               <thead>
                 <tr>
@@ -460,6 +477,37 @@
           <button id="cfgSave" type="button" class="btn btn--primary">保存して接続</button>
           <button id="cfgClear" type="button" class="btn btn--ghost">連携を解除</button>
           <button type="button" class="btn btn--ghost" data-close>閉じる</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 領収書ビューア（拡大表示） ===== -->
+    <div class="modal lightbox" id="receiptModal" hidden>
+      <div class="modal__backdrop" data-lb-close></div>
+      <div class="lightbox__box">
+        <div class="lightbox__bar">
+          <div class="lightbox__title">
+            <strong id="lbTitle"></strong>
+            <span id="lbSub"></span>
+          </div>
+          <span class="lightbox__count" id="lbCount"></span>
+          <button type="button" class="lightbox__btn" data-lb-close aria-label="閉じる">✕</button>
+        </div>
+        <div class="lightbox__stage">
+          <button type="button" class="lightbox__nav" data-lb-prev aria-label="前の領収書">◀</button>
+          <img id="lbImg" alt="領収書" />
+          <p class="lightbox__error" id="lbError" hidden>
+            画像を表示できませんでした。Google ドライブ上の画像に、
+            このGoogleアカウントの閲覧権限が無い可能性があります。
+            下の「ドライブで開く」から確認してください。
+          </p>
+          <button type="button" class="lightbox__nav" data-lb-next aria-label="次の領収書">▶</button>
+        </div>
+        <div class="lightbox__foot">
+          <a id="lbOpen" href="#" target="_blank" rel="noopener" class="btn btn--ghost btn--sm">
+            ドライブで開く ↗
+          </a>
+          <span class="lightbox__hint">← → キーで移動 / Esc で閉じる</span>
         </div>
       </div>
     </div>
