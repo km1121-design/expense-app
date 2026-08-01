@@ -2,7 +2,7 @@
  * 経費申請アプリ バックエンド（Google Apps Script Web App）
  *
  * 役割:
- *   - スプレッドシートを経費データ／ユーザーのデータベースとして使用
+ *   - スプレッドシートを経費データ／ユーザー／AI解析の学習ログのデータベースとして使用
  *   - アップロードされた領収書画像を Google Drive フォルダに保存し、URL を行に記録
  *   - ユーザー認証（ソルト付き SHA-256 ハッシュ）と署名付きセッショントークンの発行
  *   - 権限制御: user = 自分の申請のみ / admin = 全申請＋承認＋ユーザー管理
@@ -71,6 +71,38 @@ const DEFAULT_DEPARTMENTS = [
   "GoonerHouse",
 ];
 
+/**
+ * AI解析の学習ログ（店舗ごとの手修正の履歴）。
+ * 申請保存時に「AIの読み取り結果」と「利用者が確定した値」を1行ずつ記録し、
+ * 次回以降の解析で ①辞書補正 ②誤読事例のフィードバック に再利用する。
+ */
+const CORRECTIONS_SHEET = "corrections";
+const CORRECTION_HEADERS = [
+  "createdAt",
+  "vendorKey",
+  "aiVendorKey",
+  "vendor",
+  "date",
+  "amount",
+  "category",
+  "description",
+  "aiVendor",
+  "aiDate",
+  "aiAmount",
+  "aiCategory",
+  "aiDescription",
+  "corrected",
+  "applicantId",
+  "rawHead",
+];
+
+/** 学習に使う直近の履歴件数（履歴が育っても解析の所要時間を一定に保つ） */
+const CORRECTION_LOOKBACK = 600;
+/** プロンプトへ添付する誤読事例の最大件数 */
+const CORRECTION_HINT_MAX = 3;
+/** 摘要を自動補正するのに必要な最低一致回数（1回だけの摘要は使い回さない） */
+const DESCRIPTION_MIN_HITS = 2;
+
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
 
 function getProp_(key) {
@@ -125,6 +157,10 @@ function getSheet_() {
 
 function getUsersSheet_() {
   return ensureSheet_(USERS_SHEET, USER_HEADERS);
+}
+
+function getCorrectionsSheet_() {
+  return ensureSheet_(CORRECTIONS_SHEET, CORRECTION_HEADERS);
 }
 
 /** 事業部マスタ。初回作成時に既定事業部をシードする。 */
@@ -617,9 +653,17 @@ function doPost(e) {
         return json_(actionAddDepartment_(body));
       case "deleteDepartment":
         return json_(actionDeleteDepartment_(body));
+      // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
+      case "receiptImage":
+        return json_(actionReceiptImage_(body));
       // ---- AIレシート解析 ----
       case "analyzeReceipt":
         return json_(actionAnalyzeReceipt_(body));
+      // ---- AI解析の学習データ（店舗別の補正記憶） ----
+      case "listVendorMemory":
+        return json_(actionListVendorMemory_(body));
+      case "deleteVendorMemory":
+        return json_(actionDeleteVendorMemory_(body));
       // ---- 経費データ ----
       case "create": {
         const u = requireUser_(body.token, false);
@@ -705,6 +749,15 @@ function createExpense_(record, user) {
       return rec[h];
     })
   );
+  // AI解析を使った申請は「AIの読み取り」と「確定値」の差分を学習ログへ残す。
+  // 学習ログの失敗で申請そのものを落とさないよう、例外は握りつぶす。
+  if (record.ai) {
+    try {
+      logCorrection_(rec, record.ai, applicantId);
+    } catch (err) {
+      // noop
+    }
+  }
   return { ok: true, record: rec };
 }
 
@@ -750,6 +803,343 @@ function deleteExpense_(id, user) {
   return { ok: true };
 }
 
+/* ========================= 領収書画像の取得 ========================= */
+
+/**
+ * 領収書画像をアプリ経由（＝GASの実行アカウント権限）で返す。
+ * ドライブのフォルダを共有していない場合、利用者のブラウザから
+ * drive.google.com のサムネイルを直接読めないため、その代替として使う。
+ * 一般ユーザーは自分の申請の画像のみ取得できる。
+ *
+ * thumb=true のときは Drive 生成のサムネイル（小さく軽い）を優先する。
+ */
+function actionReceiptImage_(body) {
+  const u = requireUser_(body.token, false);
+  const id = String(body.imageFileId || "").trim();
+  if (!id) throw new Error("画像が指定されていません");
+
+  // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）
+  const values = getSheet_().getDataRange().getValues();
+  const head = values[0];
+  const cFile = head.indexOf("imageFileId");
+  const cApplicant = head.indexOf("applicantId");
+  let allowed = false;
+  let found = false;
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][cFile]) !== id) continue;
+    found = true;
+    allowed =
+      !!u.legacy ||
+      u.role === "admin" ||
+      String(values[i][cApplicant]) === u.username;
+    break;
+  }
+  if (!found) throw new Error("画像が見つかりません");
+  if (!allowed) throw new Error("forbidden");
+
+  const file = DriveApp.getFileById(id);
+  let blob = null;
+  if (body.thumb) {
+    try {
+      blob = file.getThumbnail();
+    } catch (err) {
+      blob = null; // サムネイル未生成のファイルは原本で返す
+    }
+  }
+  if (!blob) blob = file.getBlob();
+  if (!blob) throw new Error("画像を取得できませんでした");
+  return {
+    ok: true,
+    dataUrl:
+      "data:" +
+      blob.getContentType() +
+      ";base64," +
+      Utilities.base64Encode(blob.getBytes()),
+  };
+}
+
+/* ==================== AI解析の学習（店舗別の補正記憶） ==================== */
+
+/**
+ * 店名の照合キー。表記ゆれ（全半角・空白・法人格・記号）を吸収して
+ * 「同じ店」を同じキーに寄せる。空文字なら学習対象外。
+ */
+function vendorKey_(s) {
+  let v = String(s || "").trim();
+  if (!v) return "";
+  try {
+    v = v.normalize("NFKC"); // 全角英数・半角カナを正規化
+  } catch (err) {
+    // 旧ランタイム互換（normalize 未対応でも動作させる）
+  }
+  v = v.toLowerCase();
+  v = v.replace(/(株式会社|有限会社|合同会社|㈱|㈲)/g, "");
+  v = v.replace(/[\s　()（）\[\]【】「」・.,、。\-ー–—_/\\]/g, "");
+  return v.slice(0, 24);
+}
+
+/** シートが Date へ自動変換した日付を yyyy-MM-dd の文字列へ戻す */
+function correctionDate_(v) {
+  if (v instanceof Date) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  return String(v || "");
+}
+
+/**
+ * 直近 CORRECTION_LOOKBACK 件の学習ログを読む（古い順）。
+ * 1リクエスト内で複数回引くため結果を保持する（GASは実行ごとに初期化されるので
+ * リクエストをまたいで古い内容が残ることはない）。
+ */
+let CORRECTIONS_CACHE_ = null;
+function readRecentCorrections_() {
+  if (CORRECTIONS_CACHE_) return CORRECTIONS_CACHE_;
+  const sheet = getCorrectionsSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return (CORRECTIONS_CACHE_ = []);
+  const start = Math.max(2, last - CORRECTION_LOOKBACK + 1);
+  const values = sheet
+    .getRange(start, 1, last - start + 1, CORRECTION_HEADERS.length)
+    .getValues();
+  const out = [];
+  values.forEach(function (row) {
+    const r = {};
+    CORRECTION_HEADERS.forEach(function (h, i) {
+      r[h] = row[i];
+    });
+    if (!r.vendorKey && !r.aiVendorKey) return;
+    r.date = correctionDate_(r.date);
+    r.aiDate = correctionDate_(r.aiDate);
+    r.amount = Number(r.amount) || 0;
+    r.aiAmount = Number(r.aiAmount) || 0;
+    out.push(r);
+  });
+  CORRECTIONS_CACHE_ = out;
+  return out;
+}
+
+/**
+ * 最頻値を返す。同数の場合は新しい行（＝配列の後ろ）を優先し、
+ * 運用の変更が古い履歴に埋もれないようにする。
+ */
+function mostFrequent_(rows, field) {
+  const counts = {};
+  let best = "";
+  let bestN = 0;
+  rows.forEach(function (r) {
+    const v = String(r[field] == null ? "" : r[field]).trim();
+    if (!v) return;
+    counts[v] = (counts[v] || 0) + 1;
+    if (counts[v] >= bestN) {
+      bestN = counts[v];
+      best = v;
+    }
+  });
+  return { value: best, count: bestN };
+}
+
+/** 学習ログ（同一店舗分）を、辞書＋誤読事例に要約する */
+function summarizeCorrections_(rows) {
+  const mistakes = [];
+  for (let i = rows.length - 1; i >= 0 && mistakes.length < CORRECTION_HINT_MAX; i--) {
+    const r = rows[i];
+    const amountWrong = r.aiAmount > 0 && r.aiAmount !== r.amount && r.amount > 0;
+    const dateWrong = !!r.aiDate && !!r.date && r.aiDate !== r.date;
+    const vendorWrong =
+      !!r.aiVendor && !!r.vendor && vendorKey_(r.aiVendor) !== vendorKey_(r.vendor);
+    if (!amountWrong && !dateWrong && !vendorWrong) continue;
+    mistakes.push({
+      amountWrong: amountWrong,
+      dateWrong: dateWrong,
+      vendorWrong: vendorWrong,
+      amount: r.amount,
+      aiAmount: r.aiAmount,
+      date: r.date,
+      aiDate: r.aiDate,
+      vendor: String(r.vendor || ""),
+      aiVendor: String(r.aiVendor || ""),
+      rawHead: String(r.rawHead || ""),
+    });
+  }
+  return {
+    count: rows.length,
+    vendor: mostFrequent_(rows, "vendor"),
+    category: mostFrequent_(rows, "category"),
+    description: mostFrequent_(rows, "description"),
+    mistakes: mistakes,
+  };
+}
+
+/**
+ * 指定した店舗キーの学習内容を取り出す（履歴が無ければ null）。
+ * AIが誤った店名を返した場合でも、その誤読を記録した行から確定名にたどり、
+ * 同じ店舗の履歴をまとめて集め直す（誤読1回分だけで判断しない）。
+ */
+function buildVendorMemory_(key) {
+  if (!key) return null;
+  const all = readRecentCorrections_();
+  const match = function (r, k) {
+    return r.vendorKey === k || r.aiVendorKey === k;
+  };
+  let rows = all.filter(function (r) {
+    return match(r, key);
+  });
+  if (!rows.length) return null;
+  const canonical = mostFrequent_(rows, "vendorKey").value;
+  if (canonical && canonical !== key) {
+    const merged = all.filter(function (r) {
+      return match(r, canonical) || match(r, key);
+    });
+    if (merged.length > rows.length) rows = merged;
+  }
+  return summarizeCorrections_(rows);
+}
+
+/**
+ * ①辞書補正: 過去の確定値で 店名・科目・摘要 を上書きする。
+ * 金額・日付は毎回変わるため辞書では触らない（②のヒントで対応する）。
+ */
+function applyVendorMemory_(fields, memory) {
+  const applied = [];
+  if (!memory) return applied;
+  if (memory.vendor.value && memory.vendor.value !== fields.vendor) {
+    fields.vendor = memory.vendor.value;
+    applied.push("店名");
+  }
+  if (memory.category.value && memory.category.value !== fields.category) {
+    fields.category = memory.category.value;
+    applied.push("科目");
+  }
+  if (
+    memory.description.count >= DESCRIPTION_MIN_HITS &&
+    memory.description.value &&
+    memory.description.value !== fields.description
+  ) {
+    fields.description = memory.description.value;
+    applied.push("摘要");
+  }
+  return applied;
+}
+
+/** ②誤読事例: 過去に間違えた読み取りをプロンプトへ添える */
+function buildCorrectionHint_(memory) {
+  const lines = memory.mistakes.map(function (m) {
+    const parts = [];
+    if (m.amountWrong) {
+      parts.push("金額を " + m.aiAmount + " と読んだが、正しくは " + m.amount + " だった");
+    }
+    if (m.dateWrong) {
+      parts.push("日付を " + m.aiDate + " と読んだが、正しくは " + m.date + " だった");
+    }
+    if (m.vendorWrong) {
+      parts.push(
+        "店名を「" + m.aiVendor + "」と読んだが、正しくは「" + m.vendor + "」だった"
+      );
+    }
+    return "・" + parts.join("／") + (m.rawHead ? "（そのときの書き起こし: " + m.rawHead + "）" : "");
+  });
+  return (
+    "\n\n【この店舗のレシートで過去に実際にあった誤読】\n" +
+    lines.join("\n") +
+    "\n同じ間違いを繰り返さないでください。金額は最終的な支払合計、日付は発行日を、" +
+    "根拠になる行を慎重に選び直してから答えること。"
+  );
+}
+
+/** 申請確定時に「AIの読み取り」と「確定値」を1行記録する */
+function logCorrection_(rec, ai, applicantId) {
+  const aiVendor = String(ai.vendor || "").slice(0, 60);
+  const key = vendorKey_(rec.vendor);
+  const aiKey = vendorKey_(aiVendor);
+  if (!key && !aiKey) return; // 店名が無いと次回の手がかりにできない
+  const aiDate = String(ai.date || "");
+  const aiAmount = Math.max(0, Math.round(Number(ai.amount) || 0));
+  const aiCategory = String(ai.category || "");
+  const aiDescription = String(ai.description || "").slice(0, 60);
+  const corrected = [];
+  if (aiDate !== String(rec.date || "")) corrected.push("date");
+  if (aiAmount !== Number(rec.amount || 0)) corrected.push("amount");
+  if (aiKey !== key) corrected.push("vendor");
+  if (aiCategory !== String(rec.category || "")) corrected.push("category");
+  if (aiDescription !== String(rec.description || "")) corrected.push("description");
+  const rawHead = String(ai.rawText || "")
+    .replace(/\s+/g, " ")
+    .slice(0, 150);
+  const row = {
+    createdAt: new Date().toISOString(),
+    vendorKey: key,
+    aiVendorKey: aiKey,
+    vendor: String(rec.vendor || ""),
+    date: String(rec.date || ""),
+    amount: Number(rec.amount || 0),
+    category: String(rec.category || ""),
+    description: String(rec.description || "").slice(0, 60),
+    aiVendor: aiVendor,
+    aiDate: aiDate,
+    aiAmount: aiAmount,
+    aiCategory: aiCategory,
+    aiDescription: aiDescription,
+    corrected: corrected.join(","),
+    applicantId: String(applicantId || ""),
+    rawHead: rawHead,
+  };
+  getCorrectionsSheet_().appendRow(
+    CORRECTION_HEADERS.map(function (h) {
+      return row[h];
+    })
+  );
+  CORRECTIONS_CACHE_ = null;
+}
+
+/** 管理者向け: 学習内容を店舗ごとに集計して返す */
+function actionListVendorMemory_(body) {
+  requireUser_(body.token, true);
+  const groups = {};
+  readRecentCorrections_().forEach(function (r) {
+    const k = r.vendorKey || r.aiVendorKey;
+    if (!groups[k]) groups[k] = [];
+    groups[k].push(r);
+  });
+  const items = Object.keys(groups).map(function (k) {
+    const m = summarizeCorrections_(groups[k]);
+    return {
+      key: k,
+      vendor: m.vendor.value || String(groups[k][groups[k].length - 1].aiVendor || ""),
+      category: m.category.value,
+      description:
+        m.description.count >= DESCRIPTION_MIN_HITS ? m.description.value : "",
+      count: m.count,
+      mistakes: m.mistakes.length,
+    };
+  });
+  items.sort(function (a, b) {
+    return b.count - a.count;
+  });
+  return { ok: true, items: items };
+}
+
+/** 管理者向け: 誤った学習をやり直すため、店舗単位で履歴を削除する */
+function actionDeleteVendorMemory_(body) {
+  requireUser_(body.token, true);
+  const key = String(body.key || "").trim();
+  if (!key) throw new Error("削除対象の店舗が指定されていません");
+  const sheet = getCorrectionsSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return { ok: true, deleted: 0 };
+  const kCol = CORRECTION_HEADERS.indexOf("vendorKey");
+  const aCol = CORRECTION_HEADERS.indexOf("aiVendorKey");
+  const vals = sheet.getRange(2, 1, last - 1, CORRECTION_HEADERS.length).getValues();
+  let deleted = 0;
+  for (let i = vals.length - 1; i >= 0; i--) {
+    if (String(vals[i][kCol]) === key || String(vals[i][aCol]) === key) {
+      sheet.deleteRow(i + 2);
+      deleted++;
+    }
+  }
+  CORRECTIONS_CACHE_ = null;
+  return { ok: true, deleted: deleted };
+}
+
 /* ========================= AIレシート解析 ========================= */
 
 const RECEIPT_CATEGORIES = [
@@ -761,8 +1151,11 @@ function todayStr_() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
 }
 
-/** レシート解析プロンプト（今日の日付を埋め込む） */
-function buildReceiptPrompt_() {
+/**
+ * レシート解析プロンプト（今日の日付を埋め込む）。
+ * hint には過去の誤読事例（buildCorrectionHint_）を渡せる。
+ */
+function buildReceiptPrompt_(hint) {
   const today = todayStr_();
   return (
     "あなたは日本の経費精算の担当者です。添付はレシートまたは領収書の写真です。\n" +
@@ -790,7 +1183,8 @@ function buildReceiptPrompt_() {
     "・category: 品目から最適な経費科目を1つ（交通費=切符/IC/タクシー/高速/駐車, 交際費=接待飲食/手土産, " +
     "会議費=打合せ飲食/会議室, 消耗品費=文具/日用品/備品, 通信費=携帯/切手/宅配便, 宿泊費=ホテル/旅館, その他=該当なし）。\n" +
     "・description: 何の支払いかを15文字以内で簡潔に（例: 取引先との会食、事務用品購入）。\n\n" +
-    "読み取れない項目は空文字（amount は 0）にし、創作しないこと。"
+    "読み取れない項目は空文字（amount は 0）にし、創作しないこと。" +
+    String(hint || "")
   );
 }
 
@@ -853,7 +1247,12 @@ function normalizeReceiptFields_(o) {
   };
 }
 
-/** レシート解析（AI）。プロバイダはサーバー設定で選択、3段フォールバックの1段目 */
+/**
+ * レシート解析（AI）。プロバイダはサーバー設定で選択、3段フォールバックの1段目。
+ * 解析後、読み取れた店名をキーに過去の手修正（学習ログ）を反映する:
+ *   ② 過去に金額・日付・店名を誤読した店舗なら、その事例を添えて1回だけ読み直す
+ *   ① 確定済みの 店名・科目・摘要 を辞書として上書きする
+ */
 function actionAnalyzeReceipt_(body) {
   requireUser_(body.token, false);
   if (!body.imageBase64) throw new Error("画像がありません");
@@ -861,13 +1260,45 @@ function actionAnalyzeReceipt_(body) {
   if (!provider) {
     throw new Error("AI解析は未設定です（GEMINI_API_KEY または ANTHROPIC_API_KEY を設定してください）");
   }
-  const out =
-    provider === "gemini" ? analyzeWithGemini_(body) : analyzeWithClaude_(body);
+  const analyze = function (hint) {
+    return provider === "gemini"
+      ? analyzeWithGemini_(body, hint)
+      : analyzeWithClaude_(body, hint);
+  };
+
+  let out = analyze("");
+  let fields = out.fields || out;
+  let memory = buildVendorMemory_(vendorKey_(fields.vendor));
+  let retried = false;
+
+  if (memory && memory.mistakes.length) {
+    try {
+      const out2 = analyze(buildCorrectionHint_(memory));
+      const f2 = out2.fields || out2;
+      // 読み直しで金額・日付のどちらも取れないなら初回結果の方が信頼できる
+      if (f2 && (f2.amount || f2.date)) {
+        out = out2;
+        fields = f2;
+        retried = true;
+        const m2 = buildVendorMemory_(vendorKey_(fields.vendor));
+        if (m2) memory = m2;
+      }
+    } catch (err) {
+      // ヒント付きの読み直しに失敗しても、初回の結果で処理を続ける
+    }
+  }
+
+  const applied = applyVendorMemory_(fields, memory);
   return {
     ok: true,
-    fields: out.fields || out,
+    fields: fields,
     provider: provider,
     model: out.model || "",
+    learned: {
+      applied: applied,
+      count: memory ? memory.count : 0,
+      retried: retried,
+    },
   };
 }
 
@@ -876,7 +1307,7 @@ function actionAnalyzeReceipt_(body) {
  * モデル未提供・クォータ超過（404/403/429）の場合は次の候補へフォールバックし、
  * 全滅した場合は最後のエラーを投げる（＝原因が画面に出る）。
  */
-function analyzeWithGemini_(body) {
+function analyzeWithGemini_(body, hint) {
   const configured = String(getProp_("GEMINI_MODEL") || "").trim();
   const candidates = [];
   [
@@ -893,7 +1324,7 @@ function analyzeWithGemini_(body) {
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < candidates.length; i++) {
       try {
-        return callGemini_(body, candidates[i]);
+        return callGemini_(body, candidates[i], hint);
       } catch (err) {
         lastErr = err;
         const msg = String((err && err.message) || err);
@@ -914,7 +1345,7 @@ function analyzeWithGemini_(body) {
   throw lastErr || new Error("Gemini解析に失敗しました");
 }
 
-function callGemini_(body, model) {
+function callGemini_(body, model, hint) {
   const apiKey = getProp_("GEMINI_API_KEY");
   // raw_text を先に書き起こさせることで抽出の根拠を作り、精度を上げる
   const schema = {
@@ -943,7 +1374,7 @@ function callGemini_(body, model) {
               data: String(body.imageBase64),
             },
           },
-          { text: buildReceiptPrompt_() },
+          { text: buildReceiptPrompt_(hint) },
         ],
       },
     ],
@@ -1010,7 +1441,7 @@ function callGemini_(body, model) {
 }
 
 /** Claude で解析。モデルは OCR_MODEL で変更可（既定 claude-opus-4-8） */
-function analyzeWithClaude_(body) {
+function analyzeWithClaude_(body, hint) {
   const apiKey = getProp_("ANTHROPIC_API_KEY");
   const model = getProp_("OCR_MODEL") || "claude-opus-4-8";
   const schema = {
@@ -1042,7 +1473,7 @@ function analyzeWithClaude_(body) {
               data: String(body.imageBase64),
             },
           },
-          { type: "text", text: buildReceiptPrompt_() },
+          { type: "text", text: buildReceiptPrompt_(hint) },
         ],
       },
     ],

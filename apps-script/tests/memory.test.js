@@ -1,0 +1,255 @@
+/**
+ * Code.gs のAI解析学習ロジック（店舗別の補正記憶）の回帰テスト。
+ *
+ *   node apps-script/tests/memory.test.js
+ *
+ * Apps Script のサービスを最小限スタブして Code.gs を読み込み、学習の記録・
+ * 辞書補正・誤読事例のフィードバックが期待どおり動くかを確認する。
+ * 依存ライブラリなし・Google への接続なしで実行できる。
+ */
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+
+// ---- 最小限の GAS スタブ ----
+class FakeSheet {
+  constructor(headers) {
+    this.rows = [headers.slice()];
+  }
+  getLastRow() { return this.rows.length; }
+  getLastColumn() { return this.rows[0].length; }
+  appendRow(r) { this.rows.push(r.slice()); }
+  setFrozenRows() {}
+  deleteRow(n) { this.rows.splice(n - 1, 1); }
+  getRange(row, col, numRows, numCols) {
+    const self = this;
+    return {
+      getValues() {
+        const out = [];
+        for (let i = 0; i < numRows; i++) {
+          const src = self.rows[row - 1 + i] || [];
+          const line = [];
+          for (let j = 0; j < numCols; j++) line.push(src[col - 1 + j]);
+          out.push(line);
+        }
+        return out;
+      },
+      setValues(vals) {
+        vals.forEach((line, i) => {
+          const target = (self.rows[row - 1 + i] = self.rows[row - 1 + i] || []);
+          line.forEach((v, j) => { target[col - 1 + j] = v; });
+        });
+      },
+      setValue(v) { self.rows[row - 1][col - 1] = v; },
+      getValue() { return self.rows[row - 1][col - 1]; },
+    };
+  }
+}
+
+const sheets = {};
+const props = {};
+const sandbox = {
+  console,
+  PropertiesService: {
+    getScriptProperties: () => ({
+      getProperty: (k) => props[k] || null,
+      setProperty: (k, v) => { props[k] = v; },
+    }),
+  },
+  SpreadsheetApp: {
+    getActiveSpreadsheet: () => ({
+      getId: () => "fake",
+      getSheetByName: (n) => sheets[n] || null,
+      insertSheet: (n) => (sheets[n] = new FakeSheet([])),
+    }),
+    openById: () => sandbox.SpreadsheetApp.getActiveSpreadsheet(),
+    create: () => sandbox.SpreadsheetApp.getActiveSpreadsheet(),
+  },
+  Session: { getScriptTimeZone: () => "Asia/Tokyo" },
+  Utilities: {
+    formatDate: (d, tz, fmt) => {
+      const p = (n) => String(n).padStart(2, "0");
+      const s = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+      return fmt === "yyyy-MM" ? s.slice(0, 7) : s;
+    },
+    getUuid: () => "uuid",
+  },
+  DriveApp: {},
+  ContentService: { createTextOutput: () => ({ setMimeType: () => ({}) }) },
+  ScriptApp: {},
+  Logger: { log: () => {} },
+};
+sandbox.SpreadsheetApp.getActiveSpreadsheet = (() => {
+  const ss = {
+    getId: () => "fake",
+    getSheetByName: (n) => sheets[n] || null,
+    insertSheet: (n) => (sheets[n] = new FakeSheet([])),
+  };
+  return () => ss;
+})();
+
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(__dirname + "/../Code.gs", "utf8"), sandbox);
+const g = sandbox;
+
+/* ---------------- 1. 店名キーの表記ゆれ吸収 ---------------- */
+assert.strictEqual(g.vendorKey_("株式会社ローソン 渋谷店"), g.vendorKey_("ローソン渋谷店"));
+assert.strictEqual(g.vendorKey_("ＳＥＶＥＮ－ＥＬＥＶＥＮ"), g.vendorKey_("seven eleven"));
+assert.strictEqual(g.vendorKey_("  "), "");
+assert.notStrictEqual(g.vendorKey_("ローソン渋谷店"), g.vendorKey_("ローソン新宿店"));
+console.log("✓ vendorKey_: 法人格・全半角・空白・記号を吸収し、別店舗は区別する");
+
+/* ---------------- 2. 学習ログの記録 ---------------- */
+// AIが科目と金額を間違え、利用者が修正した申請
+g.logCorrection_(
+  { vendor: "カフェベローチェ 渋谷店", date: "2026-07-01", amount: 1320, category: "会議費", description: "打合せ" },
+  { vendor: "カフェヘローチェ渋谷店", date: "2026-07-01", amount: 1200, category: "交際費", description: "飲食", rawText: "小計 1200\n合計 1320" },
+  "yamada"
+);
+// 2回目: 同じ店・同じ修正（摘要の学習に必要な2回目）
+g.logCorrection_(
+  { vendor: "カフェベローチェ 渋谷店", date: "2026-07-05", amount: 880, category: "会議費", description: "打合せ" },
+  { vendor: "カフェベローチェ渋谷店", date: "2026-07-05", amount: 880, category: "交際費", description: "飲食", rawText: "合計 880" },
+  "yamada"
+);
+assert.strictEqual(sheets["corrections"].getLastRow(), 3); // ヘッダー + 2件
+console.log("✓ logCorrection_: 申請ごとに1行、ヘッダー付きで記録される");
+
+/* ---------------- 3. 誤読した店名でも過去の学習を引ける ---------------- */
+const memory = g.buildVendorMemory_(g.vendorKey_("カフェヘローチェ渋谷店"));
+assert.ok(memory, "AIの誤った店名表記でも aiVendorKey で履歴に届く");
+assert.strictEqual(memory.count, 2);
+assert.strictEqual(memory.vendor.value, "カフェベローチェ 渋谷店");
+assert.strictEqual(memory.category.value, "会議費");
+assert.strictEqual(memory.description.count, 2);
+console.log("✓ buildVendorMemory_: 誤読した店名からでも確定値の辞書を引ける");
+
+/* ---------------- 4. ①辞書補正 ---------------- */
+const fields = { date: "2026-07-20", amount: 700, vendor: "カフェヘローチェ渋谷店", category: "交際費", description: "飲食" };
+const applied = g.applyVendorMemory_(fields, memory);
+assert.strictEqual(applied.join(","), "店名,科目,摘要");
+assert.strictEqual(fields.vendor, "カフェベローチェ 渋谷店");
+assert.strictEqual(fields.category, "会議費");
+assert.strictEqual(fields.description, "打合せ");
+assert.strictEqual(fields.amount, 700, "金額は毎回変わるので辞書では触らない");
+assert.strictEqual(fields.date, "2026-07-20", "日付も辞書では触らない");
+console.log("✓ applyVendorMemory_: 店名・科目・摘要のみ補正し、金額と日付は温存する");
+
+/* ---------------- 5. 摘要は1回だけの履歴では学習しない ---------------- */
+g.logCorrection_(
+  { vendor: "はじめての店", date: "2026-07-10", amount: 500, category: "消耗品費", description: "付箋を購入" },
+  { vendor: "はじめての店", date: "2026-07-10", amount: 500, category: "その他", description: "物品購入" },
+  "yamada"
+);
+const once = g.buildVendorMemory_(g.vendorKey_("はじめての店"));
+const f2 = { date: "2026-07-22", amount: 300, vendor: "はじめての店", category: "その他", description: "物品購入" };
+assert.strictEqual(g.applyVendorMemory_(f2, once).join(","), "科目");
+assert.strictEqual(f2.description, "物品購入", "1回だけの摘要は使い回さない");
+console.log("✓ 摘要は2回以上一致した場合のみ学習（単発の摘要を使い回さない）");
+
+/* ---------------- 6. ②誤読事例のヒント生成 ---------------- */
+const hint = g.buildCorrectionHint_(memory);
+assert.ok(hint.includes("金額を 1200 と読んだが、正しくは 1320 だった"));
+assert.ok(hint.includes("店名を「カフェヘローチェ渋谷店」と読んだが"));
+assert.ok(hint.includes("小計 1200 合計 1320"), "根拠の書き起こしも添える");
+assert.ok(g.buildReceiptPrompt_(hint).endsWith(hint), "プロンプト末尾にヒントが付く");
+assert.ok(!g.buildReceiptPrompt_().includes("過去に実際にあった誤読"), "履歴が無ければ素のプロンプト");
+console.log("✓ buildCorrectionHint_: 誤読事例をプロンプト末尾へ添付できる");
+
+/* ---------------- 7. 誤読が無い店舗では読み直しを起こさない ---------------- */
+g.logCorrection_(
+  { vendor: "正確な店", date: "2026-07-11", amount: 1000, category: "消耗品費", description: "備品" },
+  { vendor: "正確な店", date: "2026-07-11", amount: 1000, category: "消耗品費", description: "備品" },
+  "yamada"
+);
+assert.strictEqual(g.buildVendorMemory_(g.vendorKey_("正確な店")).mistakes.length, 0);
+console.log("✓ 誤読の無い店舗は mistakes 0 件（＝2回目のAI呼び出しをしない）");
+
+/* ---------------- 8. 管理者向け一覧と削除 ---------------- */
+const list = g.actionListVendorMemory_({ token: "" });
+const cafe = list.items.find((i) => i.vendor === "カフェベローチェ 渋谷店");
+assert.strictEqual(cafe.count, 2);
+assert.strictEqual(cafe.category, "会議費");
+assert.strictEqual(cafe.mistakes, 1);
+assert.strictEqual(list.items.find((i) => i.vendor === "はじめての店").description, "", "単発の摘要は一覧にも出さない");
+
+const before = sheets["corrections"].getLastRow();
+const del = g.actionDeleteVendorMemory_({ token: "", key: cafe.key });
+assert.strictEqual(del.deleted, 2);
+assert.strictEqual(sheets["corrections"].getLastRow(), before - 2);
+assert.strictEqual(g.buildVendorMemory_(cafe.key), null, "削除後は学習が初期状態に戻る");
+assert.ok(g.buildVendorMemory_(g.vendorKey_("正確な店")), "他店舗の学習は残る");
+console.log("✓ listVendorMemory / deleteVendorMemory: 店舗単位で確認・リセットできる");
+
+/* ---------------- 9. 店名が無い申請は学習しない ---------------- */
+const n = sheets["corrections"].getLastRow();
+g.logCorrection_(
+  { vendor: "", date: "2026-07-12", amount: 300, category: "その他", description: "" },
+  { vendor: "", date: "2026-07-12", amount: 300, category: "その他", description: "" },
+  "yamada"
+);
+assert.strictEqual(sheets["corrections"].getLastRow(), n, "店名なしは次回の手がかりが無いので記録しない");
+console.log("✓ 店名が取れない申請は学習ログに残さない");
+
+/* -------- 10. actionAnalyzeReceipt_: 読み直し＋辞書補正の一連の流れ -------- */
+props.GEMINI_API_KEY = "dummy";
+const calls = [];
+const stubAnalyze = (fields) => (body, hint) => {
+  calls.push(String(hint || ""));
+  return { fields: Object.assign({}, fields), model: "stub" };
+};
+
+// (a) 学習が無い店舗 → 1回だけ呼ばれ、補正もされない
+calls.length = 0;
+g.analyzeWithGemini_ = stubAnalyze({
+  date: "2026-07-25", amount: 1500, vendor: "初見の店", category: "その他", description: "支払い",
+});
+let res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(calls.length, 1, "学習が無ければAI呼び出しは1回");
+assert.strictEqual(calls[0], "", "ヒント無しで呼ばれる");
+assert.strictEqual(res.learned.applied.length, 0);
+assert.strictEqual(res.learned.retried, false);
+assert.strictEqual(res.fields.vendor, "初見の店");
+
+// (b) 誤読履歴のある店舗 → ヒント付きで読み直し、さらに辞書補正が乗る
+g.logCorrection_(
+  { vendor: "そば処ふじ", date: "2026-07-02", amount: 1100, category: "会議費", description: "打合せ昼食" },
+  { vendor: "そば処ふじ", date: "2026-07-02", amount: 1000, category: "その他", description: "飲食", rawText: "小計 1000 合計 1100" },
+  "yamada"
+);
+g.logCorrection_(
+  { vendor: "そば処ふじ", date: "2026-07-09", amount: 990, category: "会議費", description: "打合せ昼食" },
+  { vendor: "そば処ふじ", date: "2026-07-09", amount: 990, category: "その他", description: "飲食" },
+  "yamada"
+);
+calls.length = 0;
+g.analyzeWithGemini_ = stubAnalyze({
+  date: "2026-07-26", amount: 1200, vendor: "そば処ふじ", category: "その他", description: "飲食",
+});
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(calls.length, 2, "誤読履歴があるので1回だけ読み直す");
+assert.strictEqual(calls[0], "");
+assert.ok(calls[1].includes("正しくは 1100 だった"), "2回目は誤読事例つき");
+assert.strictEqual(res.learned.retried, true);
+assert.strictEqual(res.learned.applied.join(","), "科目,摘要");
+assert.strictEqual(res.fields.category, "会議費");
+assert.strictEqual(res.fields.description, "打合せ昼食");
+assert.strictEqual(res.fields.amount, 1200, "今回の金額はそのまま");
+console.log("✓ actionAnalyzeReceipt_: 誤読履歴のある店舗のみ読み直し、辞書補正を適用する");
+
+/* -------- 11. 読み直しが失敗しても初回結果で応答する -------- */
+calls.length = 0;
+let n2 = 0;
+g.analyzeWithGemini_ = function (body, hint) {
+  calls.push(String(hint || ""));
+  if (n2++ > 0) throw new Error("503 overloaded");
+  return { fields: { date: "2026-07-27", amount: 1300, vendor: "そば処ふじ", category: "その他", description: "飲食" }, model: "stub" };
+};
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(calls.length, 2);
+assert.strictEqual(res.learned.retried, false);
+assert.strictEqual(res.fields.amount, 1300, "初回結果を採用");
+assert.strictEqual(res.fields.category, "会議費", "辞書補正は効いたまま");
+console.log("✓ 読み直しが失敗しても初回結果＋辞書補正で応答する");
+
+console.log("\nすべて成功");

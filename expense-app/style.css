@@ -23,6 +23,11 @@
   box-sizing: border-box;
 }
 
+/* display を明示した要素でも hidden 属性を必ず優先させる */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -409,6 +414,9 @@ body {
 
 /* ===== Buttons ===== */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
@@ -417,6 +425,7 @@ body {
   font-size: 0.85rem;
   cursor: pointer;
   font-family: inherit;
+  text-decoration: none;
   min-height: 36px;
 }
 .btn:hover {
@@ -667,9 +676,295 @@ body {
   font-size: 0.8em;
 }
 
-.receipt-link {
-  text-decoration: none;
-  font-size: 1rem;
+/* ===== 表示形式の切替（カード／表） ===== */
+.view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.view-toggle button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.8rem;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.view-toggle button + button {
+  border-left: 1px solid var(--border);
+}
+.view-toggle button:hover {
+  background: var(--surface-2);
+}
+.view-toggle button.is-on {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+/* ===== 領収書サムネイル ===== */
+.thumb {
+  display: block;
+  width: 92px;
+  height: 116px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+  cursor: pointer;
+}
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.thumb:hover {
+  border-color: var(--accent);
+}
+.thumb--sm {
+  width: 52px;
+  height: 40px;
+  border-radius: 6px;
+}
+.thumb--none,
+.thumb.is-error {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 0.68rem;
+  line-height: 1.3;
+  color: var(--muted);
+  background: var(--surface-2);
+  cursor: default;
+}
+.thumb.is-error::after {
+  content: "表示できません";
+  padding: 0 4px;
+}
+.thumb--sm.is-error::after {
+  content: "✕";
+}
+
+/* ===== 申請カード（領収書つき一覧） ===== */
+.cards {
+  display: grid;
+  gap: 12px;
+}
+.cards[hidden] {
+  display: none;
+}
+.ecard {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+.ecard__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.ecard__who {
+  font-weight: 700;
+}
+.ecard__dept {
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+.ecard__date {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ecard__body {
+  display: flex;
+  gap: 14px;
+  padding: 12px 14px;
+  align-items: flex-start;
+}
+.ecard__main {
+  flex: 1;
+  min-width: 0;
+}
+.ecard__tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.chip {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.ecard__amount {
+  margin: 0 0 4px;
+  font-size: 1.25rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.ecard__vendor {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.ecard__desc {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.ecard__note {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--red);
+}
+.ecard__ops {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+/* ===== 領収書ビューア（拡大表示） ===== */
+.lightbox {
+  padding: 12px;
+}
+.lightbox__box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 100%;
+  max-width: 900px;
+  max-height: 92vh;
+  overflow: hidden;
+}
+.lightbox__bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.lightbox__title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: 0.85rem;
+}
+.lightbox__title span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lightbox__count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.lightbox__btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.lightbox__btn:hover {
+  color: var(--text);
+}
+.lightbox__stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  gap: 10px;
+  padding: 12px;
+  background: var(--surface-2);
+  overflow: auto;
+}
+.lightbox__stage img {
+  max-width: 100%;
+  max-height: 68vh;
+  border-radius: 8px;
+  background: var(--surface);
+}
+.lightbox__error {
+  margin: 24px;
+  max-width: 420px;
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.lightbox__nav {
+  flex: none;
+  align-self: center;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 999px;
+  width: 34px;
+  height: 34px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.lightbox__nav:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.lightbox__nav[hidden] {
+  display: none;
+}
+.lightbox__foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.lightbox__hint {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+@media (max-width: 640px) {
+  .lightbox__hint {
+    display: none;
+  }
+  .ecard__body {
+    gap: 10px;
+  }
+  .thumb {
+    width: 76px;
+    height: 96px;
+  }
 }
 
 /* ===== Department management ===== */

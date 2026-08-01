@@ -16,6 +16,7 @@ const USER_KEY = "expense-app:currentUser"; // ローカルモードの氏名
 const CONFIG_KEY = "expense-app:config";
 const QUEUE_KEY = "expense-app:queue"; // 未同期の作成申請
 const SESSION_KEY = "expense-app:session"; // クラウドモードのセッション
+const VIEW_KEY = "expense-app:views"; // 一覧の表示形式（カード／表）
 
 // ローカル（試用）モードの事業部プルダウン初期値（クラウド時はサーバーのマスタを使用）
 const DEFAULT_DEPARTMENTS = [
@@ -30,6 +31,7 @@ const state = {
   lastImageThumb: null,
   lastImageFile: null,
   lastAiBase64: null, // AI解析用画像のキャッシュ（再解析を高速化）
+  lastAiFields: null, // AIが提案した値（申請時に手修正との差分を学習ログへ送る）
   config: { endpoint: "" },
   session: null, // { token, user:{username,displayName,role,department} }
   departments: [], // 登録済み事業部の一覧（申請フォームの候補）
@@ -39,6 +41,10 @@ const state = {
   personalMonth: "", // "yyyy-MM" または "all"
   adminMonth: "",
   syncStatus: "local",
+  // 一覧の表示形式（"cards" = 領収書サムネイル付きカード / "table" = 表）
+  views: { personal: "cards", admin: "cards" },
+  // 領収書ビューア: 表示中の一覧のうち画像がある申請のIDと現在位置
+  lightbox: { ids: [], index: 0 },
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
@@ -70,6 +76,17 @@ function saveSession() {
   } else {
     localStorage.removeItem(SESSION_KEY);
   }
+}
+function loadViews() {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY);
+    if (raw) state.views = { ...state.views, ...JSON.parse(raw) };
+  } catch {
+    /* noop */
+  }
+}
+function saveViews() {
+  localStorage.setItem(VIEW_KEY, JSON.stringify(state.views));
 }
 function loadCache() {
   try {
@@ -297,6 +314,7 @@ function applySessionUI() {
   $("#passwordCard").hidden = !(cloud && state.session && state.authEnabled);
   $("#userMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#deptMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  $("#memoryCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
     const roleEl = $("#sessionRole");
@@ -543,6 +561,61 @@ function renderUsers(users) {
         )
         .join("")
     : `<tr><td colspan="6" class="empty">ユーザーがいません。</td></tr>`;
+}
+
+/* =========================================================================
+ * AI解析の学習データ（管理者のみ）
+ * ========================================================================= */
+
+async function loadVendorMemory() {
+  try {
+    const data = await apiPost({ action: "listVendorMemory" });
+    renderVendorMemory(data.items || []);
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "学習データの取得に失敗しました");
+  }
+}
+
+function renderVendorMemory(items) {
+  const tbody = $("#memoryTable tbody");
+  tbody.innerHTML = items.length
+    ? items
+        .map(
+          (m) => `
+      <tr>
+        <td>${escapeHtml(m.vendor || "（店名なし）")}</td>
+        <td>${escapeHtml(m.category || "—")}</td>
+        <td>${escapeHtml(m.description || "—")}</td>
+        <td>${m.count}</td>
+        <td>${m.mistakes ? `${m.mistakes}件` : "—"}</td>
+        <td>
+          <button class="btn btn--ghost btn--sm" data-memory-del="${escapeHtml(
+            m.key
+          )}" data-memory-name="${escapeHtml(m.vendor || "")}">学習を削除</button>
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="6" class="empty">まだ学習データがありません。AI解析を使って申請すると貯まります。</td></tr>`;
+}
+
+async function deleteVendorMemory(key, name) {
+  if (
+    !window.confirm(
+      `「${name || key}」の学習内容を削除しますか？\n（この店舗の自動補正が初期状態に戻ります。申請データは消えません）`
+    )
+  ) {
+    return;
+  }
+  try {
+    const data = await apiPost({ action: "deleteVendorMemory", key });
+    toast(`学習データを削除しました（${data.deleted || 0}件）`);
+    await loadVendorMemory();
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "削除に失敗しました");
+  }
 }
 
 async function handleUserAdd(evt) {
@@ -877,6 +950,7 @@ async function runAiAnalyze(file) {
   statusEl.hidden = false;
   $("#ocrRawWrap").hidden = true;
   $("#ocrError").hidden = true;
+  state.lastAiFields = null;
   barFill.style.width = "60%";
   statusText.textContent = "AIがレシートを解析中…（数秒かかります）";
   try {
@@ -923,12 +997,29 @@ async function runAiAnalyze(file) {
       $("#ocrRawWrap").hidden = false;
     }
 
+    // AIの提案値を控えておき、送信時に手修正との差分を学習ログへ送る
+    state.lastAiFields = {
+      date: f.date || "",
+      amount: Number(f.amount) || 0,
+      vendor: f.vendor || "",
+      category: f.category || "",
+      description: f.description || "",
+      rawText: (f.rawText || "").slice(0, 400),
+    };
+
     barFill.style.width = "100%";
     let msg = filled.length
       ? `AI解析完了：${filled.join("・")}を自動入力しました（内容をご確認ください）`
       : "AI解析完了：読み取れた項目がありません。手入力してください。";
     if (filled.length && missing.length) {
       msg += ` ／ ${missing.join("・")}は読み取れませんでした（手入力してください）`;
+    }
+    const learned = data.learned || {};
+    if (learned.retried) {
+      msg += " ／ この店舗の過去の誤読を踏まえて読み直しました";
+    }
+    if (learned.applied && learned.applied.length) {
+      msg += ` ／ 過去の修正から${learned.applied.join("・")}を自動補正しました`;
     }
     statusText.textContent = msg;
     return true;
@@ -1099,6 +1190,7 @@ function clearImage() {
   state.lastImageThumb = null;
   state.lastImageFile = null;
   state.lastAiBase64 = null;
+  state.lastAiFields = null;
   $("#preview").hidden = true;
   $("#previewImg").src = "";
   $("#imageInput").value = "";
@@ -1166,6 +1258,8 @@ async function submitExpense(evt) {
         record.imageBase64 = img.base64;
         record.imageMime = img.mime;
       }
+      // AI解析を使った申請は提案値も送り、手修正の差分をサーバー側で学習させる
+      if (state.lastAiFields) record.ai = state.lastAiFields;
       try {
         await apiPost({ action: "create", record });
         await refreshFromCloud();
@@ -1210,11 +1304,233 @@ function statCard(label, value, cls = "") {
   )}</p><p class="stat__value ${cls}">${escapeHtml(value)}</p></div>`;
 }
 
-function receiptCell(e) {
-  const href = e.imageUrl || e.imageThumb;
-  return href
-    ? `<a class="receipt-link" href="${escapeHtml(href)}" target="_blank" rel="noopener" title="領収書を開く">🧾</a>`
-    : "—";
+/* ---------- 領収書画像 ---------- */
+
+/** 申請から Drive のファイルIDを取り出す（古いデータは URL から拾う） */
+function receiptFileId(e) {
+  if (e.imageFileId) return String(e.imageFileId);
+  const m = String(e.imageUrl || "").match(/\/file\/d\/([^/?#]+)/);
+  return m ? m[1] : "";
+}
+
+/**
+ * アプリ経由で取得した画像のキャッシュ（`ファイルID:t|f` → data URL）。
+ * ドライブを共有していない環境では毎回の再描画で再取得しないために持つ。
+ */
+const receiptCache = new Map();
+const receiptCacheKey = (id, thumb) => id + (thumb ? ":t" : ":f");
+
+/**
+ * 領収書画像の表示用URL。
+ * クラウドモードは Drive のサムネイルエンドポイント（幅を指定して軽量化）、
+ * ローカル（試用）モードは端末内に持っている data URL をそのまま使う。
+ * アプリ経由で取得済みの画像があればそれを優先する。
+ */
+function receiptImageUrl(e, width) {
+  const id = receiptFileId(e);
+  if (id) {
+    const cached = receiptCache.get(receiptCacheKey(id, isThumbSize(width)));
+    if (cached) return cached;
+    return (
+      "https://drive.google.com/thumbnail?id=" +
+      encodeURIComponent(id) +
+      "&sz=w" +
+      (width || 400)
+    );
+  }
+  return e.imageThumb || "";
+}
+
+const isThumbSize = (width) => (width || 400) <= 400;
+
+function hasReceipt(e) {
+  return !!receiptImageUrl(e);
+}
+
+/**
+ * アプリ（GAS）経由で画像を取得する。
+ * 領収書はGAS実行アカウントのドライブにあるため、フォルダを共有していない
+ * 利用者のブラウザからは drive.google.com のサムネイルを直接読めない。
+ * その場合のフォールバック。
+ */
+async function fetchReceiptDataUrl(id, thumb) {
+  const key = receiptCacheKey(id, thumb);
+  if (receiptCache.has(key)) return receiptCache.get(key);
+  const data = await apiPost({
+    action: "receiptImage",
+    imageFileId: id,
+    thumb: !!thumb,
+  });
+  if (!data.dataUrl) throw new Error("画像を取得できませんでした");
+  receiptCache.set(key, data.dataUrl);
+  return data.dataUrl;
+}
+
+/** 画像が読めなかったとき（権限が無い・削除済みなど）に枠だけ残して知らせる */
+function markReceiptBroken(img) {
+  const box = img.closest(".thumb");
+  if (box) box.classList.add("is-error");
+  img.remove();
+}
+
+/** サムネイルの読み込み失敗 → アプリ経由で取り直し、それも駄目なら枠表示 */
+function onReceiptImgError(img) {
+  const id = img.dataset.fileId || "";
+  if (!id || img.dataset.retried || !isCloudAuthed()) return markReceiptBroken(img);
+  img.dataset.retried = "1";
+  fetchReceiptDataUrl(id, img.dataset.thumb === "1").then(
+    (url) => {
+      img.src = url;
+    },
+    () => markReceiptBroken(img)
+  );
+}
+
+/** サムネイル画像のHTML（読み込み失敗時はアプリ経由の取得へ切り替える） */
+function receiptImgTag(e, width) {
+  const thumb = isThumbSize(width);
+  return `<img src="${escapeHtml(receiptImageUrl(e, width))}" alt="領収書" loading="lazy"
+    data-file-id="${escapeHtml(receiptFileId(e))}" data-thumb="${thumb ? 1 : 0}"
+    onerror="onReceiptImgError(this)" />`;
+}
+
+/** 表の「領収書」セル（クリックで拡大表示） */
+function receiptCell(e, scope) {
+  if (!hasReceipt(e)) return '<span class="thumb thumb--none thumb--sm">—</span>';
+  return `<button type="button" class="thumb thumb--sm" data-receipt="${escapeHtml(
+    e.id
+  )}" data-scope="${scope}" title="領収書を拡大表示">${receiptImgTag(e, 200)}</button>`;
+}
+
+/** カード用の領収書サムネイル（画像が無い場合は同じ大きさの枠を出す） */
+function receiptThumb(e, scope) {
+  if (!hasReceipt(e)) {
+    return '<span class="thumb thumb--none">領収書<br />なし</span>';
+  }
+  return `<button type="button" class="thumb" data-receipt="${escapeHtml(
+    e.id
+  )}" data-scope="${scope}" title="領収書を拡大表示">${receiptImgTag(e, 400)}</button>`;
+}
+
+/**
+ * カード表示（領収書サムネイル付き）。
+ * ops は各申請の操作ボタンHTMLを返す関数（無ければ操作なし）。
+ */
+function expenseCardsHtml(rows, scope, ops) {
+  return rows
+    .map(
+      (e) => `
+    <article class="ecard">
+      <header class="ecard__head">
+        <span class="ecard__who">${escapeHtml(e.applicant || "—")}${
+          e.department ? ` <span class="ecard__dept">${escapeHtml(e.department)}</span>` : ""
+        }</span>
+        <span class="ecard__date">${escapeHtml(e.date)}</span>
+      </header>
+      <div class="ecard__body">
+        ${receiptThumb(e, scope)}
+        <div class="ecard__main">
+          <div class="ecard__tags">
+            <span class="chip">${escapeHtml(e.category)}</span>
+            <span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span>
+          </div>
+          <p class="ecard__amount">${yen(e.amount)}</p>
+          <p class="ecard__vendor">${escapeHtml(e.vendor || "支払先なし")}</p>
+          ${e.description ? `<p class="ecard__desc">${escapeHtml(e.description)}</p>` : ""}
+          ${
+            e.reviewComment
+              ? `<p class="ecard__note">${escapeHtml(e.reviewComment)}</p>`
+              : ""
+          }
+          ${ops ? `<div class="ecard__ops">${ops(e)}</div>` : ""}
+        </div>
+      </div>
+    </article>`
+    )
+    .join("");
+}
+
+/** 一覧の表示形式（カード／表）を切り替えて描画する */
+function applyViewUI(scope) {
+  const view = state.views[scope] === "table" ? "table" : "cards";
+  const cards = $(`#${scope}Cards`);
+  const table = $(`#${scope}TableWrap`);
+  if (cards) cards.hidden = view !== "cards";
+  if (table) table.hidden = view !== "table";
+  $$(`#${scope}ViewToggle button`).forEach((b) =>
+    b.classList.toggle("is-on", b.dataset.view === view)
+  );
+}
+
+function setView(scope, view) {
+  state.views[scope] = view === "table" ? "table" : "cards";
+  saveViews();
+  applyViewUI(scope);
+}
+
+/* ---------- 領収書ビューア（拡大表示） ---------- */
+
+/** 表示中の一覧のうち画像がある申請を、ビューアの送り／戻し対象として覚えておく */
+function setLightboxScope(scope, rows) {
+  state.lightbox.scopeIds = state.lightbox.scopeIds || {};
+  state.lightbox.scopeIds[scope] = rows.filter(hasReceipt).map((e) => e.id);
+}
+
+function openReceipt(id, scope) {
+  const ids = (state.lightbox.scopeIds || {})[scope] || [id];
+  const index = Math.max(0, ids.indexOf(id));
+  state.lightbox = { ...state.lightbox, ids, index };
+  showReceipt();
+  $("#receiptModal").hidden = false;
+}
+
+function showReceipt() {
+  const { ids, index } = state.lightbox;
+  const e = findExpense(ids[index]);
+  if (!e) return closeReceipt();
+  const img = $("#lbImg");
+  const showError = () => {
+    img.hidden = true;
+    $("#lbError").hidden = false;
+  };
+  $("#lbError").hidden = true;
+  img.hidden = false;
+  delete img.dataset.retried;
+  img.src = receiptImageUrl(e, 1200);
+  img.onerror = () => {
+    // ドライブを直接読めない場合はアプリ経由で取り直す
+    const id = receiptFileId(e);
+    if (!id || img.dataset.retried || !isCloudAuthed()) return showError();
+    img.dataset.retried = "1";
+    fetchReceiptDataUrl(id, false).then((url) => {
+      img.src = url;
+    }, showError);
+  };
+  $("#lbTitle").textContent = `${e.date}　${yen(e.amount)}`;
+  $("#lbSub").textContent = [e.applicant, e.department, e.category, e.vendor]
+    .filter(Boolean)
+    .join("　/　");
+  $("#lbCount").textContent = ids.length > 1 ? `${index + 1} / ${ids.length}` : "";
+  // ローカル（試用）モードは端末内の画像なので、ドライブのリンクは出さない
+  const open = $("#lbOpen");
+  open.hidden = !e.imageUrl;
+  open.href = e.imageUrl || "#";
+  $(".lightbox__foot").hidden = open.hidden;
+  const single = ids.length < 2;
+  $("[data-lb-prev]").hidden = single;
+  $("[data-lb-next]").hidden = single;
+}
+
+function moveReceipt(step) {
+  const { ids } = state.lightbox;
+  if (ids.length < 2) return;
+  state.lightbox.index = (state.lightbox.index + step + ids.length) % ids.length;
+  showReceipt();
+}
+
+function closeReceipt() {
+  $("#receiptModal").hidden = true;
+  $("#lbImg").src = "";
 }
 
 /** 「自分の申請」を返す（モード・権限に応じて） */
@@ -1264,19 +1580,26 @@ function renderPersonal() {
   const filter = $("#personalFilter").value;
   const rows = mine.filter((e) => filter === "all" || e.status === filter);
   const tbody = $("#personalTable tbody");
+  const cards = $("#personalCards");
+  applyViewUI("personal");
+  setLightboxScope("personal", rows);
 
-  if (!identified) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">${
-      cloudEnabled()
-        ? "ログインすると自分の申請が表示されます。"
-        : "右上で氏名を入力すると、自分の申請が表示されます。"
-    }</td></tr>`;
+  const empty = !identified
+    ? cloudEnabled()
+      ? "ログインすると自分の申請が表示されます。"
+      : "右上で氏名を入力すると、自分の申請が表示されます。"
+    : !rows.length
+    ? "該当する申請はありません。"
+    : "";
+  if (empty) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">${empty}</td></tr>`;
+    cards.innerHTML = `<p class="empty">${empty}</p>`;
     return;
   }
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">該当する申請はありません。</td></tr>`;
-    return;
-  }
+
+  const ops = (e) =>
+    `<button class="btn btn--ghost btn--sm" data-del="${e.id}">取消</button>`;
+  cards.innerHTML = expenseCardsHtml(rows, "personal", ops);
   tbody.innerHTML = rows
     .map(
       (e) => `
@@ -1286,9 +1609,9 @@ function renderPersonal() {
       <td>${escapeHtml(e.vendor || "—")}</td>
       <td class="num">${yen(e.amount)}</td>
       <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
-      <td>${receiptCell(e)}</td>
+      <td>${receiptCell(e, "personal")}</td>
       <td>${escapeHtml(e.reviewComment || "")}</td>
-      <td><button class="btn btn--ghost btn--sm" data-del="${e.id}">取消</button></td>
+      <td>${ops(e)}</td>
     </tr>`
     )
     .join("");
@@ -1328,8 +1651,14 @@ function renderAdmin() {
   const pending = monthRecs.filter((e) => e.status === "pending");
   const approved = monthRecs.filter((e) => e.status === "approved");
 
+  const withReceipt = monthRecs.filter(hasReceipt).length;
+
   $("#adminStats").innerHTML = [
     statCard("申請件数", monthRecs.length + " 件"),
+    statCard(
+      "領収書あり",
+      monthRecs.length ? `${withReceipt} / ${monthRecs.length} 件` : "— 件"
+    ),
     statCard("承認待ち", pending.length + " 件", "is-accent"),
     statCard("承認待ち金額", yen(sum(pending)), "is-accent"),
     statCard("承認済み金額", yen(sum(approved)), "is-green"),
@@ -1361,6 +1690,7 @@ function renderAdmin() {
   // 一覧（検索・状態フィルタ・ソート）
   const q = $("#adminSearch").value.trim().toLowerCase();
   const sf = $("#adminStatusFilter").value;
+  const rf = $("#adminReceiptFilter").value;
   let rows = monthRecs.filter((e) => {
     const matchQ =
       !q ||
@@ -1368,7 +1698,9 @@ function renderAdmin() {
       (e.vendor || "").toLowerCase().includes(q) ||
       (e.department || "").toLowerCase().includes(q);
     const matchS = sf === "all" || e.status === sf;
-    return matchQ && matchS;
+    const matchR =
+      rf === "all" || (rf === "yes" ? hasReceipt(e) : !hasReceipt(e));
+    return matchQ && matchS && matchR;
   });
 
   const sortKey = $("#adminSort").value;
@@ -1400,10 +1732,20 @@ function renderAdmin() {
   };
 
   const tbody = $("#adminTable tbody");
-  tbody.innerHTML = rows.length
-    ? rows
-        .map(
-          (e) => `
+  const cards = $("#adminCards");
+  applyViewUI("admin");
+  setLightboxScope("admin", rows);
+
+  if (!rows.length) {
+    const msg = "該当する申請はありません。";
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">${msg}</td></tr>`;
+    cards.innerHTML = `<p class="empty">${msg}</p>`;
+    return;
+  }
+  cards.innerHTML = expenseCardsHtml(rows, "admin", ops);
+  tbody.innerHTML = rows
+    .map(
+      (e) => `
       <tr>
         <td>${escapeHtml(e.applicant)}</td>
         <td>${escapeHtml(e.department || "—")}</td>
@@ -1411,13 +1753,12 @@ function renderAdmin() {
         <td>${escapeHtml(e.category)}</td>
         <td>${escapeHtml(e.vendor || "—")}</td>
         <td class="num">${yen(e.amount)}</td>
-        <td>${receiptCell(e)}</td>
+        <td>${receiptCell(e, "admin")}</td>
         <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
         <td>${ops(e)}</td>
       </tr>`
-        )
-        .join("")
-    : `<tr><td colspan="9" class="empty">該当する申請はありません。</td></tr>`;
+    )
+    .join("");
 }
 
 function render() {
@@ -1558,6 +1899,7 @@ function setTab(tab) {
   );
   if (tab === "admin" && cloudEnabled() && state.isAdmin && state.authEnabled) {
     loadUsers();
+    loadVendorMemory();
   }
 }
 
@@ -1671,6 +2013,7 @@ async function initMode() {
 
 function init() {
   loadConfig();
+  loadViews();
 
   state.currentUser = localStorage.getItem(USER_KEY) || "";
   $("#currentUser").value = state.currentUser;
@@ -1704,6 +2047,13 @@ function init() {
   $("#userTable").addEventListener("click", handleUserTableClick);
   $("#userTable").addEventListener("change", handleUserDeptChange);
   $("#userReloadBtn").addEventListener("click", loadUsers);
+
+  // AI解析の学習データ
+  $("#memoryReloadBtn").addEventListener("click", loadVendorMemory);
+  $("#memoryTable").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-memory-del]");
+    if (del) deleteVendorMemory(del.dataset.memoryDel, del.dataset.memoryName);
+  });
 
   // 事業部マスタ管理
   $("#deptAddForm").addEventListener("submit", handleDeptAdd);
@@ -1749,22 +2099,51 @@ function init() {
   $("#personalFilter").addEventListener("change", renderPersonal);
   $("#adminSearch").addEventListener("input", renderAdmin);
   $("#adminStatusFilter").addEventListener("change", renderAdmin);
+  $("#adminReceiptFilter").addEventListener("change", renderAdmin);
   $("#csvBtn").addEventListener("click", exportCsv);
 
-  // テーブル操作
-  $("#personalTable").addEventListener("click", (e) => {
-    const del = e.target.closest("[data-del]");
-    if (del) deleteExpense(del.dataset.del);
+  // 表示形式の切替（カード／表）
+  ["personal", "admin"].forEach((scope) => {
+    $(`#${scope}ViewToggle`).addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-view]");
+      if (btn) setView(scope, btn.dataset.view);
+    });
   });
-  $("#adminTable").addEventListener("click", (e) => {
-    const a = e.target.closest("[data-approve]");
-    const r = e.target.closest("[data-reject]");
-    const rs = e.target.closest("[data-reset]");
-    const rm = e.target.closest("[data-remove]");
-    if (a) approve(a.dataset.approve);
-    else if (r) reject(r.dataset.reject);
-    else if (rs) resetStatus(rs.dataset.reset);
-    else if (rm) deleteExpense(rm.dataset.remove);
+
+  // 一覧の操作（表・カードで共通。領収書サムネイルは拡大表示を開く）
+  const bindListClicks = (el, admin) => {
+    el.addEventListener("click", (e) => {
+      const thumb = e.target.closest("[data-receipt]");
+      if (thumb) return openReceipt(thumb.dataset.receipt, thumb.dataset.scope);
+      const del = e.target.closest("[data-del]");
+      if (del) return deleteExpense(del.dataset.del);
+      if (!admin) return;
+      const a = e.target.closest("[data-approve]");
+      const r = e.target.closest("[data-reject]");
+      const rs = e.target.closest("[data-reset]");
+      const rm = e.target.closest("[data-remove]");
+      if (a) approve(a.dataset.approve);
+      else if (r) reject(r.dataset.reject);
+      else if (rs) resetStatus(rs.dataset.reset);
+      else if (rm) deleteExpense(rm.dataset.remove);
+    });
+  };
+  bindListClicks($("#personalTable"), false);
+  bindListClicks($("#personalCards"), false);
+  bindListClicks($("#adminTable"), true);
+  bindListClicks($("#adminCards"), true);
+
+  // 領収書ビューア
+  $("#receiptModal").addEventListener("click", (e) => {
+    if (e.target.closest("[data-lb-close]")) closeReceipt();
+    else if (e.target.closest("[data-lb-prev]")) moveReceipt(-1);
+    else if (e.target.closest("[data-lb-next]")) moveReceipt(1);
+  });
+  document.addEventListener("keydown", (e) => {
+    if ($("#receiptModal").hidden) return;
+    if (e.key === "Escape") closeReceipt();
+    else if (e.key === "ArrowLeft") moveReceipt(-1);
+    else if (e.key === "ArrowRight") moveReceipt(1);
   });
 
   // 月ナビ（個人・管理者）
