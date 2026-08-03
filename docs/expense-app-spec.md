@@ -1,6 +1,6 @@
 # 経費申請アプリ 仕様書
 
-最終更新: 2026-07-28
+最終更新: 2026-08-03
 
 ## 1. 目的
 
@@ -22,7 +22,7 @@
                                        │   └───────┬───────────┬───────┘
                                        │           ▼           ▼
                                        │   スプレッドシート   Google ドライブ
-                                       │   expenses / users  (領収書画像)
+                                       │   経費データ/ユーザー等  (領収書画像)
                                        │           │
 [分析・実績管理ツール] ◀────────────────┘           │
    Looker Studio / BIツール / スプレッドシート集計 / JSON API / CSV
@@ -30,11 +30,11 @@
 
 - フロントエンド: バニラ JS（`expense-app/`）。GitHub Pages で公開。レスポンシブ対応。
 - バックエンド: Google Apps Script Web App（`apps-script/Code.gs`）。サーバー・GCP設定不要。
-- データストア（1つのスプレッドシート内）:
-  - `expenses` シート = 経費データ（1申請1行）
-  - `users` シート = ユーザーアカウント（パスワードはソルト付き SHA-256 ハッシュ）
-  - `departments` シート = 事業部マスタ
-  - `corrections` シート = AI解析の学習ログ（手修正の履歴・店舗別の補正記憶）
+- データストア（1つのスプレッドシート内）。タブ名・見出しは日本語:
+  - **経費データ** シート = 経費データ（1申請1行）
+  - **ユーザー** シート = ユーザーアカウント（パスワードはソルト付き SHA-256 ハッシュ）
+  - **事業部マスタ** シート = 事業部の一覧
+  - **AI学習ログ** シート = AI解析の学習ログ（手修正の履歴・店舗別の補正記憶）
   - Google ドライブ「経費領収書」フォルダ = 領収書画像（行に URL を保持）
 
 ### 2.1 動作モード
@@ -49,10 +49,10 @@
 ## 3. 認証・権限
 
 ### 3.1 認証方式
-- ユーザーID＋パスワード。パスワードは `users` シートにソルト付き SHA-256 で保存。
+- ユーザーID＋パスワード。パスワードは「ユーザー」シートにソルト付き SHA-256 で保存。
 - ログイン成功で **HMAC-SHA256 署名付きセッショントークン**（有効期限12時間）を発行。
   以降のリクエストはトークンを必須とし、サーバー側で毎回検証する。
-- 初回接続時（`users` が空）は「初期設定」画面で最初の管理者を作成する
+- 初回接続時（「ユーザー」シートが空）は「初期設定」画面で最初の管理者を作成する
   （それまでは従来互換のオープンモード）。
 
 ### 3.2 権限（ロール）
@@ -93,7 +93,7 @@
 #### 4.1.1 手修正の学習（店舗別の補正記憶）
 
 手修正した内容を店舗ごとに蓄積し、次回同じ店舗のレシートで再利用する。
-モデルの再学習（ファインチューニング）ではなく、`corrections` シートへの
+モデルの再学習（ファインチューニング）ではなく、「AI学習ログ」シートへの
 記録とその再利用で実現する。
 
 - **記録**: AI解析を使った申請の保存時に、「AIの読み取り値」と「利用者が確定した値」を
@@ -121,7 +121,7 @@
 - 科目: 交通費／交際費／会議費／消耗品費／通信費／宿泊費／その他。
 
 ### 4.2.1 事業部マスタ
-- 事業部は `departments` シートで管理し、申請フォーム・ユーザー登録のプルダウンに反映。
+- 事業部は「事業部マスタ」シートで管理し、申請フォーム・ユーザー登録のプルダウンに反映。
 - 初期値: BAR / 人材 / 運送 / 本部 / ARTGRAGE / クリニック / GoonerHouse。
 - 管理者ダッシュボードの「事業部の管理」から追加・削除が可能。
   削除しても過去の申請データの事業部名は保持される（選択肢から外れるだけ）。
@@ -185,22 +185,35 @@
 
 ## 5. データモデル
 
-`expenses`: `id, createdAt, applicant, date, category, vendor, amount, description,
-status, reviewedAt, reviewer, reviewComment, imageUrl, imageFileId, applicantId,
-department`
+**シートを直接見る人向けにタブ名と1行目の見出しは日本語**、JSON API・CSV・
+フロントエンドが使う内部キーは英語で固定する（外部連携を壊さないため）。
+シートの読み書きは列の位置で行い、見出しは表示専用。
+旧版で作られた英語タブ・英語見出しは、次回アクセス時に自動で日本語へ移行される
+（手動の移行作業は不要）。
 
-`users`: `username, displayName, passwordHash, salt, role, active, createdAt,
-department`
+**経費データ**（内部キー → 見出し）:
+`id`→申請ID / `createdAt`→申請日時 / `applicant`→申請者 / `date`→利用日 /
+`category`→科目 / `vendor`→支払先 / `amount`→金額 / `description`→摘要 /
+`status`→状態 / `reviewedAt`→処理日時 / `reviewer`→処理者 /
+`reviewComment`→却下理由・備考 / `imageUrl`→領収書URL /
+`imageFileId`→領収書ファイルID / `applicantId`→申請者ID / `department`→事業部
 
-`departments`: `name`（事業部マスタ。初期値 BAR / 人材 / 運送 / 本部 /
+**ユーザー**:
+`username`→ユーザーID / `displayName`→表示名 / `passwordHash`→パスワードハッシュ /
+`salt`→ソルト / `role`→権限 / `active`→有効 / `createdAt`→登録日時 /
+`department`→事業部
+
+**事業部マスタ**: `name`→事業部名（初期値 BAR / 人材 / 運送 / 本部 /
 ARTGRAGE / クリニック / GoonerHouse）
 
-`corrections`: `createdAt, vendorKey, aiVendorKey, vendor, date, amount, category,
-description, aiVendor, aiDate, aiAmount, aiCategory, aiDescription, corrected,
-applicantId, rawHead`（AI解析の学習ログ。`ai*` がAIの読み取り値、それ以外が確定値。
-`corrected` は修正された項目名）
+**AI学習ログ**: `createdAt`→記録日時 / `vendorKey`→店舗キー /
+`aiVendorKey`→店舗キー（AI読取）/ `vendor`→店名（確定）/ `date`→利用日（確定）/
+`amount`→金額（確定）/ `category`→科目（確定）/ `description`→摘要（確定）/
+`aiVendor`〜`aiDescription`→各項目の（AI読取）/ `corrected`→修正された項目 /
+`applicantId`→申請者ID / `rawHead`→書き起こし（先頭）
 
 - `status`: `pending` / `approved` / `rejected`。`role`: `user` / `admin`。
+  （シート上の見出しは日本語だが、値そのものは英語のまま）
 
 ## 6. API（POST は text/plain の JSON。認証系以外は token 必須）
 
