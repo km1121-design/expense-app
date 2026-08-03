@@ -13,13 +13,19 @@ const assert = require("assert");
 
 // ---- 最小限の GAS スタブ ----
 class FakeSheet {
-  constructor(headers) {
-    this.rows = [headers.slice()];
+  constructor(name, rows) {
+    this.name = name;
+    this.rows = rows || [];
   }
+  getName() { return this.name; }
+  setName(n) { renameSheet(this, n); }
   getLastRow() { return this.rows.length; }
-  getLastColumn() { return this.rows[0].length; }
+  getLastColumn() { return this.rows[0] ? this.rows[0].length : 0; }
   appendRow(r) { this.rows.push(r.slice()); }
   setFrozenRows() {}
+  getDataRange() {
+    return this.getRange(1, 1, this.getLastRow(), this.getLastColumn());
+  }
   deleteRow(n) { this.rows.splice(n - 1, 1); }
   getRange(row, col, numRows, numCols) {
     const self = this;
@@ -47,6 +53,11 @@ class FakeSheet {
 }
 
 const sheets = {};
+function renameSheet(sheet, newName) {
+  delete sheets[sheet.name];
+  sheet.name = newName;
+  sheets[newName] = sheet;
+}
 const props = {};
 const sandbox = {
   console,
@@ -56,15 +67,7 @@ const sandbox = {
       setProperty: (k, v) => { props[k] = v; },
     }),
   },
-  SpreadsheetApp: {
-    getActiveSpreadsheet: () => ({
-      getId: () => "fake",
-      getSheetByName: (n) => sheets[n] || null,
-      insertSheet: (n) => (sheets[n] = new FakeSheet([])),
-    }),
-    openById: () => sandbox.SpreadsheetApp.getActiveSpreadsheet(),
-    create: () => sandbox.SpreadsheetApp.getActiveSpreadsheet(),
-  },
+  SpreadsheetApp: {},
   Session: { getScriptTimeZone: () => "Asia/Tokyo" },
   Utilities: {
     formatDate: (d, tz, fmt) => {
@@ -79,18 +82,64 @@ const sandbox = {
   ScriptApp: {},
   Logger: { log: () => {} },
 };
-sandbox.SpreadsheetApp.getActiveSpreadsheet = (() => {
-  const ss = {
-    getId: () => "fake",
-    getSheetByName: (n) => sheets[n] || null,
-    insertSheet: (n) => (sheets[n] = new FakeSheet([])),
-  };
-  return () => ss;
-})();
+const FAKE_SS = {
+  getId: () => "fake",
+  getSheetByName: (n) => sheets[n] || null,
+  insertSheet: (n) => (sheets[n] = new FakeSheet(n)),
+};
+sandbox.SpreadsheetApp.getActiveSpreadsheet = () => FAKE_SS;
+sandbox.SpreadsheetApp.openById = () => FAKE_SS;
+sandbox.SpreadsheetApp.create = () => FAKE_SS;
+
+// 旧版（英語タブ・英語見出し）で作られた状態を用意し、自動移行を検証する
+sheets["expenses"] = new FakeSheet("expenses", [
+  ["id", "createdAt", "applicant", "date", "category", "vendor", "amount",
+   "description", "status", "reviewedAt", "reviewer", "reviewComment",
+   "imageUrl", "imageFileId", "applicantId", "department"],
+  ["e1", "2026-07-20T00:00:00Z", "山田太郎", "2026-07-20", "会議費", "旧データ店",
+   500, "移行前の申請", "approved", "", "自動承認", "", "", "OLDFILE", "yamada", "本部"],
+]);
 
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(__dirname + "/../Code.gs", "utf8"), sandbox);
-const g = sandbox;
+const g = sandbox; // function 宣言はグローバルオブジェクトに乗る
+/** const 宣言はグローバルオブジェクトに乗らないため、式を評価して取り出す */
+const val = (expr) => vm.runInContext(expr, sandbox);
+
+/* -------- 0. 旧英語タブ／英語見出しの自動移行と、既存データの読み出し -------- */
+const sheet = g.getSheet_();
+assert.strictEqual(sheet.getName(), "経費データ", "タブ名が日本語へリネームされる");
+assert.strictEqual(sheets["expenses"], undefined, "旧名のタブは残らない");
+assert.strictEqual(
+  sheet.rows[0].join(","),
+  "申請ID,申請日時,申請者,利用日,科目,支払先,金額,摘要,状態,処理日時,処理者,却下理由・備考,領収書URL,領収書ファイルID,申請者ID,事業部",
+  "1行目が日本語見出しに置き換わる"
+);
+// 移行前に入っていた行は、そのまま同じ内部キーで読み出せる
+const migrated = g.rowsToRecords_(sheet)[0];
+assert.strictEqual(migrated.id, "e1");
+assert.strictEqual(migrated.applicant, "山田太郎");
+assert.strictEqual(migrated.amount, 500);
+assert.strictEqual(migrated.department, "本部");
+assert.strictEqual(migrated.imageFileId, "OLDFILE");
+// 2回目の呼び出しでも壊れない（見出しは日本語のまま、データ行は増えない）
+assert.strictEqual(g.getSheet_().rows.length, 2);
+// 日本語見出し・英語見出しのどちらからでも内部キーへ解決できる
+assert.strictEqual(
+  g.headerKeys_(["利用日", "金額", "領収書ファイルID"], val("EXPENSE_COLUMNS")).join(","),
+  "date,amount,imageFileId"
+);
+assert.strictEqual(
+  g.headerKeys_(["date", "amount", "imageFileId"], val("EXPENSE_COLUMNS")).join(","),
+  "date,amount,imageFileId"
+);
+// 事業部マスタは初回作成時だけ既定値を入れる
+assert.strictEqual(g.getDepartmentsSheet_().rows[0][0], "事業部名");
+assert.ok(g.listDepartments_().indexOf("BAR") >= 0);
+assert.strictEqual(g.listDepartments_().length, val("DEFAULT_DEPARTMENTS").length);
+g.getDepartmentsSheet_(); // 2回目でシードが重複しないこと
+assert.strictEqual(g.listDepartments_().length, val("DEFAULT_DEPARTMENTS").length);
+console.log("✓ 旧英語タブ・英語見出しを自動で日本語へ移行し、既存データも読める");
 
 /* ---------------- 1. 店名キーの表記ゆれ吸収 ---------------- */
 assert.strictEqual(g.vendorKey_("株式会社ローソン 渋谷店"), g.vendorKey_("ローソン渋谷店"));
@@ -112,7 +161,7 @@ g.logCorrection_(
   { vendor: "カフェベローチェ渋谷店", date: "2026-07-05", amount: 880, category: "交際費", description: "飲食", rawText: "合計 880" },
   "yamada"
 );
-assert.strictEqual(sheets["corrections"].getLastRow(), 3); // ヘッダー + 2件
+assert.strictEqual(sheets["AI学習ログ"].getLastRow(), 3); // ヘッダー + 2件
 console.log("✓ logCorrection_: 申請ごとに1行、ヘッダー付きで記録される");
 
 /* ---------------- 3. 誤読した店名でも過去の学習を引ける ---------------- */
@@ -173,22 +222,22 @@ assert.strictEqual(cafe.category, "会議費");
 assert.strictEqual(cafe.mistakes, 1);
 assert.strictEqual(list.items.find((i) => i.vendor === "はじめての店").description, "", "単発の摘要は一覧にも出さない");
 
-const before = sheets["corrections"].getLastRow();
+const before = sheets["AI学習ログ"].getLastRow();
 const del = g.actionDeleteVendorMemory_({ token: "", key: cafe.key });
 assert.strictEqual(del.deleted, 2);
-assert.strictEqual(sheets["corrections"].getLastRow(), before - 2);
+assert.strictEqual(sheets["AI学習ログ"].getLastRow(), before - 2);
 assert.strictEqual(g.buildVendorMemory_(cafe.key), null, "削除後は学習が初期状態に戻る");
 assert.ok(g.buildVendorMemory_(g.vendorKey_("正確な店")), "他店舗の学習は残る");
 console.log("✓ listVendorMemory / deleteVendorMemory: 店舗単位で確認・リセットできる");
 
 /* ---------------- 9. 店名が無い申請は学習しない ---------------- */
-const n = sheets["corrections"].getLastRow();
+const n = sheets["AI学習ログ"].getLastRow();
 g.logCorrection_(
   { vendor: "", date: "2026-07-12", amount: 300, category: "その他", description: "" },
   { vendor: "", date: "2026-07-12", amount: 300, category: "その他", description: "" },
   "yamada"
 );
-assert.strictEqual(sheets["corrections"].getLastRow(), n, "店名なしは次回の手がかりが無いので記録しない");
+assert.strictEqual(sheets["AI学習ログ"].getLastRow(), n, "店名なしは次回の手がかりが無いので記録しない");
 console.log("✓ 店名が取れない申請は学習ログに残さない");
 
 /* -------- 10. actionAnalyzeReceipt_: 読み直し＋辞書補正の一連の流れ -------- */

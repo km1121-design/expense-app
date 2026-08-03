@@ -3,6 +3,7 @@
  *
  * 役割:
  *   - スプレッドシートを経費データ／ユーザー／AI解析の学習ログのデータベースとして使用
+ *     （タブ名・1行目の見出しは日本語。内部キー・JSON APIのキー名は英語で固定）
  *   - アップロードされた領収書画像を Google Drive フォルダに保存し、URL を行に記録
  *   - ユーザー認証（ソルト付き SHA-256 ハッシュ）と署名付きセッショントークンの発行
  *   - 権限制御: user = 自分の申請のみ / admin = 全申請＋承認＋ユーザー管理
@@ -28,39 +29,55 @@
  *   最初の管理者を action=setup で作成すると認証が有効になる。
  */
 
-const SHEET_NAME = "expenses";
-const HEADERS = [
-  "id",
-  "createdAt",
-  "applicant",
-  "date",
-  "category",
-  "vendor",
-  "amount",
-  "description",
-  "status",
-  "reviewedAt",
-  "reviewer",
-  "reviewComment",
-  "imageUrl",
-  "imageFileId",
-  "applicantId",
-  "department",
+/**
+ * シートの列定義。[内部キー, シート1行目に表示する見出し] の順で列順そのものを表す。
+ * 内部キーは JSON API・CSV・フロントエンドが使う名前なので変更しない。
+ * 見出しだけを日本語にすることで、シートを直接見る人にわかりやすくする。
+ * 旧版で作られた英語見出し・英語タブ名は ensureSheet_ が自動で日本語へ移行する。
+ */
+const SHEET_NAME = "経費データ";
+const SHEET_NAME_LEGACY = "expenses";
+const EXPENSE_COLUMNS = [
+  ["id", "申請ID"],
+  ["createdAt", "申請日時"],
+  ["applicant", "申請者"],
+  ["date", "利用日"],
+  ["category", "科目"],
+  ["vendor", "支払先"],
+  ["amount", "金額"],
+  ["description", "摘要"],
+  ["status", "状態"],
+  ["reviewedAt", "処理日時"],
+  ["reviewer", "処理者"],
+  ["reviewComment", "却下理由・備考"],
+  ["imageUrl", "領収書URL"],
+  ["imageFileId", "領収書ファイルID"],
+  ["applicantId", "申請者ID"],
+  ["department", "事業部"],
 ];
+const HEADERS = EXPENSE_COLUMNS.map(function (c) {
+  return c[0];
+});
 
-const USERS_SHEET = "users";
-const USER_HEADERS = [
-  "username",
-  "displayName",
-  "passwordHash",
-  "salt",
-  "role",
-  "active",
-  "createdAt",
-  "department",
+const USERS_SHEET = "ユーザー";
+const USERS_SHEET_LEGACY = "users";
+const USER_COLUMNS = [
+  ["username", "ユーザーID"],
+  ["displayName", "表示名"],
+  ["passwordHash", "パスワードハッシュ"],
+  ["salt", "ソルト"],
+  ["role", "権限"],
+  ["active", "有効"],
+  ["createdAt", "登録日時"],
+  ["department", "事業部"],
 ];
+const USER_HEADERS = USER_COLUMNS.map(function (c) {
+  return c[0];
+});
 
-const DEPARTMENTS_SHEET = "departments";
+const DEPARTMENTS_SHEET = "事業部マスタ";
+const DEPARTMENTS_SHEET_LEGACY = "departments";
+const DEPARTMENT_COLUMNS = [["name", "事業部名"]];
 const DEFAULT_DEPARTMENTS = [
   "BAR",
   "人材",
@@ -76,25 +93,29 @@ const DEFAULT_DEPARTMENTS = [
  * 申請保存時に「AIの読み取り結果」と「利用者が確定した値」を1行ずつ記録し、
  * 次回以降の解析で ①辞書補正 ②誤読事例のフィードバック に再利用する。
  */
-const CORRECTIONS_SHEET = "corrections";
-const CORRECTION_HEADERS = [
-  "createdAt",
-  "vendorKey",
-  "aiVendorKey",
-  "vendor",
-  "date",
-  "amount",
-  "category",
-  "description",
-  "aiVendor",
-  "aiDate",
-  "aiAmount",
-  "aiCategory",
-  "aiDescription",
-  "corrected",
-  "applicantId",
-  "rawHead",
+const CORRECTIONS_SHEET = "AI学習ログ";
+const CORRECTIONS_SHEET_LEGACY = "corrections";
+const CORRECTION_COLUMNS = [
+  ["createdAt", "記録日時"],
+  ["vendorKey", "店舗キー"],
+  ["aiVendorKey", "店舗キー（AI読取）"],
+  ["vendor", "店名（確定）"],
+  ["date", "利用日（確定）"],
+  ["amount", "金額（確定）"],
+  ["category", "科目（確定）"],
+  ["description", "摘要（確定）"],
+  ["aiVendor", "店名（AI読取）"],
+  ["aiDate", "利用日（AI読取）"],
+  ["aiAmount", "金額（AI読取）"],
+  ["aiCategory", "科目（AI読取）"],
+  ["aiDescription", "摘要（AI読取）"],
+  ["corrected", "修正された項目"],
+  ["applicantId", "申請者ID"],
+  ["rawHead", "書き起こし（先頭）"],
 ];
+const CORRECTION_HEADERS = CORRECTION_COLUMNS.map(function (c) {
+  return c[0];
+});
 
 /** 学習に使う直近の履歴件数（履歴が育っても解析の所要時間を一定に保つ） */
 const CORRECTION_LOOKBACK = 600;
@@ -132,51 +153,94 @@ function getSpreadsheet_() {
   return ss;
 }
 
-function ensureSheet_(name, headers) {
+/**
+ * シートを取得（無ければ作成）し、タブ名と1行目の見出しを日本語に揃える。
+ * 旧版で作られた英語タブ（expenses など）は見つけ次第リネームし、
+ * 英語の見出し行も日本語ラベルへ置き換えるため、移行作業は不要。
+ * 列は EXPENSE_COLUMNS 等の定義順そのもので、内部の読み書きは位置で行う。
+ */
+function ensureSheet_(name, columns, legacyName) {
   const ss = getSpreadsheet_();
   let sheet = ss.getSheetByName(name);
-  if (!sheet) sheet = ss.insertSheet(name);
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(headers);
-    sheet.setFrozenRows(1);
-  } else {
-    // 既存シートに新しい列が増えた場合はヘッダー行を末尾に追記
-    const width = sheet.getLastColumn();
-    if (width < headers.length) {
-      sheet
-        .getRange(1, width + 1, 1, headers.length - width)
-        .setValues([headers.slice(width)]);
+  if (!sheet && legacyName) {
+    const legacy = ss.getSheetByName(legacyName);
+    if (legacy) {
+      legacy.setName(name); // 旧英語タブ名 → 日本語タブ名
+      sheet = legacy;
     }
   }
+  const labels = columns.map(function (c) {
+    return c[1];
+  });
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(labels);
+    sheet.setFrozenRows(1);
+    return sheet;
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(labels);
+    sheet.setFrozenRows(1);
+    return sheet;
+  }
+  // 既存シート: 列の追加と、英語見出し → 日本語見出しの置き換え
+  const width = Math.max(sheet.getLastColumn(), labels.length);
+  const head = sheet.getRange(1, 1, 1, width).getValues()[0];
+  let changed = false;
+  labels.forEach(function (label, i) {
+    if (String(head[i] == null ? "" : head[i]).trim() !== label) {
+      head[i] = label;
+      changed = true;
+    }
+  });
+  if (changed) sheet.getRange(1, 1, 1, width).setValues([head]);
   return sheet;
 }
 
+/**
+ * 1行目の見出し（日本語ラベル／旧英語名のどちらでも）を内部キーの配列に変換する。
+ * 見出しが書き換えられていても、定義に無い列は元の文字列のまま残す。
+ */
+function headerKeys_(headRow, columns) {
+  return headRow.map(function (h) {
+    const t = String(h == null ? "" : h).trim();
+    for (let i = 0; i < columns.length; i++) {
+      if (columns[i][1] === t || columns[i][0] === t) return columns[i][0];
+    }
+    return t;
+  });
+}
+
 function getSheet_() {
-  return ensureSheet_(SHEET_NAME, HEADERS);
+  return ensureSheet_(SHEET_NAME, EXPENSE_COLUMNS, SHEET_NAME_LEGACY);
 }
 
 function getUsersSheet_() {
-  return ensureSheet_(USERS_SHEET, USER_HEADERS);
+  return ensureSheet_(USERS_SHEET, USER_COLUMNS, USERS_SHEET_LEGACY);
 }
 
 function getCorrectionsSheet_() {
-  return ensureSheet_(CORRECTIONS_SHEET, CORRECTION_HEADERS);
+  return ensureSheet_(
+    CORRECTIONS_SHEET,
+    CORRECTION_COLUMNS,
+    CORRECTIONS_SHEET_LEGACY
+  );
 }
 
 /** 事業部マスタ。初回作成時に既定事業部をシードする。 */
 function getDepartmentsSheet_() {
-  const ss = getSpreadsheet_();
-  let sheet = ss.getSheetByName(DEPARTMENTS_SHEET);
-  const fresh = !sheet;
-  if (!sheet) sheet = ss.insertSheet(DEPARTMENTS_SHEET);
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(["name"]);
-    sheet.setFrozenRows(1);
-    if (fresh) {
-      DEFAULT_DEPARTMENTS.forEach(function (d) {
-        sheet.appendRow([d]);
-      });
-    }
+  const existed =
+    !!getSpreadsheet_().getSheetByName(DEPARTMENTS_SHEET) ||
+    !!getSpreadsheet_().getSheetByName(DEPARTMENTS_SHEET_LEGACY);
+  const sheet = ensureSheet_(
+    DEPARTMENTS_SHEET,
+    DEPARTMENT_COLUMNS,
+    DEPARTMENTS_SHEET_LEGACY
+  );
+  if (!existed) {
+    DEFAULT_DEPARTMENTS.forEach(function (d) {
+      sheet.appendRow([d]);
+    });
   }
   return sheet;
 }
@@ -305,7 +369,7 @@ function usersExist_() {
 function readUsers_() {
   const sheet = getUsersSheet_();
   const values = sheet.getDataRange().getValues();
-  const head = values[0];
+  const head = headerKeys_(values[0], USER_COLUMNS);
   const users = [];
   for (let i = 1; i < values.length; i++) {
     if (!values[i][0]) continue;
@@ -551,7 +615,7 @@ function normalizeValue_(header, value) {
 function rowsToRecords_(sheet) {
   const values = sheet.getDataRange().getValues();
   if (values.length < 2) return [];
-  const head = values[0];
+  const head = headerKeys_(values[0], EXPENSE_COLUMNS);
   const records = [];
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
@@ -820,7 +884,7 @@ function actionReceiptImage_(body) {
 
   // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）
   const values = getSheet_().getDataRange().getValues();
-  const head = values[0];
+  const head = headerKeys_(values[0], EXPENSE_COLUMNS);
   const cFile = head.indexOf("imageFileId");
   const cApplicant = head.indexOf("applicantId");
   let allowed = false;
