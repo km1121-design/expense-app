@@ -45,6 +45,7 @@ const state = {
   views: { personal: "cards", admin: "cards" },
   // 領収書ビューア: 表示中の一覧のうち画像がある申請のIDと現在位置
   lightbox: { ids: [], index: 0 },
+  lastFare: null, // 直前の運賃照合結果（申請時にサーバーへ区間を送る）
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
@@ -180,6 +181,14 @@ function normalizeRecord(r) {
     reviewedAt: r.reviewedAt || null,
     reviewer: r.reviewer || null,
     reviewComment: r.reviewComment || null,
+    // 交通費の運賃照合（サーバー側で確定した内容）
+    fareFrom: r.fareFrom || "",
+    fareTo: r.fareTo || "",
+    fareRound: r.fareRound === true || String(r.fareRound).toLowerCase() === "true",
+    fareTrips: Number(r.fareTrips) || 0,
+    fareUnit: Number(r.fareUnit) || 0,
+    fareExpected: Number(r.fareExpected) || 0,
+    fareCheck: r.fareCheck || "",
   };
 }
 
@@ -315,6 +324,13 @@ function applySessionUI() {
   $("#userMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#deptMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#memoryCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  $("#fareMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
+  // 運賃のWeb照合はサーバー側で行うため、ローカル（試用）モードでは使えない
+  const fareBtn = $("#fareLookupBtn");
+  fareBtn.disabled = !(cloud && state.session);
+  fareBtn.title = fareBtn.disabled
+    ? "運賃のWeb照合はクラウド連携（ログイン）が必要です。区間と回数は入力できます。"
+    : "出発駅・到着駅から運賃を調べて申請額と突き合わせます";
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
     const roleEl = $("#sessionRole");
@@ -1102,6 +1118,231 @@ async function runOcr(file) {
 }
 
 /* =========================================================================
+ * 交通費の運賃照合（電車賃）
+ * ========================================================================= */
+
+/** 科目が交通費のときだけ区間の入力欄を出す */
+function applyFareUI() {
+  const isTransit = $("#expCategory").value === "交通費";
+  $("#fareBox").hidden = !isTransit;
+  if (!isTransit) clearFareResult();
+}
+
+function clearFareResult() {
+  state.lastFare = null;
+  $("#fareResult").hidden = true;
+  $("#fareResult").className = "fare-result";
+  $("#fareApplyBtn").hidden = true;
+}
+
+/** 入力欄から区間の指定を読み取る */
+function readFareInput() {
+  return {
+    from: $("#fareFrom").value.trim(),
+    to: $("#fareTo").value.trim(),
+    round: $("#fareRound").value === "round",
+    trips: Math.max(1, Math.min(60, Number($("#fareTrips").value) || 1)),
+  };
+}
+
+/** 想定金額の内訳を「510円 × 往復 × 2回 = 2,040円」の形で表す */
+function fareBreakdown(f) {
+  const parts = [yen(f.unit)];
+  if (f.round) parts.push("往復");
+  if (f.trips > 1) parts.push(`${f.trips}回`);
+  return `${parts.join(" × ")} = ${yen(f.expected)}`;
+}
+
+/** 区間の運賃を照合し、申請額と突き合わせて結果を表示する */
+async function lookupFare() {
+  if (!cloudEnabled() || !state.session) {
+    toast("運賃の照合はクラウド連携（ログイン）が必要です");
+    return;
+  }
+  const input = readFareInput();
+  if (!input.from || !input.to) {
+    toast("出発駅と到着駅を入力してください");
+    return;
+  }
+  const btn = $("#fareLookupBtn");
+  const result = $("#fareResult");
+  btn.disabled = true;
+  result.hidden = false;
+  result.className = "fare-result";
+  result.textContent = "運賃を照合中…（初めての区間はWebで調べるため数秒かかります）";
+  try {
+    const data = await apiPost({
+      action: "lookupFare",
+      from: input.from,
+      to: input.to,
+      round: input.round,
+      trips: input.trips,
+    });
+    state.lastFare = data;
+    renderFareResult();
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    state.lastFare = null;
+    result.className = "fare-result is-error";
+    result.textContent = "照合できませんでした：" + (err.message || "不明なエラー");
+    $("#fareApplyBtn").hidden = true;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 照合結果と、申請額との一致／差額を表示する */
+function renderFareResult() {
+  const f = state.lastFare;
+  if (!f) return clearFareResult();
+  const result = $("#fareResult");
+  const amount = Number($("#expAmount").value);
+  const lines = [`想定金額：${fareBreakdown(f)}`];
+  if (f.route) lines.push(`経路：${f.route}`);
+  lines.push(
+    f.cached
+      ? "運賃マスタの登録値で照合（Web検索なし）"
+      : "Web検索で照合し、運賃マスタへ登録しました"
+  );
+
+  let cls = "fare-result is-ok";
+  if (!amount) {
+    lines.push("金額が空のため「金額に反映」で入力できます");
+  } else if (amount === f.expected) {
+    lines.unshift("✅ 申請額は想定金額と一致しています");
+  } else {
+    cls = "fare-result is-warn";
+    const diff = amount - f.expected;
+    lines.unshift(
+      `⚠️ 申請額 ${yen(amount)} は想定金額と ${yen(Math.abs(diff))} ${
+        diff > 0 ? "多い" : "少ない"
+      }です`
+    );
+  }
+  result.className = cls;
+  result.innerHTML =
+    lines.map((l) => `<span>${escapeHtml(l)}</span>`).join("") +
+    (f.source
+      ? `<a href="${escapeHtml(f.source)}" target="_blank" rel="noopener">出典を開く ↗</a>`
+      : "");
+  result.hidden = false;
+  $("#fareApplyBtn").hidden = !f.expected;
+}
+
+/** 照合した想定金額を金額欄へ入れる */
+function applyFareToAmount() {
+  const f = state.lastFare;
+  if (!f || !f.expected) return;
+  $("#expAmount").value = f.expected;
+  renderFareResult();
+}
+
+/* ---------- 運賃マスタ（管理者のみ） ---------- */
+
+async function loadFares() {
+  try {
+    const data = await apiPost({ action: "listFares" });
+    renderFares(data.items || []);
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "運賃マスタの取得に失敗しました");
+  }
+}
+
+function renderFares(items) {
+  const tbody = $("#fareTable tbody");
+  tbody.innerHTML = items.length
+    ? items
+        .map(
+          (f) => `
+      <tr>
+        <td>${escapeHtml(f.from)}</td>
+        <td>${escapeHtml(f.to)}</td>
+        <td class="num">
+          <input class="fare-inline-input" type="number" min="1" step="1"
+            value="${f.fare}" data-fare-edit="${escapeHtml(f.key)}"
+            data-from="${escapeHtml(f.from)}" data-to="${escapeHtml(f.to)}" />
+        </td>
+        <td>${escapeHtml(f.route || "—")}</td>
+        <td>${
+          f.source
+            ? `<a href="${escapeHtml(f.source)}" target="_blank" rel="noopener">出典 ↗</a>`
+            : "—"
+        }</td>
+        <td>${escapeHtml((f.checkedAt || "").slice(0, 10))}<br /><span class="fare-by">${escapeHtml(
+            f.checkedBy || ""
+          )}</span></td>
+        <td>
+          <button class="btn btn--ghost btn--sm" data-fare-del="${escapeHtml(
+            f.key
+          )}" data-label="${escapeHtml(f.from + "〜" + f.to)}">削除</button>
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="7" class="empty">まだ区間がありません。申請時に区間を照合すると貯まります。</td></tr>`;
+}
+
+async function saveFareEdit(el) {
+  const fare = Number(el.value);
+  if (!fare || fare <= 0) {
+    toast("片道運賃は1円以上で入力してください");
+    return loadFares();
+  }
+  try {
+    const data = await apiPost({
+      action: "upsertFare",
+      from: el.dataset.from,
+      to: el.dataset.to,
+      fare,
+    });
+    renderFares(data.items || []);
+    toast("運賃を更新しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "更新に失敗しました");
+    loadFares();
+  }
+}
+
+async function handleFareAdd(evt) {
+  evt.preventDefault();
+  try {
+    const data = await apiPost({
+      action: "upsertFare",
+      from: $("#nfFrom").value.trim(),
+      to: $("#nfTo").value.trim(),
+      fare: Number($("#nfFare").value),
+      route: $("#nfRoute").value.trim(),
+    });
+    $("#fareAddForm").reset();
+    renderFares(data.items || []);
+    toast("区間を登録しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "登録に失敗しました");
+  }
+}
+
+async function deleteFare(key, label) {
+  if (
+    !window.confirm(
+      `区間「${label}」を運賃マスタから削除しますか？\n（次回この区間を照合すると、またWebで調べ直します）`
+    )
+  ) {
+    return;
+  }
+  try {
+    const data = await apiPost({ action: "deleteFare", key });
+    renderFares(data.items || []);
+    toast("区間を削除しました");
+  } catch (err) {
+    if (err instanceof AuthError) return handleAuthError();
+    toast(err.message || "削除に失敗しました");
+  }
+}
+
+/* =========================================================================
  * 申請フォーム
  * ========================================================================= */
 
@@ -1216,12 +1457,26 @@ async function submitExpense(evt) {
     return;
   }
 
+  // 交通費で区間が入力されていれば、照合用に一緒に送る
+  // （片道運賃と想定金額はサーバー側が運賃マスタから計算し直す）
+  const fare = $("#expCategory").value === "交通費" ? readFareInput() : null;
+  const fareFields =
+    fare && fare.from && fare.to
+      ? {
+          fareFrom: fare.from,
+          fareTo: fare.to,
+          fareRound: fare.round,
+          fareTrips: fare.trips,
+        }
+      : {};
+
   const base = {
     id: uid(),
     // クラウドモードでは申請者はサーバー側でセッションから強制される
     applicant: cloudEnabled()
       ? state.session.user.displayName
       : state.currentUser,
+    ...fareFields,
     date: $("#expDate").value,
     category: $("#expCategory").value,
     // 空の場合はサーバー側でプロフィールの事業部が入る
@@ -1287,6 +1542,8 @@ async function submitExpense(evt) {
     $("#expenseForm").reset();
     $("#expDate").valueAsDate = new Date();
     applyDeptUI(); // 事業部の既定値を再設定
+    applyFareUI();
+    clearFareResult();
     clearImage();
     render();
   } finally {
@@ -1412,6 +1669,32 @@ function receiptThumb(e, scope) {
   )}" data-scope="${scope}" title="領収書を拡大表示">${receiptImgTag(e, 400)}</button>`;
 }
 
+/** 運賃照合の結果バッジ（交通費で区間が指定された申請にだけ付く） */
+function fareBadge(e) {
+  const label = {
+    match: ["一致", "is-match", "申請額が想定運賃と一致"],
+    diff: ["差額あり", "is-diff", "申請額が想定運賃と違う"],
+    unchecked: ["未照合", "is-unchecked", "運賃マスタに区間が無く照合できていない"],
+  }[e.fareCheck];
+  if (!label) return "";
+  const detail = e.fareExpected ? `（想定 ${yen(Number(e.fareExpected))}）` : "";
+  return `<span class="fare-badge ${label[1]}" title="${escapeHtml(
+    label[2] + detail
+  )}">🚃 ${label[0]}</span>`;
+}
+
+/** 区間の説明（例: 新井薬師前→武蔵浦和 往復 ×2） */
+function fareRouteText(e) {
+  if (!e.fareFrom || !e.fareTo) return "";
+  const round = e.fareRound === true || String(e.fareRound).toLowerCase() === "true";
+  const trips = Number(e.fareTrips) || 1;
+  return (
+    `${e.fareFrom}→${e.fareTo}` +
+    (round ? " 往復" : " 片道") +
+    (trips > 1 ? ` ×${trips}回` : "")
+  );
+}
+
 /**
  * カード表示（領収書サムネイル付き）。
  * ops は各申請の操作ボタンHTMLを返す関数（無ければ操作なし）。
@@ -1433,9 +1716,12 @@ function expenseCardsHtml(rows, scope, ops) {
           <div class="ecard__tags">
             <span class="chip">${escapeHtml(e.category)}</span>
             <span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span>
+            ${fareBadge(e)}
           </div>
           <p class="ecard__amount">${yen(e.amount)}</p>
-          <p class="ecard__vendor">${escapeHtml(e.vendor || "支払先なし")}</p>
+          <p class="ecard__vendor">${escapeHtml(
+            fareRouteText(e) || e.vendor || "支払先なし"
+          )}</p>
           ${e.description ? `<p class="ecard__desc">${escapeHtml(e.description)}</p>` : ""}
           ${
             e.reviewComment
@@ -1608,7 +1894,7 @@ function renderPersonal() {
       <td>${escapeHtml(e.category)}</td>
       <td>${escapeHtml(e.vendor || "—")}</td>
       <td class="num">${yen(e.amount)}</td>
-      <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
+      <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span>${fareBadge(e)}</td>
       <td>${receiptCell(e, "personal")}</td>
       <td>${escapeHtml(e.reviewComment || "")}</td>
       <td>${ops(e)}</td>
@@ -1691,6 +1977,7 @@ function renderAdmin() {
   const q = $("#adminSearch").value.trim().toLowerCase();
   const sf = $("#adminStatusFilter").value;
   const rf = $("#adminReceiptFilter").value;
+  const ff = $("#adminFareFilter").value;
   let rows = monthRecs.filter((e) => {
     const matchQ =
       !q ||
@@ -1700,7 +1987,8 @@ function renderAdmin() {
     const matchS = sf === "all" || e.status === sf;
     const matchR =
       rf === "all" || (rf === "yes" ? hasReceipt(e) : !hasReceipt(e));
-    return matchQ && matchS && matchR;
+    const matchF = ff === "all" || e.fareCheck === ff;
+    return matchQ && matchS && matchR && matchF;
   });
 
   const sortKey = $("#adminSort").value;
@@ -1754,7 +2042,7 @@ function renderAdmin() {
         <td>${escapeHtml(e.vendor || "—")}</td>
         <td class="num">${yen(e.amount)}</td>
         <td>${receiptCell(e, "admin")}</td>
-        <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span></td>
+        <td><span class="badge badge--${e.status}">${STATUS_LABEL[e.status]}</span>${fareBadge(e)}</td>
         <td>${ops(e)}</td>
       </tr>`
     )
@@ -1867,6 +2155,8 @@ function exportCsv() {
     "id", "createdAt", "applicant", "applicantId", "department", "date",
     "category", "vendor", "amount", "description", "status", "reviewedAt",
     "reviewer", "reviewComment", "imageUrl",
+    "fareFrom", "fareTo", "fareRound", "fareTrips", "fareUnit",
+    "fareExpected", "fareCheck",
   ];
   const esc = (v) => {
     const s = v == null ? "" : String(v);
@@ -1900,6 +2190,7 @@ function setTab(tab) {
   if (tab === "admin" && cloudEnabled() && state.isAdmin && state.authEnabled) {
     loadUsers();
     loadVendorMemory();
+    loadFares();
   }
 }
 
@@ -2018,6 +2309,7 @@ function init() {
   state.currentUser = localStorage.getItem(USER_KEY) || "";
   $("#currentUser").value = state.currentUser;
   $("#expDate").valueAsDate = new Date();
+  applyFareUI(); // 既定の科目（交通費）に合わせて区間欄を出す
 
   // タブ
   $("#tabs").addEventListener("click", (e) => {
@@ -2047,6 +2339,43 @@ function init() {
   $("#userTable").addEventListener("click", handleUserTableClick);
   $("#userTable").addEventListener("change", handleUserDeptChange);
   $("#userReloadBtn").addEventListener("click", loadUsers);
+
+  // 交通費の運賃照合
+  $("#expCategory").addEventListener("change", applyFareUI);
+  $("#fareLookupBtn").addEventListener("click", lookupFare);
+  $("#fareApplyBtn").addEventListener("click", applyFareToAmount);
+  ["#fareRound", "#fareTrips"].forEach((sel) =>
+    $(sel).addEventListener("change", () => {
+      // 往復・回数を変えたら想定金額を作り直す（運賃は照合済みの値を再利用）
+      if (!state.lastFare) return;
+      const input = readFareInput();
+      state.lastFare = {
+        ...state.lastFare,
+        round: input.round,
+        trips: input.trips,
+        expected: state.lastFare.unit * (input.round ? 2 : 1) * input.trips,
+      };
+      renderFareResult();
+    })
+  );
+  $("#expAmount").addEventListener("input", () => {
+    if (state.lastFare) renderFareResult();
+  });
+  ["#fareFrom", "#fareTo"].forEach((sel) =>
+    $(sel).addEventListener("input", clearFareResult)
+  );
+
+  // 運賃マスタ（管理者）
+  $("#fareReloadBtn").addEventListener("click", loadFares);
+  $("#fareAddForm").addEventListener("submit", handleFareAdd);
+  $("#fareTable").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-fare-del]");
+    if (del) deleteFare(del.dataset.fareDel, del.dataset.label);
+  });
+  $("#fareTable").addEventListener("change", (e) => {
+    const edit = e.target.closest("[data-fare-edit]");
+    if (edit) saveFareEdit(edit);
+  });
 
   // AI解析の学習データ
   $("#memoryReloadBtn").addEventListener("click", loadVendorMemory);
@@ -2100,6 +2429,7 @@ function init() {
   $("#adminSearch").addEventListener("input", renderAdmin);
   $("#adminStatusFilter").addEventListener("change", renderAdmin);
   $("#adminReceiptFilter").addEventListener("change", renderAdmin);
+  $("#adminFareFilter").addEventListener("change", renderAdmin);
   $("#csvBtn").addEventListener("click", exportCsv);
 
   // 表示形式の切替（カード／表）

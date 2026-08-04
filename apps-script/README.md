@@ -131,9 +131,15 @@ JSON API・CSV が返すキー名は英語のまま固定なので、分析ツ�
 | 申請者ID | `applicantId` | ユーザーID（権限フィルタに使用） |
 | 事業部 | `department` | |
 
+交通費（電車賃）の申請には、区間の照合結果として
+`fareFrom`(出発駅) / `fareTo`(到着駅) / `fareRound`(往復) / `fareTrips`(回数) /
+`fareUnit`(片道運賃) / `fareExpected`(想定金額) / `fareCheck`(運賃照合) が入ります。
+`fareCheck` は `match`（申請額＝想定金額）/ `diff`（不一致）/ `unchecked`
+（区間はあるが運賃マスタに登録が無い）/ 空（区間の指定なし）です。
+
 このほか **ユーザー**（`username, displayName, passwordHash, salt, role, active,
-createdAt, department`）、**事業部マスタ**、**AI学習ログ** の各シートが同じ
-スプレッドシートに作成されます。
+createdAt, department`）、**事業部マスタ**、**AI学習ログ**、**運賃マスタ** の各シートが
+同じスプレッドシートに作成されます。
 
 > **旧バージョンからの移行**
 > 以前の版では、タブ名も見出しも英語（`expenses` / `users` / `departments` /
@@ -143,6 +149,27 @@ createdAt, department`）、**事業部マスタ**、**AI学習ログ** の各�
 > ただし、**タブ名 `expenses` を直接参照している外部連携**
 > （Looker Studio のデータソース、他ブックからの `IMPORTRANGE` など）は
 > 参照先の再設定が必要です。同じブック内の数式は Google が自動で追従します。
+
+### 「運賃マスタ」シート（電車賃の照合基準）
+
+電車賃は領収書が出ないため、区間から想定運賃を出して申請額と突き合わせます。
+
+1. 申請フォームで科目「交通費」を選ぶと、出発駅・到着駅・片道/往復・**回数**の欄が出ます
+2. 「Webで運賃を照合」を押すと、**運賃マスタに登録済みの区間はその値で即照合**、
+   未登録なら Gemini の Google 検索で「大人1名・通常運賃・IC片道」を調べ、
+   経路と出典URLを添えて返し、このシートへ登録します
+3. 想定金額 = 片道運賃 × (往復なら2) × 回数。申請額と比べて一致／差額を表示します
+4. 保存時はサーバー側が片道運賃をこのシートから取り直して再計算するため、
+   申請者側で運賃を書き換えることはできません
+
+上りと下りは同じ区間として扱い（運賃が同じため）、駅名は全半角・空白・末尾の「駅」を
+吸収して照合します。運賃改定やWeb照合の誤りは、管理者ダッシュボードの
+「運賃マスタ」で運賃欄を直接書き換えて修正してください（削除すると次回また調べ直します）。
+
+Web照合には `GEMINI_API_KEY` が必要です（AI解析と同じキーを使います）。
+モデルは `FARE_MODEL` で変更でき、既定は `gemini-3.5-flash` です。
+**検索1回ごとに少額の課金が発生する場合があります**が、同じ区間は2回目以降
+検索しないため、繰り返しの通勤区間ではほとんど発生しません。
 
 ### 「AI学習ログ」シート
 
@@ -192,6 +219,11 @@ node apps-script/tests/memory.test.js
     摘要をJSONで返却。過去の学習を適用した場合は `learned` を併せて返す）
   - `{action:"listVendorMemory", token}` / `{action:"deleteVendorMemory", token, key}`
     … AI解析の学習データの確認・店舗単位の削除（admin のみ）
+  - `{action:"lookupFare", token, from, to, round, trips}` … 交通費（電車賃）の運賃照合。
+    運賃マスタにある区間はその値で即答し、無ければ Gemini の Google 検索で調べて
+    マスタへ登録する。`{unit, expected, route, source, cached}` を返す
+  - `{action:"listFares", token}` / `{action:"upsertFare", token, from, to, fare, route}` /
+    `{action:"deleteFare", token, key}` … 運賃マスタの一覧・上書き・削除（admin のみ）
   - `{action:"receiptImage", token, imageFileId, thumb}` … 領収書画像を data URL で返す。
     ドライブのフォルダを共有していない利用者向けのフォールバック（ダッシュボードが
     サムネイルの読み込みに失敗したときに自動で使う）。シートに登録済みのファイルIDのみ許可し、

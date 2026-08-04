@@ -112,8 +112,16 @@ assert.strictEqual(sheet.getName(), "経費データ", "タブ名が日本語へ
 assert.strictEqual(sheets["expenses"], undefined, "旧名のタブは残らない");
 assert.strictEqual(
   sheet.rows[0].join(","),
-  "申請ID,申請日時,申請者,利用日,科目,支払先,金額,摘要,状態,処理日時,処理者,却下理由・備考,領収書URL,領収書ファイルID,申請者ID,事業部",
-  "1行目が日本語見出しに置き換わる"
+  val("EXPENSE_COLUMNS").map((c) => c[1]).join(","),
+  "1行目が日本語見出しに置き換わる（列が増えた場合も追記される）"
+);
+assert.ok(
+  sheet.rows[0].join(",").startsWith("申請ID,申請日時,申請者,利用日,科目,支払先,金額,摘要"),
+  "先頭の見出しは日本語"
+);
+assert.ok(
+  sheet.rows[0].indexOf("運賃照合") > 0,
+  "旧シートにも新しい列（運賃照合）の見出しが追記される"
 );
 // 移行前に入っていた行は、そのまま同じ内部キーで読み出せる
 const migrated = g.rowsToRecords_(sheet)[0];
@@ -300,5 +308,125 @@ assert.strictEqual(res.learned.retried, false);
 assert.strictEqual(res.fields.amount, 1300, "初回結果を採用");
 assert.strictEqual(res.fields.category, "会議費", "辞書補正は効いたまま");
 console.log("✓ 読み直しが失敗しても初回結果＋辞書補正で応答する");
+
+/* ================= 交通費の運賃照合（電車賃） ================= */
+
+/* -------- 12. 駅名・区間キーの正規化 -------- */
+assert.strictEqual(g.stationKey_("新井薬師前駅"), g.stationKey_("新井薬師前"));
+assert.strictEqual(g.stationKey_("ＪＲ 武蔵浦和"), g.stationKey_("jr武蔵浦和"));
+// 上りと下りは同じ運賃なので同じキーに寄せる
+assert.strictEqual(
+  g.fareKey_("新井薬師前", "武蔵浦和"),
+  g.fareKey_("武蔵浦和駅", "新井薬師前駅")
+);
+assert.strictEqual(g.fareKey_("新宿", "新宿"), "", "同じ駅は区間にならない");
+assert.strictEqual(g.fareKey_("新宿", ""), "", "片方が空なら区間にならない");
+console.log("✓ stationKey_/fareKey_: 「駅」の有無・全半角を吸収し、逆方向も同一区間として扱う");
+
+/* -------- 13. 想定金額 = 片道 × 往復 × 回数 -------- */
+assert.strictEqual(g.fareTotal_(220, false, 1), 220);
+assert.strictEqual(g.fareTotal_(220, true, 1), 440, "往復は2倍");
+assert.strictEqual(g.fareTotal_(220, true, 10), 4400, "回数分を掛ける");
+assert.strictEqual(g.fareTotal_(220, false, 0), 220, "回数0は1回として扱う");
+assert.strictEqual(g.fareTotal_(100, false, 999), 100 * val("FARE_TRIPS_MAX"), "回数は上限で止める");
+console.log("✓ fareTotal_: 往復と回数を掛けた想定金額を出し、回数は1〜上限に収める");
+
+/* -------- 14. Webで調べた運賃が運賃マスタへ蓄積され、2回目は検索しない -------- */
+props.GEMINI_API_KEY = "dummy";
+let searchCalls = 0;
+g.searchFareOnWeb_ = function (from, to) {
+  searchCalls++;
+  return { fare: 510, route: "西武新宿線→JR埼京線 池袋乗換", source: "https://example.test/fare" };
+};
+const first = g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", round: true, trips: 2 });
+assert.strictEqual(searchCalls, 1);
+assert.strictEqual(first.cached, false);
+assert.strictEqual(first.unit, 510);
+assert.strictEqual(first.expected, 510 * 2 * 2, "往復×2回");
+assert.strictEqual(first.source, "https://example.test/fare");
+
+// 2回目は同じ区間（しかも逆方向・「駅」付き）でもマスタから即答する
+const second = g.actionLookupFare_({ token: "", from: "武蔵浦和駅", to: "新井薬師前駅", round: false, trips: 1 });
+assert.strictEqual(searchCalls, 1, "2回目はWeb検索しない");
+assert.strictEqual(second.cached, true);
+assert.strictEqual(second.unit, 510);
+assert.strictEqual(second.expected, 510);
+assert.strictEqual(sheets["運賃マスタ"].getLastRow(), 2, "同じ区間は1行にまとまる");
+console.log("✓ actionLookupFare_: 初回はWebで照合し、以降は運賃マスタから即答（逆方向も同一視）");
+
+/* -------- 15. 申請時の照合判定はサーバー側で計算する -------- */
+// 申請額が想定と一致
+const okRec = g.resolveFareForRecord_(
+  { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: true, fareTrips: 2 }, 2040);
+assert.strictEqual(okRec.check, "match");
+assert.strictEqual(okRec.unit, 510);
+assert.strictEqual(okRec.expected, 2040);
+// 申請額が想定と違う
+const ngRec = g.resolveFareForRecord_(
+  { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: true, fareTrips: 2 }, 3000);
+assert.strictEqual(ngRec.check, "diff");
+assert.strictEqual(ngRec.expected, 2040, "想定金額はマスタの運賃から計算する");
+// クライアントが片道運賃を偽っても、マスタの値で上書きされる
+const spoofed = g.resolveFareForRecord_(
+  { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: false, fareTrips: 1, fareUnit: 99999 }, 510);
+assert.strictEqual(spoofed.unit, 510, "申請側の片道運賃は信用しない");
+assert.strictEqual(spoofed.check, "match");
+// マスタに無い区間は「未照合」
+const unknown = g.resolveFareForRecord_({ fareFrom: "知らない駅A", fareTo: "知らない駅B" }, 300);
+assert.strictEqual(unknown.check, "unchecked");
+assert.strictEqual(unknown.expected, 0);
+// 区間の指定が無ければ照合対象外
+assert.strictEqual(g.resolveFareForRecord_({}, 300).check, "");
+console.log("✓ resolveFareForRecord_: 想定金額をマスタから再計算し、申請額との一致/相違を判定する");
+
+/* -------- 16. 管理者による運賃の手修正・削除 -------- */
+g.actionUpsertFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", fare: 560 });
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: false, fareTrips: 1 }, 560).check,
+  "match",
+  "運賃改定を手修正すると以降の照合に反映される"
+);
+assert.strictEqual(sheets["運賃マスタ"].getLastRow(), 2, "手修正は行を増やさず上書きする");
+const listed = g.actionListFares_({ token: "" }).items;
+assert.strictEqual(listed.length, 1);
+assert.strictEqual(listed[0].fare, 560);
+assert.ok(listed[0].checkedBy.indexOf("手動") === 0);
+
+let threw = "";
+try {
+  g.actionUpsertFare_({ token: "", from: "新宿", to: "新宿", fare: 200 });
+} catch (err) {
+  threw = String(err.message);
+}
+assert.ok(threw.indexOf("別々の駅名") > 0, "同一駅の登録は弾く");
+
+g.actionDeleteFare_({ token: "", key: listed[0].key });
+assert.strictEqual(g.actionListFares_({ token: "" }).items.length, 0);
+searchCalls = 0;
+g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", round: false, trips: 1 });
+assert.strictEqual(searchCalls, 1, "削除後は再びWebで調べ直す");
+console.log("✓ 運賃マスタ: 管理者が上書き・削除でき、削除後は再照合される");
+
+/* -------- 17. AIの応答から運賃JSONを取り出す -------- */
+assert.strictEqual(
+  g.parseJsonLoosely_('```json\n{"fare": 480, "route": "JR中央線"}\n```').fare,
+  480,
+  "コードフェンス付きでも読める"
+);
+assert.strictEqual(
+  g.parseJsonLoosely_('調べました。{"fare": 300, "route": "都営大江戸線"} 以上です').fare,
+  300,
+  "前後に説明が付いていても読める"
+);
+assert.strictEqual(g.parseJsonLoosely_("運賃は分かりませんでした"), null);
+assert.strictEqual(
+  g.groundingSource_({ groundingMetadata: { groundingChunks: [
+    { web: { uri: "https://transit.example.test/1", title: "運賃案内" } }] } }),
+  "https://transit.example.test/1",
+  "検索の出典URLを拾える"
+);
+assert.strictEqual(g.groundingSource_({}), "", "出典が無ければ空文字");
+console.log("✓ AI応答のJSON抽出と出典URLの取得");
 
 console.log("\nすべて成功");

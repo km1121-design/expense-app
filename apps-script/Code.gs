@@ -18,7 +18,9 @@
  *                     自動作成・自動保存して以降再利用）
  *   AUTH_SECRET     : セッショントークン署名鍵（初回に自動生成・自動保存）
  *   SHARED_TOKEN    : 分析ツール用の読み取りトークン（設定時、doGet ?token= で全件取得可）
- *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）が有効
+ *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）と
+ *                       交通費の運賃Web照合（Google検索グラウンディング）が有効
+ *   FARE_MODEL        : 運賃照合に使うモデル（既定: gemini-3.5-flash）
  *   GEMINI_MODEL      : Geminiのモデル（既定: gemini-2.5-flash）
  *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効
  *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-4-8。安価なら claude-haiku-4-5）
@@ -54,6 +56,14 @@ const EXPENSE_COLUMNS = [
   ["imageFileId", "領収書ファイルID"],
   ["applicantId", "申請者ID"],
   ["department", "事業部"],
+  // 交通費の運賃照合（電車賃。区間と回数から想定額を出して申請額と突き合わせる）
+  ["fareFrom", "出発駅"],
+  ["fareTo", "到着駅"],
+  ["fareRound", "往復"],
+  ["fareTrips", "回数"],
+  ["fareUnit", "片道運賃"],
+  ["fareExpected", "想定金額"],
+  ["fareCheck", "運賃照合"],
 ];
 const HEADERS = EXPENSE_COLUMNS.map(function (c) {
   return c[0];
@@ -78,6 +88,23 @@ const USER_HEADERS = USER_COLUMNS.map(function (c) {
 const DEPARTMENTS_SHEET = "事業部マスタ";
 const DEPARTMENTS_SHEET_LEGACY = "departments";
 const DEPARTMENT_COLUMNS = [["name", "事業部名"]];
+
+/**
+ * 区間運賃マスタ。一度Webで照合した区間の運賃を蓄積し、
+ * 次回以降は検索せずに即照合する（結果がぶれず、検索の課金も発生しない）。
+ * 運賃改定やAIの誤りは管理者が上書き・削除して直せる。
+ */
+const FARES_SHEET = "運賃マスタ";
+const FARE_COLUMNS = [
+  ["key", "区間キー"],
+  ["from", "出発駅"],
+  ["to", "到着駅"],
+  ["fare", "片道運賃"],
+  ["route", "経路"],
+  ["source", "出典URL"],
+  ["checkedAt", "照合日時"],
+  ["checkedBy", "照合方法"],
+];
 const DEFAULT_DEPARTMENTS = [
   "BAR",
   "人材",
@@ -225,6 +252,10 @@ function getCorrectionsSheet_() {
     CORRECTION_COLUMNS,
     CORRECTIONS_SHEET_LEGACY
   );
+}
+
+function getFaresSheet_() {
+  return ensureSheet_(FARES_SHEET, FARE_COLUMNS);
 }
 
 /** 事業部マスタ。初回作成時に既定事業部をシードする。 */
@@ -717,6 +748,15 @@ function doPost(e) {
         return json_(actionAddDepartment_(body));
       case "deleteDepartment":
         return json_(actionDeleteDepartment_(body));
+      // ---- 交通費の運賃照合（電車賃） ----
+      case "lookupFare":
+        return json_(actionLookupFare_(body));
+      case "listFares":
+        return json_(actionListFares_(body));
+      case "upsertFare":
+        return json_(actionUpsertFare_(body));
+      case "deleteFare":
+        return json_(actionDeleteFare_(body));
       // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
       case "receiptImage":
         return json_(actionReceiptImage_(body));
@@ -788,6 +828,10 @@ function createExpense_(record, user) {
     imageFileId = file.getId();
     imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
   }
+  // 交通費の運賃照合。片道運賃は運賃マスタ（サーバー側の正）から取り直して
+  // 想定金額を計算するため、クライアントから送られた金額は信用しない。
+  const fare = resolveFareForRecord_(record, Number(record.amount) || 0);
+
   // 自動承認モードでは申請と同時に承認済みにする
   const auto = isAutoApprove_();
   const rec = {
@@ -807,6 +851,13 @@ function createExpense_(record, user) {
     imageFileId: imageFileId,
     applicantId: applicantId,
     department: department,
+    fareFrom: fare.from,
+    fareTo: fare.to,
+    fareRound: fare.from ? fare.round : "",
+    fareTrips: fare.from ? fare.trips : "",
+    fareUnit: fare.unit || "",
+    fareExpected: fare.expected || "",
+    fareCheck: fare.check,
   };
   sheet.appendRow(
     HEADERS.map(function (h) {
@@ -865,6 +916,340 @@ function deleteExpense_(id, user) {
   }
   sheet.deleteRow(row);
   return { ok: true };
+}
+
+/* ==================== 交通費の運賃照合（電車賃） ==================== */
+
+/** 1回の申請で認める回数の上限（打ち間違いで巨額にならないように） */
+const FARE_TRIPS_MAX = 60;
+
+/** 駅名の照合キー。表記ゆれ（全半角・空白・「駅」の有無）を吸収する */
+function stationKey_(s) {
+  let v = String(s || "").trim();
+  if (!v) return "";
+  try {
+    v = v.normalize("NFKC");
+  } catch (err) {
+    // 旧ランタイム互換
+  }
+  v = v.replace(/[\s　()（）]/g, "");
+  v = v.replace(/駅$/, "");
+  return v.toLowerCase().slice(0, 24);
+}
+
+/**
+ * 区間キー。上りと下りで運賃は同じなので、2駅を並べ替えて同一視する。
+ * これにより「A→B」で調べた運賃を「B→A」の申請にも使える。
+ */
+function fareKey_(from, to) {
+  const a = stationKey_(from);
+  const b = stationKey_(to);
+  if (!a || !b || a === b) return "";
+  return a < b ? a + "|" + b : b + "|" + a;
+}
+
+/** 運賃マスタを全件読む（件数は区間数なので多くならない） */
+function readFares_() {
+  const sheet = getFaresSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  const values = sheet
+    .getRange(2, 1, last - 1, FARE_COLUMNS.length)
+    .getValues();
+  const out = [];
+  values.forEach(function (row, i) {
+    if (!row[0]) return;
+    const r = { _row: i + 2 };
+    FARE_COLUMNS.forEach(function (c, j) {
+      r[c[0]] = row[j];
+    });
+    r.fare = Math.max(0, Math.round(Number(r.fare) || 0));
+    out.push(r);
+  });
+  return out;
+}
+
+/** 区間キーで運賃マスタを引く */
+function findFare_(key) {
+  if (!key) return null;
+  const rows = readFares_();
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i].key) === key) return rows[i];
+  }
+  return null;
+}
+
+/** 運賃マスタへ登録（同じ区間があれば上書き） */
+function saveFare_(rec) {
+  const sheet = getFaresSheet_();
+  const existing = findFare_(rec.key);
+  const row = FARE_COLUMNS.map(function (c) {
+    return rec[c[0]] == null ? "" : rec[c[0]];
+  });
+  if (existing) {
+    sheet.getRange(existing._row, 1, 1, FARE_COLUMNS.length).setValues([row]);
+  } else {
+    sheet.appendRow(row);
+  }
+}
+
+/** 回数・往復から想定金額を組み立てる */
+function fareTotal_(unit, round, trips) {
+  const u = Math.max(0, Math.round(Number(unit) || 0));
+  const n = Math.min(FARE_TRIPS_MAX, Math.max(1, Math.round(Number(trips) || 1)));
+  return u * (round ? 2 : 1) * n;
+}
+
+/**
+ * 区間の運賃を照合する。
+ * 1. 運賃マスタにあればそれを使う（Web検索なし・即時・結果が一定）
+ * 2. 無ければ Gemini の Google 検索グラウンディングで調べ、マスタへ登録する
+ * 想定金額 = 片道運賃 × (往復なら2) × 回数。申請額との比較は呼び出し側で行う。
+ */
+function actionLookupFare_(body) {
+  requireUser_(body.token, false);
+  const from = String(body.from || "").trim();
+  const to = String(body.to || "").trim();
+  const key = fareKey_(from, to);
+  if (!key) throw new Error("出発駅と到着駅を（別々の駅名で）入力してください");
+  const round = !!body.round;
+  const trips = Math.min(
+    FARE_TRIPS_MAX,
+    Math.max(1, Math.round(Number(body.trips) || 1))
+  );
+
+  let hit = findFare_(key);
+  let cached = !!hit;
+  if (!hit) {
+    const found = searchFareOnWeb_(from, to);
+    hit = {
+      key: key,
+      from: from,
+      to: to,
+      fare: found.fare,
+      route: found.route,
+      source: found.source,
+      checkedAt: new Date().toISOString(),
+      checkedBy: "web",
+    };
+    saveFare_(hit);
+  }
+  return {
+    ok: true,
+    cached: cached,
+    from: String(hit.from || from),
+    to: String(hit.to || to),
+    unit: hit.fare,
+    round: round,
+    trips: trips,
+    expected: fareTotal_(hit.fare, round, trips),
+    route: String(hit.route || ""),
+    source: String(hit.source || ""),
+    checkedBy: String(hit.checkedBy || ""),
+  };
+}
+
+/**
+ * Gemini の Google 検索グラウンディングで片道運賃を調べる。
+ * 構造化出力（responseSchema）は検索ツールと併用できないため、
+ * JSONで答えるよう指示し、本文から取り出す。出典は groundingMetadata から拾う。
+ */
+function searchFareOnWeb_(from, to) {
+  const apiKey = getProp_("GEMINI_API_KEY");
+  if (!apiKey) {
+    throw new Error(
+      "運賃のWeb照合には GEMINI_API_KEY の設定が必要です（管理者に設定を依頼してください）"
+    );
+  }
+  const prompt =
+    "日本の鉄道運賃を調べてください。\n" +
+    "区間: 「" + from + "」から「" + to + "」\n\n" +
+    "検索して、次の条件の運賃を答えてください:\n" +
+    "・大人1名の通常運賃（定期券・往復割引なし）\n" +
+    "・ICカード利用時の片道運賃（IC運賃が無い場合は切符運賃）\n" +
+    "・最も一般的・最短で案内される経路（乗換を含んでよい）\n\n" +
+    "回答は次のJSONのみを出力してください（前後に説明を書かない）:\n" +
+    '{"fare": 片道運賃の整数（円）, "route": "経路（例: 西武新宿線→JR埼京線 池袋乗換）", ' +
+    '"note": "補足（乗換や運賃の種別など30文字以内）"}\n\n' +
+    "運賃が確認できない場合は fare を 0 にしてください。推測で数字を書かないこと。";
+
+  const model =
+    String(getProp_("FARE_MODEL") || "").trim() || "gemini-3.5-flash";
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0, maxOutputTokens: 900 },
+  };
+
+  const fetchOnce = function (p) {
+    return UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(p),
+      muteHttpExceptions: true,
+    });
+  };
+  let res = fetchOnce(payload);
+  let code = res.getResponseCode();
+  let text = res.getContentText();
+  // 検索ツール非対応のモデル・構成では 400 になるため、ツール無しで一度だけ再試行
+  if (code === 400 && /tool|search/i.test(text)) {
+    delete payload.tools;
+    res = fetchOnce(payload);
+    code = res.getResponseCode();
+    text = res.getContentText();
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    throw new Error("運賃照合の応答を読み取れませんでした（HTTP " + code + "）");
+  }
+  if (code !== 200) {
+    const msg =
+      data && data.error && data.error.message ? data.error.message : "HTTP " + code;
+    throw new Error("運賃照合エラー(HTTP " + code + "): " + msg);
+  }
+  const cand = (data.candidates || [])[0];
+  if (!cand || !cand.content) throw new Error("運賃照合が応答を返しませんでした");
+  let out = "";
+  (cand.content.parts || []).forEach(function (p) {
+    if (p.text) out += p.text;
+  });
+
+  const parsed = parseJsonLoosely_(out);
+  const fare = Math.max(0, Math.round(Number(parsed && parsed.fare) || 0));
+  if (!fare) {
+    throw new Error(
+      "運賃を確認できませんでした。駅名を正式名称で入力するか、金額を手入力してください。"
+    );
+  }
+  let route = String((parsed && parsed.route) || "").slice(0, 80);
+  const note = String((parsed && parsed.note) || "").slice(0, 40);
+  if (note) route = route ? route + "（" + note + "）" : note;
+  return { fare: fare, route: route, source: groundingSource_(cand) };
+}
+
+/** ```json フェンスや前後の説明が付いていても JSON を取り出す */
+function parseJsonLoosely_(text) {
+  const s = String(text || "");
+  try {
+    return JSON.parse(s);
+  } catch (err) {
+    // 続けて本文中のオブジェクトを探す
+  }
+  const m = s.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[0]);
+  } catch (err) {
+    return null;
+  }
+}
+
+/** グラウンディング（検索）で参照されたURLを1つ返す。無ければ空文字 */
+function groundingSource_(cand) {
+  const meta = cand.groundingMetadata || cand.grounding_metadata;
+  const chunks = (meta && (meta.groundingChunks || meta.grounding_chunks)) || [];
+  for (let i = 0; i < chunks.length; i++) {
+    const web = chunks[i].web || chunks[i].Web;
+    if (web && web.uri) return String(web.uri).slice(0, 400);
+  }
+  return "";
+}
+
+/**
+ * 申請に付いてきた区間から、保存する運賃照合の内容を決める。
+ * 片道運賃は運賃マスタから取り直すため、申請者側で書き換えられない。
+ * マスタに無い区間は「未照合」として区間と回数だけ残す。
+ *   match     : 申請額 = 想定金額
+ *   diff      : 申請額 ≠ 想定金額（管理者が確認する）
+ *   unchecked : 区間はあるがマスタに運賃が無い
+ *   ""        : 区間の指定なし（交通費以外など）
+ */
+function resolveFareForRecord_(record, amount) {
+  const from = String((record && record.fareFrom) || "").trim();
+  const to = String((record && record.fareTo) || "").trim();
+  const key = fareKey_(from, to);
+  if (!key) return { from: "", to: "", round: false, trips: 0, unit: 0, expected: 0, check: "" };
+  const round = !!(record && record.fareRound);
+  const trips = Math.min(
+    FARE_TRIPS_MAX,
+    Math.max(1, Math.round(Number(record && record.fareTrips) || 1))
+  );
+  const hit = findFare_(key);
+  if (!hit || !hit.fare) {
+    return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+  }
+  const expected = fareTotal_(hit.fare, round, trips);
+  return {
+    from: from,
+    to: to,
+    round: round,
+    trips: trips,
+    unit: hit.fare,
+    expected: expected,
+    check: expected === Math.round(amount) ? "match" : "diff",
+  };
+}
+
+/** 管理者向け: 運賃マスタの一覧 */
+function actionListFares_(body) {
+  requireUser_(body.token, true);
+  const items = readFares_().map(function (r) {
+    return {
+      key: String(r.key),
+      from: String(r.from || ""),
+      to: String(r.to || ""),
+      fare: r.fare,
+      route: String(r.route || ""),
+      source: String(r.source || ""),
+      checkedAt: correctionDate_(r.checkedAt) || String(r.checkedAt || ""),
+      checkedBy: String(r.checkedBy || ""),
+    };
+  });
+  items.sort(function (a, b) {
+    return (a.from + a.to).localeCompare(b.from + b.to, "ja");
+  });
+  return { ok: true, items: items };
+}
+
+/** 管理者向け: 運賃の手修正・手動登録（運賃改定やAIの誤りを直す） */
+function actionUpsertFare_(body) {
+  const u = requireUser_(body.token, true);
+  const from = String(body.from || "").trim();
+  const to = String(body.to || "").trim();
+  const key = fareKey_(from, to);
+  if (!key) throw new Error("出発駅と到着駅を（別々の駅名で）入力してください");
+  const fare = Math.round(Number(body.fare) || 0);
+  if (fare <= 0) throw new Error("片道運賃は1円以上で入力してください");
+  const existing = findFare_(key);
+  saveFare_({
+    key: key,
+    from: from,
+    to: to,
+    fare: fare,
+    route: String(body.route || (existing && existing.route) || ""),
+    source: String(body.source || (existing && existing.source) || ""),
+    checkedAt: new Date().toISOString(),
+    checkedBy: "手動（" + (u.displayName || u.username || "管理者") + "）",
+  });
+  return { ok: true, items: actionListFares_(body).items };
+}
+
+/** 管理者向け: 運賃マスタから区間を削除（次回は再びWebで調べ直す） */
+function actionDeleteFare_(body) {
+  requireUser_(body.token, true);
+  const key = String(body.key || "").trim();
+  const existing = findFare_(key);
+  if (existing) getFaresSheet_().deleteRow(existing._row);
+  return { ok: true, items: actionListFares_(body).items };
 }
 
 /* ========================= 領収書画像の取得 ========================= */
