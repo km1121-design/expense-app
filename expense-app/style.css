@@ -135,6 +135,10 @@ body {
   color: var(--red);
   border-color: var(--red);
   background: var(--red-soft);
+  cursor: pointer; /* クリックでエラー詳細を表示できる */
+}
+.sync-badge.is-error:hover {
+  filter: brightness(0.97);
 }
 
 .tabs {
