@@ -46,6 +46,7 @@ const state = {
   // 領収書ビューア: 表示中の一覧のうち画像がある申請のIDと現在位置
   lightbox: { ids: [], index: 0 },
   lastFare: null, // 直前の運賃照合結果（申請時にサーバーへ区間を送る）
+  lastError: null, // 直前の通信エラー（同期バッジのクリックで確認できる）
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
@@ -129,12 +130,39 @@ function escapeHtml(s) {
 const STATUS_LABEL = { pending: "申請中", approved: "承認済み", rejected: "却下" };
 
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, ms) {
   const el = $("#toast");
   el.textContent = msg;
   el.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.hidden = true), 3200);
+  toastTimer = setTimeout(() => (el.hidden = true), ms || 3200);
+}
+
+/**
+ * 通信エラーの内容を控えておき、同期バッジのクリックでいつでも見られるようにする。
+ * トーストは数秒で消えるため、原因の共有・調査ができるようにするのが目的。
+ */
+function recordError(context, err) {
+  const msg = (err && err.message) || String(err);
+  state.lastError = {
+    at: new Date().toLocaleString("ja-JP"),
+    context,
+    message: msg,
+  };
+  console.error(context, err);
+  return msg;
+}
+
+/** 同期バッジをクリックしたときに、直前のエラー内容を表示する */
+function showLastError() {
+  const e = state.lastError;
+  if (!e) {
+    toast("記録されているエラーはありません");
+    return;
+  }
+  window.alert(
+    `通信エラーの詳細\n\n発生: ${e.at}\n処理: ${e.context}\n\n${e.message}`
+  );
 }
 
 /** シート由来のISO日時文字列を yyyy-MM-dd へ整形（既に日付形式ならそのまま） */
@@ -274,8 +302,12 @@ function setSync(status) {
     error: { text: "同期エラー", cls: "is-error" },
   };
   const m = map[status] || map.local;
-  badge.textContent = m.text;
+  badge.textContent = status === "error" ? m.text + " ⓘ" : m.text;
   badge.className = "sync-badge " + m.cls;
+  badge.title =
+    status === "error"
+      ? "クリックすると通信エラーの詳細を表示します"
+      : "クラウド連携の状態";
 }
 
 function updatePendingUI() {
@@ -301,10 +333,10 @@ async function refreshFromCloud() {
     await flushQueue();
   } catch (err) {
     if (err instanceof AuthError) return handleAuthError();
-    console.error(err);
+    const msg = recordError("クラウドから読み込み（doGet）", err);
     setSync("error");
     loadCache();
-    toast("クラウド読込に失敗：" + (err.message || "不明なエラー"));
+    toast("クラウド読込に失敗：" + msg, 8000);
   }
   render();
 }
@@ -1219,7 +1251,8 @@ async function lookupFare() {
     if (err instanceof AuthError) return handleAuthError();
     state.lastFare = null;
     result.className = "fare-result is-error";
-    result.textContent = "照合できませんでした：" + (err.message || "不明なエラー");
+    result.textContent =
+      "照合できませんでした：" + recordError("運賃照合（lookupFare）", err);
     $("#fareApplyBtn").hidden = true;
   } finally {
     btn.disabled = false;
@@ -2328,12 +2361,12 @@ async function initMode() {
     showAuthOverlay("login");
     setSync("synced");
   } catch (err) {
-    console.error(err);
+    const msg = recordError("接続確認（status）", err);
     setSync("error");
     loadCache();
     syncAdminUI();
     render();
-    toast("サーバーに接続できません：" + (err.message || "不明なエラー"));
+    toast("サーバーに接続できません：" + msg, 8000);
   }
 }
 
@@ -2358,6 +2391,11 @@ function init() {
     localStorage.setItem(USER_KEY, state.currentUser);
     render();
   });
+  // 同期バッジ: エラー時はクリックで詳細を表示
+  $("#syncBadge").addEventListener("click", () => {
+    if (state.syncStatus === "error") showLastError();
+  });
+
   $("#adminToggle").addEventListener("click", () => {
     state.isAdmin = !state.isAdmin;
     syncAdminUI();
