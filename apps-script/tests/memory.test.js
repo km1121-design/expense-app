@@ -91,7 +91,17 @@ sandbox.SpreadsheetApp.getActiveSpreadsheet = () => FAKE_SS;
 sandbox.SpreadsheetApp.openById = () => FAKE_SS;
 sandbox.SpreadsheetApp.create = () => FAKE_SS;
 
-// 旧版（英語タブ・英語見出し）で作られた状態を用意し、自動移行を検証する
+// 旧版（英語タブ・英語見出し）で作られた状態を用意し、自動移行を検証する。
+// corrections は「AI解析を使った申請」でしか触られないタブなので、
+// 全シート移行が走ることの確認用にデータ行つきで置いておく。
+sheets["corrections"] = new FakeSheet("corrections", [
+  ["createdAt", "vendorKey", "aiVendorKey", "vendor", "date", "amount", "category",
+   "description", "aiVendor", "aiDate", "aiAmount", "aiCategory", "aiDescription",
+   "corrected", "applicantId", "rawHead"],
+  ["2026-07-01T00:00:00Z", "旧店舗", "旧店舗", "旧店舗", "2026-07-01", 700,
+   "消耗品費", "移行前の学習", "旧店舗", "2026-07-01", 700, "消耗品費", "移行前の学習",
+   "", "yamada", ""],
+]);
 sheets["expenses"] = new FakeSheet("expenses", [
   ["id", "createdAt", "applicant", "date", "category", "vendor", "amount",
    "description", "status", "reviewedAt", "reviewer", "reviewComment",
@@ -107,6 +117,29 @@ const g = sandbox; // function 宣言はグローバルオブジェクトに乗�
 const val = (expr) => vm.runInContext(expr, sandbox);
 
 /* -------- 0. 旧英語タブ／英語見出しの自動移行と、既存データの読み出し -------- */
+// 使われていないタブ（corrections）も含め、全シートがまとめて移行される
+g.migrateSheetsIfNeeded_();
+["経費データ", "ユーザー", "事業部マスタ", "AI学習ログ", "運賃マスタ"].forEach((n) =>
+  assert.ok(sheets[n], `${n} タブが用意される`)
+);
+["expenses", "users", "departments", "corrections"].forEach((n) =>
+  assert.strictEqual(sheets[n], undefined, `旧名 ${n} のタブは残らない`)
+);
+assert.strictEqual(
+  sheets["AI学習ログ"].rows[0][0],
+  "記録日時",
+  "AI解析を使っていなくても学習ログの見出しが日本語化される"
+);
+// 移行前に入っていた学習ログもそのまま読める
+const oldMemory = g.buildVendorMemory_(g.vendorKey_("旧店舗"));
+assert.ok(oldMemory, "移行前の学習データが引き続き使える");
+assert.strictEqual(oldMemory.category.value, "消耗品費");
+// 2回目は版が一致するので何もしない（毎リクエストの負荷を増やさない）
+assert.strictEqual(props.SCHEMA_VERSION, val("SCHEMA_VERSION"));
+g.migrateSheetsIfNeeded_();
+assert.strictEqual(sheets["AI学習ログ"].getLastRow(), 2, "重複して行が増えない");
+console.log("✓ migrateSheetsIfNeeded_: 使われていないタブも含め全シートを一度で移行する");
+
 const sheet = g.getSheet_();
 assert.strictEqual(sheet.getName(), "経費データ", "タブ名が日本語へリネームされる");
 assert.strictEqual(sheets["expenses"], undefined, "旧名のタブは残らない");
@@ -169,7 +202,7 @@ g.logCorrection_(
   { vendor: "カフェベローチェ渋谷店", date: "2026-07-05", amount: 880, category: "交際費", description: "飲食", rawText: "合計 880" },
   "yamada"
 );
-assert.strictEqual(sheets["AI学習ログ"].getLastRow(), 3); // ヘッダー + 2件
+assert.strictEqual(sheets["AI学習ログ"].getLastRow(), 4); // ヘッダー + 移行前1件 + 2件
 console.log("✓ logCorrection_: 申請ごとに1行、ヘッダー付きで記録される");
 
 /* ---------------- 3. 誤読した店名でも過去の学習を引ける ---------------- */

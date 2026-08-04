@@ -258,6 +258,48 @@ function getFaresSheet_() {
   return ensureSheet_(FARES_SHEET, FARE_COLUMNS);
 }
 
+/**
+ * シート名・見出しの定義の版。ここを変えると次のリクエストで全シートを移行する。
+ */
+const SCHEMA_VERSION = "2026-08-ja-1";
+
+/**
+ * 全シートのタブ名と見出しを現在の定義に揃える。
+ *
+ * 各シートは使われたときにしか ensureSheet_ を通らないため、たとえば
+ * AI学習ログ（旧 corrections）は「AI解析を使った申請」が発生するまで
+ * 日本語化されない。それを避けるため、版が変わったときだけ全シートを
+ * まとめて移行する（普段はプロパティ1回の読み取りだけで終わる）。
+ * 存在しないシートはここで作成され、見出しだけの空シートになる。
+ */
+function migrateSheetsIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty("SCHEMA_VERSION") === SCHEMA_VERSION) return;
+  migrateSheets();
+  props.setProperty("SCHEMA_VERSION", SCHEMA_VERSION);
+}
+
+/**
+ * メンテナンス用：エディタから手動実行できる全シートの移行（デプロイ不要）。
+ * タブ名のリネームと見出しの日本語化・列の追記を、全シートに対して行う。
+ */
+function migrateSheets() {
+  getSheet_();
+  getUsersSheet_();
+  getDepartmentsSheet_();
+  getCorrectionsSheet_();
+  getFaresSheet_();
+}
+
+/** 移行の失敗でリクエスト自体を落とさないためのラッパー */
+function safeMigrateSheets_() {
+  try {
+    migrateSheetsIfNeeded_();
+  } catch (err) {
+    // 移行できなくても本来の処理は続行する（次回のリクエストで再試行される）
+  }
+}
+
 /** 事業部マスタ。初回作成時に既定事業部をシードする。 */
 function getDepartmentsSheet_() {
   const existed =
@@ -681,6 +723,7 @@ function findRow_(sheet, id) {
  */
 function doGet(e) {
   try {
+    safeMigrateSheets_();
     const token = e && e.parameter ? e.parameter.token : "";
     const shared = getProp_("SHARED_TOKEN");
     let records;
@@ -704,6 +747,7 @@ function doGet(e) {
 /** POST: 認証・申請の作成・更新・削除・ユーザー管理 */
 function doPost(e) {
   try {
+    safeMigrateSheets_();
     const body = JSON.parse((e.postData && e.postData.contents) || "{}");
     switch (body.action) {
       // ---- 認証（トークン不要） ----
