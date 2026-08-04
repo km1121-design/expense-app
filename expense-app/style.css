@@ -676,6 +676,99 @@ body {
   font-size: 0.8em;
 }
 
+/* ===== 交通費の運賃照合（電車賃） ===== */
+.fare-box {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 12px 14px 14px;
+  margin: 0 0 4px;
+}
+.fare-box legend {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--muted);
+  padding: 0 6px;
+}
+.fare-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.fare-grid .form__row {
+  margin: 0;
+}
+.fare-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.fare-result {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.fare-result.is-ok {
+  border-color: var(--green);
+  background: var(--green-soft);
+}
+.fare-result.is-warn {
+  border-color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+.fare-result.is-error {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+.fare-result a {
+  color: var(--blue);
+  align-self: flex-start;
+}
+.fare-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.fare-badge.is-match {
+  background: var(--green-soft);
+  color: var(--green);
+}
+.fare-badge.is-diff {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.fare-badge.is-unchecked {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.fare-inline-input {
+  width: 90px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 0.8rem;
+  font-family: inherit;
+  text-align: right;
+}
+.fare-by {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
 /* ===== 表示形式の切替（カード／表） ===== */
 .view-toggle {
   display: inline-flex;

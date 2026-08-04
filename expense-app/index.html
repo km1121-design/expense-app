@@ -142,6 +142,42 @@
                 <label for="expVendor">支払先 / 店名</label>
                 <input id="expVendor" type="text" placeholder="例：〇〇商店" />
               </div>
+
+              <!-- 交通費の運賃照合（科目が交通費のときだけ表示） -->
+              <fieldset class="fare-box" id="fareBox" hidden>
+                <legend>電車賃の照合（区間から運賃を調べます）</legend>
+                <div class="fare-grid">
+                  <div class="form__row">
+                    <label for="fareFrom">出発駅</label>
+                    <input id="fareFrom" type="text" placeholder="例：新井薬師前" autocomplete="off" />
+                  </div>
+                  <div class="form__row">
+                    <label for="fareTo">到着駅</label>
+                    <input id="fareTo" type="text" placeholder="例：武蔵浦和" autocomplete="off" />
+                  </div>
+                  <div class="form__row">
+                    <label for="fareRound">片道 / 往復</label>
+                    <select id="fareRound">
+                      <option value="round">往復</option>
+                      <option value="one">片道</option>
+                    </select>
+                  </div>
+                  <div class="form__row">
+                    <label for="fareTrips">回数</label>
+                    <input id="fareTrips" type="number" min="1" max="60" step="1" value="1" />
+                  </div>
+                </div>
+                <div class="fare-actions">
+                  <button id="fareLookupBtn" type="button" class="btn btn--ghost btn--sm">
+                    🔎 Webで運賃を照合
+                  </button>
+                  <button id="fareApplyBtn" type="button" class="btn btn--ghost btn--sm" hidden>
+                    金額に反映
+                  </button>
+                </div>
+                <p class="fare-result" id="fareResult" hidden></p>
+              </fieldset>
+
               <div class="form__row">
                 <label for="expAmount">金額（円） <span class="req">*</span></label>
                 <input id="expAmount" type="number" min="0" step="1" required />
@@ -267,6 +303,12 @@
                 <option value="yes">領収書あり</option>
                 <option value="no">領収書なし</option>
               </select>
+              <select id="adminFareFilter" class="mini-select">
+                <option value="all">運賃照合：すべて</option>
+                <option value="diff">差額あり</option>
+                <option value="unchecked">未照合</option>
+                <option value="match">一致</option>
+              </select>
               <select id="adminSort" class="mini-select">
                 <option value="date_desc">日付（新しい順）</option>
                 <option value="date_asc">日付（古い順）</option>
@@ -315,6 +357,47 @@
           <div id="deptChips" class="dept-chips"></div>
           <form id="deptAddForm" class="form form--inline-add">
             <input id="newDeptName" type="text" placeholder="新しい事業部名" maxlength="40" required />
+            <button type="submit" class="btn btn--primary">追加</button>
+          </form>
+        </div>
+
+        <!-- 運賃マスタ（クラウド＋認証モードのみ） -->
+        <div class="card cloud-only" id="fareMgmtCard" hidden>
+          <div class="card__head">
+            <h2 class="card__title">運賃マスタ（電車賃の照合基準）</h2>
+            <button id="fareReloadBtn" type="button" class="btn btn--ghost btn--sm">
+              再読込
+            </button>
+          </div>
+          <p class="card__hint">
+            申請時に区間を照合すると、その区間の片道運賃がここに蓄積されます。
+            2回目以降は<strong>Web検索せずにこの値で即照合</strong>するため、結果がぶれません。
+            運賃改定やWeb照合の誤りは、運賃欄を直接書き換えて修正してください
+            （削除すると次回また調べ直します）。上りと下りは同じ区間として扱います。
+          </p>
+          <div class="table-wrap">
+            <table class="table" id="fareTable">
+              <thead>
+                <tr>
+                  <th>出発駅</th>
+                  <th>到着駅</th>
+                  <th class="num">片道運賃</th>
+                  <th>経路</th>
+                  <th>出典</th>
+                  <th>更新</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <h3 class="card__subtitle">区間を手で追加する</h3>
+          <form id="fareAddForm" class="form form--inline-add">
+            <input id="nfFrom" type="text" placeholder="出発駅" required />
+            <input id="nfTo" type="text" placeholder="到着駅" required />
+            <input id="nfFare" type="number" min="1" step="1" placeholder="片道運賃" required />
+            <input id="nfRoute" type="text" placeholder="経路（任意）" />
             <button type="submit" class="btn btn--primary">追加</button>
           </form>
         </div>
