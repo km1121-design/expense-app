@@ -1117,51 +1117,36 @@ function searchFareOnWeb_(from, to) {
     '"note": "補足（乗換や運賃の種別など30文字以内）"}\n\n' +
     "運賃が確認できない場合は fare を 0 にしてください。推測で数字を書かないこと。";
 
-  const model =
-    String(getProp_("FARE_MODEL") || "").trim() || "gemini-3.5-flash";
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    encodeURIComponent(model) +
-    ":generateContent?key=" +
-    encodeURIComponent(apiKey);
-  const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0, maxOutputTokens: 900 },
-  };
+  // モデル未提供・混雑時は次の候補へ。Web アプリの応答時間に収めるため
+  // 思考は最小にする（運賃の照合は推論よりも検索結果の読み取りが主）。
+  const configured = String(getProp_("FARE_MODEL") || "").trim();
+  const candidates = [];
+  [configured, "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"].forEach(
+    function (m) {
+      if (m && candidates.indexOf(m) < 0) candidates.push(m);
+    }
+  );
 
-  const fetchOnce = function (p) {
-    return UrlFetchApp.fetch(url, {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify(p),
-      muteHttpExceptions: true,
-    });
-  };
-  let res = fetchOnce(payload);
-  let code = res.getResponseCode();
-  let text = res.getContentText();
-  // 検索ツール非対応のモデル・構成では 400 になるため、ツール無しで一度だけ再試行
-  if (code === 400 && /tool|search/i.test(text)) {
-    delete payload.tools;
-    res = fetchOnce(payload);
-    code = res.getResponseCode();
-    text = res.getContentText();
+  let lastErr = null;
+  let cand = null;
+  for (let i = 0; i < candidates.length && !cand; i++) {
+    try {
+      cand = callFareSearch_(apiKey, candidates[i], prompt);
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err && err.message) || err);
+      if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
+      if (
+        !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
+          msg
+        )
+      ) {
+        throw err;
+      }
+    }
   }
+  if (!cand) throw lastErr || new Error("運賃照合に失敗しました");
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (err) {
-    throw new Error("運賃照合の応答を読み取れませんでした（HTTP " + code + "）");
-  }
-  if (code !== 200) {
-    const msg =
-      data && data.error && data.error.message ? data.error.message : "HTTP " + code;
-    throw new Error("運賃照合エラー(HTTP " + code + "): " + msg);
-  }
-  const cand = (data.candidates || [])[0];
-  if (!cand || !cand.content) throw new Error("運賃照合が応答を返しませんでした");
   let out = "";
   (cand.content.parts || []).forEach(function (p) {
     if (p.text) out += p.text;
@@ -1178,6 +1163,68 @@ function searchFareOnWeb_(from, to) {
   const note = String((parsed && parsed.note) || "").slice(0, 40);
   if (note) route = route ? route + "（" + note + "）" : note;
   return { fare: fare, route: route, source: groundingSource_(cand) };
+}
+
+/**
+ * Gemini を1回呼び、候補（candidate）を返す。
+ * Google 検索グラウンディングは thinkingLevel / responseSchema と併用できない構成が
+ * あるため、400 のときは該当フィールドを外して1回だけ再試行する。
+ */
+function callFareSearch_(apiKey, model, prompt) {
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0, maxOutputTokens: 900 },
+  };
+  // 応答時間を短縮（Webアプリのタイムアウトで画面がHTMLエラーになるのを避ける）
+  if (/gemini-3/.test(model)) {
+    payload.generationConfig.thinkingLevel = "minimal";
+  } else if (/gemini-2\.5/.test(model)) {
+    payload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
+  const fetchOnce = function (p) {
+    return UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(p),
+      muteHttpExceptions: true,
+    });
+  };
+  let res = fetchOnce(payload);
+  let code = res.getResponseCode();
+  let text = res.getContentText();
+  // 思考制御・検索ツール非対応の構成では 400 になるため、外して一度だけ再試行
+  if (code === 400 && /thinking|tool|search/i.test(text)) {
+    delete payload.generationConfig.thinkingLevel;
+    delete payload.generationConfig.thinkingConfig;
+    if (/tool|search/i.test(text)) delete payload.tools;
+    res = fetchOnce(payload);
+    code = res.getResponseCode();
+    text = res.getContentText();
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    throw new Error("運賃照合の応答を読み取れませんでした（HTTP " + code + "）");
+  }
+  if (code !== 200) {
+    const msg =
+      data && data.error && data.error.message ? data.error.message : "HTTP " + code;
+    throw new Error("運賃照合エラー(" + model + " / HTTP " + code + "): " + msg);
+  }
+  const cand = (data.candidates || [])[0];
+  if (!cand || !cand.content) {
+    throw new Error("運賃照合が応答を返しませんでした（" + model + "）");
+  }
+  return cand;
 }
 
 /** ```json フェンスや前後の説明が付いていても JSON を取り出す */

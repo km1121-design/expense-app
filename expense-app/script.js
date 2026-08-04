@@ -199,6 +199,41 @@ function normalizeRecord(r) {
 
 class AuthError extends Error {}
 
+/**
+ * 応答をJSONとして読む。
+ * Apps Script はエラー時やアクセス権限が足りないときにHTML（Googleのエラー画面や
+ * ログイン画面）を返すため、そのまま JSON.parse すると原因の分からない
+ * 「Unexpected token '<'」になる。何が起きているかを日本語で伝える。
+ */
+async function readJsonResponse(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    const head = text.slice(0, 400);
+    if (/accounts\.google\.com|ServiceLogin|Sign in|ログイン/i.test(head)) {
+      throw new Error(
+        "Googleのログイン画面が返されました。Apps Scriptのデプロイ設定で" +
+          "「アクセスできるユーザー」を『全員』にしてください（HTTP " +
+          res.status +
+          "）"
+      );
+    }
+    if (/<!DOCTYPE|<html/i.test(head)) {
+      throw new Error(
+        "サーバーがJSONではなくHTMLを返しました（HTTP " +
+          res.status +
+          "）。Apps Scriptを再デプロイ（デプロイを管理→新バージョン）したか、" +
+          "⚙️のURLが正しい /exec のURLかを確認してください。" +
+          "エディタの「実行数」に残ったエラーも確認してください。"
+      );
+    }
+    throw new Error(
+      "サーバーの応答を読み取れませんでした（HTTP " + res.status + "）: " + head
+    );
+  }
+}
+
 async function apiPost(payload) {
   const body = { ...payload };
   if (state.session && body.token === undefined) body.token = state.session.token;
@@ -207,7 +242,7 @@ async function apiPost(payload) {
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  const data = await readJsonResponse(res);
   if (!data.ok) {
     if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
     throw new Error(data.error || "APIエラー");
@@ -220,7 +255,7 @@ async function apiGet() {
   const url =
     state.config.endpoint + (token ? "?token=" + encodeURIComponent(token) : "");
   const res = await fetch(url);
-  const data = await res.json();
+  const data = await readJsonResponse(res);
   if (!data.ok) {
     if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
     throw new Error(data.error || "APIエラー");
@@ -269,7 +304,7 @@ async function refreshFromCloud() {
     console.error(err);
     setSync("error");
     loadCache();
-    toast("クラウド読込に失敗しました。ローカルの内容を表示します。");
+    toast("クラウド読込に失敗：" + (err.message || "不明なエラー"));
   }
   render();
 }
@@ -2298,7 +2333,7 @@ async function initMode() {
     loadCache();
     syncAdminUI();
     render();
-    toast("サーバーに接続できません。ローカルのキャッシュを表示します。");
+    toast("サーバーに接続できません：" + (err.message || "不明なエラー"));
   }
 }
 
