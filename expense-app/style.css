@@ -680,6 +680,24 @@ body {
   font-size: 0.8em;
 }
 
+/* ===== 案内バー（バックエンドが古い版のとき等） ===== */
+.notice {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--accent-strong);
+  background: var(--accent-soft);
+  color: var(--text);
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+.notice code {
+  background: var(--surface);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
 /* ===== 交通費の運賃照合（電車賃） ===== */
 .fare-box {
   border: 1px solid var(--border);
