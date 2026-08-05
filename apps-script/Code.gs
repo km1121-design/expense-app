@@ -757,6 +757,16 @@ function doPost(e) {
           authEnabled: usersExist_(),
           autoApprove: isAutoApprove_(),
           aiOcr: !!resolveOcrProvider_(),
+          version: SCHEMA_VERSION,
+          // アプリ側が「このバックエンドで何が使えるか」を判定するための一覧。
+          // 古いコードのままデプロイされている場合はキー自体が返らないので、
+          // アプリは機能が無いものとして扱い、再デプロイを促す。
+          features: {
+            fare: true, // 交通費の運賃照合
+            receiptImage: true, // 領収書画像のアプリ経由取得
+            vendorMemory: true, // AI解析の学習
+            jaSheets: true, // シートの日本語化
+          },
         });
       case "setup":
         return json_(actionSetup_(body));

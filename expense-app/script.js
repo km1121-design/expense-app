@@ -47,6 +47,7 @@ const state = {
   lightbox: { ids: [], index: 0 },
   lastFare: null, // 直前の運賃照合結果（申請時にサーバーへ区間を送る）
   lastError: null, // 直前の通信エラー（同期バッジのクリックで確認できる）
+  features: {}, // バックエンド（Apps Script）が対応している機能
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
@@ -392,11 +393,15 @@ function applySessionUI() {
   $("#deptMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#memoryCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
   $("#fareMgmtCard").hidden = !(cloud && state.isAdmin && state.authEnabled);
-  // 運賃のWeb照合はサーバー側で行うため、ローカル（試用）モードでは使えない
+  // 運賃のWeb照合はサーバー側で行うため、ローカル（試用）モードや
+  // Code.gs が古い版のままの環境では使えない
   const fareBtn = $("#fareLookupBtn");
-  fareBtn.disabled = !(cloud && state.session);
-  fareBtn.title = fareBtn.disabled
+  const fareReady = cloud && !!state.session && !!state.features.fare;
+  fareBtn.disabled = !fareReady;
+  fareBtn.title = !cloud || !state.session
     ? "運賃のWeb照合はクラウド連携（ログイン）が必要です。区間と回数は入力できます。"
+    : !state.features.fare
+    ? "Apps Script のコードが古い版です。最新の Code.gs を貼り付けて再デプロイしてください。"
     : "出発駅・到着駅から運賃を調べて申請額と突き合わせます";
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
@@ -1187,6 +1192,30 @@ async function runOcr(file) {
 /* =========================================================================
  * 交通費の運賃照合（電車賃）
  * ========================================================================= */
+
+/**
+ * バックエンド（Apps Script）が古い版のときに案内を出す。
+ * status の features は新しい Code.gs でしか返らないため、
+ * 「アプリだけ更新されて Code.gs の再デプロイが済んでいない」状態を検出できる。
+ */
+function applyBackendNotice() {
+  const el = $("#backendNotice");
+  if (!el) return;
+  const missing = [];
+  if (!state.features.fare) missing.push("電車賃の運賃照合");
+  if (!state.features.receiptImage) missing.push("領収書画像の表示");
+  if (!state.features.vendorMemory) missing.push("AI解析の学習");
+  if (!cloudEnabled() || !missing.length) {
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML =
+    "⚠️ <strong>Apps Script のコードが古い版です。</strong>" +
+    escapeHtml(missing.join("・")) +
+    " が使えません。最新の <code>Code.gs</code> を貼り付けて再デプロイしてください" +
+    "（デプロイ → デプロイを管理 → ✏️ → 新バージョン）。";
+  el.hidden = false;
+}
 
 /** 科目が交通費のときだけ区間の入力欄を出す */
 function applyFareUI() {
@@ -2328,6 +2357,8 @@ async function initMode() {
     state.authEnabled = !!st.authEnabled;
     state.autoApprove = !!st.autoApprove;
     state.aiOcr = !!st.aiOcr;
+    state.features = st.features || {};
+    applyBackendNotice();
 
     if (!state.authEnabled) {
       // 初期設定（最初の管理者作成）が必要
