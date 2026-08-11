@@ -1129,30 +1129,14 @@ function searchFareOnWeb_(from, to) {
 
   // モデル未提供・混雑時は次の候補へ。Web アプリの応答時間に収めるため
   // 思考は最小にする（運賃の照合は推論よりも検索結果の読み取りが主）。
-  const configured = String(getProp_("FARE_MODEL") || "").trim();
-  const candidates = buildModelCandidates_(configured);
-
-  const failures = [];
-  let cand = null;
-  for (let i = 0; i < candidates.length && !cand; i++) {
-    try {
-      cand = callFareSearch_(apiKey, candidates[i], prompt);
-    } catch (err) {
-      const msg = String((err && err.message) || err);
-      failures.push(candidates[i] + " → " + msg);
-      if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
-      if (
-        !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|not found|not supported|no longer available|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
-          msg
-        )
-      ) {
-        throw err;
-      }
+  const cand = tryGeminiModels_(
+    "運賃照合",
+    apiKey,
+    getProp_("FARE_MODEL"),
+    function (model) {
+      return callFareSearch_(apiKey, model, prompt);
     }
-  }
-  // 全滅したときは「どのモデルがどう失敗したか」と「このキーで使えるモデル」を
-  // まとめて返す。1つのモデルのエラーだけでは原因が分からないため。
-  if (!cand) throw new Error(buildModelFailureMessage_("運賃照合", apiKey, failures));
+  );
 
   let out = "";
   (cand.content.parts || []).forEach(function (p) {
@@ -1738,13 +1722,15 @@ function buildReceiptPrompt_(hint) {
 /* ---------------- Gemini のモデル選択と失敗時の案内 ---------------- */
 
 /**
- * 試すモデルの候補。設定値があれば最優先し、続けて現行の flash 系を新しい順に試す。
- * 旧モデル（gemini-2.5-flash 等）は新しいAPIキーでは 404 になるため候補に入れない。
+ * 試すモデルの候補。設定値があれば最優先。
+ * 個別のバージョン名（gemini-3.6-flash 等）はAPIキーの種類によって
+ * 使えたり使えなかったりする（無料枠が無いモデルは 429、廃止済みは 404）ため、
+ * **常に現行モデルを指す別名（-latest）を先に試す**。
  */
 const GEMINI_FALLBACK_MODELS = [
-  "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-3.1-flash-lite",
+  "gemini-flash-latest",
+  "gemini-3-flash-preview",
+  "gemini-flash-lite-latest",
 ];
 
 function buildModelCandidates_(configured) {
@@ -1755,6 +1741,92 @@ function buildModelCandidates_(configured) {
       if (m && out.indexOf(m) < 0) out.push(m);
     });
   return out;
+}
+
+/**
+ * モデル名の一覧から、文章生成に使えそうなものを優先度順に並べる。
+ * 別名（-latest）＞ flash ＞ pro の順。読み上げ・画像生成などの専用モデルは除く。
+ */
+function pickUsableGeminiModels_(names) {
+  const usable = (names || []).filter(function (n) {
+    return (
+      /flash|pro/.test(n) &&
+      !/tts|image|audio|live|embedding|customtools/.test(n)
+    );
+  });
+  const score = function (n) {
+    let s = 0;
+    if (/-latest$/.test(n)) s -= 100; // モデル名の変更に強い別名を最優先
+    if (/flash/.test(n)) s -= 50; // 速くて安い
+    if (/lite/.test(n)) s += 10;
+    if (/preview/.test(n)) s += 5;
+    return s;
+  };
+  return usable.slice().sort(function (a, b) {
+    return score(a) - score(b) || a.localeCompare(b);
+  });
+}
+
+/**
+ * 候補モデルを順に試し、最初に成功した結果を返す。
+ *
+ * 候補が全滅した場合は、そのAPIキーで **実際に使えるモデル**を取得して追い試しする。
+ * モデル名の変更・廃止や、キーの種類による利用可否の違いで全滅しても、
+ * 設定を変えずに自動で復旧させるため。
+ *
+ * @param label   エラー文に出す処理名
+ * @param apiKey  Gemini の APIキー
+ * @param configured スクリプトプロパティで指定されたモデル（最優先・空可）
+ * @param call    model を受け取って結果を返す関数（失敗時は例外）
+ * @param passes  候補を何巡するか（混雑時の再挑戦用。既定1）
+ */
+function tryGeminiModels_(label, apiKey, configured, call, passes) {
+  const failures = [];
+  const everTried = {};
+  const run = function (models, record) {
+    const tried = {};
+    for (let i = 0; i < models.length; i++) {
+      const model = models[i];
+      if (!model || tried[model]) continue;
+      tried[model] = true;
+      everTried[model] = true;
+      try {
+        return call(model);
+      } catch (err) {
+        const msg = String((err && err.message) || err);
+        if (record) failures.push(model + " → " + msg);
+        // APIキー自体が無効なら、どのモデルでも成功しないので即中断
+        if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
+        // 混雑・未提供・権限・クォータは次候補へ。それ以外は本当の異常なので投げる
+        if (
+          !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|high demand|not found|not supported|no longer available|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
+            msg
+          )
+        ) {
+          throw err;
+        }
+      }
+    }
+    return null;
+  };
+
+  const candidates = buildModelCandidates_(configured);
+  const rounds = Math.max(1, passes || 1);
+  for (let pass = 0; pass < rounds; pass++) {
+    const out = run(candidates, pass === 0);
+    if (out) return out;
+    if (pass + 1 < rounds) Utilities.sleep(1500); // 503は一時的な混雑が多い
+  }
+
+  // ここまで全滅 → このキーで使えるモデルを調べ、未試行のものを追加で試す
+  const usable = listAvailableGeminiModels_(apiKey);
+  const extra = pickUsableGeminiModels_(usable).filter(function (m) {
+    return !everTried[m];
+  });
+  const out2 = run(extra.slice(0, 3), true);
+  if (out2) return out2;
+
+  throw new Error(buildModelFailureMessage_(label, usable, failures));
 }
 
 /**
@@ -1787,11 +1859,9 @@ function listAvailableGeminiModels_(apiKey) {
 }
 
 /** 全モデルで失敗したときの案内文（各モデルの失敗理由＋使えるモデル一覧） */
-function buildModelFailureMessage_(label, apiKey, failures) {
+function buildModelFailureMessage_(label, usableModels, failures) {
   let msg = label + "に失敗しました。試したモデル: " + failures.join(" / ");
-  const usable = listAvailableGeminiModels_(apiKey).filter(function (n) {
-    return n.indexOf("flash") >= 0 || n.indexOf("pro") >= 0;
-  });
+  const usable = pickUsableGeminiModels_(usableModels);
   if (usable.length) {
     msg +=
       "\nこのAPIキーで使えるモデル: " +
@@ -1932,37 +2002,21 @@ function actionAnalyzeReceipt_(body) {
 }
 
 /**
- * Gemini（無料枠可）で解析。GEMINI_MODEL 未指定なら無料枠対象の高精度モデルを順に試す。
+ * Gemini（無料枠可）で解析。GEMINI_MODEL 未指定なら現行モデルを順に試す。
  * モデル未提供・クォータ超過（404/403/429）の場合は次の候補へフォールバックし、
- * 全滅した場合は最後のエラーを投げる（＝原因が画面に出る）。
+ * 全滅した場合はこのキーで使えるモデルを調べて追い試ししてから、
+ * 全モデルの失敗理由と使えるモデル一覧をまとめて投げる（＝原因が画面に出る）。
  */
 function analyzeWithGemini_(body, hint) {
-  const candidates = buildModelCandidates_(getProp_("GEMINI_MODEL"));
-  const failures = [];
   // 1巡目で全滅した場合は少し待って再挑戦（503は一時的な混雑が多い）
-  for (let pass = 0; pass < 2; pass++) {
-    for (let i = 0; i < candidates.length; i++) {
-      try {
-        return callGemini_(body, candidates[i], hint);
-      } catch (err) {
-        const msg = String((err && err.message) || err);
-        if (pass === 0) failures.push(candidates[i] + " → " + msg);
-        // APIキー自体が無効なら、どのモデルでも成功しないので即中断
-        if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
-        // 混雑(503/500/UNAVAILABLE/overloaded)・未提供・権限・クォータは次候補へ
-        if (
-          !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|high demand|not found|not supported|no longer available|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
-            msg
-          )
-        ) {
-          throw err;
-        }
-      }
-    }
-    if (pass === 0) Utilities.sleep(1500);
-  }
-  throw new Error(
-    buildModelFailureMessage_("AI解析", getProp_("GEMINI_API_KEY"), failures)
+  return tryGeminiModels_(
+    "AI解析",
+    getProp_("GEMINI_API_KEY"),
+    getProp_("GEMINI_MODEL"),
+    function (model) {
+      return callGemini_(body, model, hint);
+    },
+    2
   );
 }
 

@@ -482,29 +482,86 @@ assert.ok(
   val("GEMINI_FALLBACK_MODELS").indexOf("gemini-2.5-flash") < 0,
   "新しいAPIキーで404になる旧モデルは候補に含めない"
 );
+assert.ok(
+  /-latest$/.test(val("GEMINI_FALLBACK_MODELS")[0]),
+  "モデル名の変更に強い別名（-latest）を最初に試す"
+);
 
-// 全滅時は「どのモデルがどう失敗したか」と「使えるモデル」の両方を返す
+/* -------- 19. 使えるモデルの選別と優先順位 -------- */
+// 実際のAPIキーが返した一覧（バージョン固定名が使えないキーの例）
+const REAL_LIST = [
+  "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-preview-tts",
+  "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest",
+  "gemini-2.5-flash-lite", "gemini-2.5-flash-image", "gemini-3-flash-preview",
+  "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "embedding-001",
+];
+const picked = g.pickUsableGeminiModels_(REAL_LIST);
+assert.strictEqual(picked[0], "gemini-flash-latest", "別名のflashを最優先");
+assert.ok(picked.indexOf("gemini-flash-lite-latest") < picked.indexOf("gemini-2.5-flash"),
+  "別名は個別バージョンより優先");
+["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-image",
+ "gemini-3.1-pro-preview-customtools", "embedding-001"].forEach((n) =>
+  assert.ok(picked.indexOf(n) < 0, `${n} は文章生成用ではないので除外`)
+);
+console.log("✓ pickUsableGeminiModels_: 別名を優先し、読み上げ・画像用モデルは除外する");
+
+/* -------- 20. 候補が全滅しても、使えるモデルを調べて自動で復旧する -------- */
 sandbox.UrlFetchApp = {
   fetch: () => ({
     getResponseCode: () => 200,
     getContentText: () =>
       JSON.stringify({
-        models: [
-          { name: "models/gemini-3.6-flash", supportedGenerationMethods: ["generateContent"] },
-          { name: "models/embedding-001", supportedGenerationMethods: ["embedContent"] },
-        ],
+        models: REAL_LIST.map((n) => ({
+          name: "models/" + n,
+          supportedGenerationMethods: n === "embedding-001" ? ["embedContent"] : ["generateContent"],
+        })),
       }),
   }),
 };
-const failMsg = g.buildModelFailureMessage_("運賃照合", "dummy", [
-  "gemini-3.6-flash → HTTP 404: not found",
-  "gemini-3.5-flash → HTTP 429: quota",
-]);
-assert.ok(failMsg.indexOf("gemini-3.6-flash → HTTP 404") > 0, "1つ目の失敗理由を含む");
-assert.ok(failMsg.indexOf("gemini-3.5-flash → HTTP 429") > 0, "2つ目の失敗理由も含む");
-assert.ok(failMsg.indexOf("このAPIキーで使えるモデル") > 0, "使えるモデルを案内する");
-assert.ok(failMsg.indexOf("gemini-3.6-flash,") > 0 || failMsg.indexOf("gemini-3.6-flash\n") > 0);
-assert.ok(failMsg.indexOf("embedding-001") < 0, "generateContent非対応のモデルは出さない");
-console.log("✓ モデル候補の組み立てと、全滅時に全モデルの失敗理由＋使えるモデルを返す");
+// 既定の候補（-latest 等）はすべて 429 で、一覧から拾ったモデルだけ成功する状況
+let attempted = [];
+const recovered = g.tryGeminiModels_("運賃照合", "dummy", "", function (model) {
+  attempted.push(model);
+  if (model === "gemini-2.5-flash") return { ok: true, model };
+  throw new Error("運賃照合エラー(" + model + " / HTTP 429): You exceeded your current quota");
+});
+assert.strictEqual(recovered.model, "gemini-2.5-flash", "候補外のモデルで復旧できる");
+assert.ok(
+  attempted.slice(0, 3).join(",") === val("GEMINI_FALLBACK_MODELS").join(","),
+  "まず既定の候補を順に試している"
+);
+assert.ok(attempted.length > 3, "全滅後に一覧から拾い直して追い試ししている");
+console.log("✓ tryGeminiModels_: 候補が全滅しても、使えるモデルを調べて自動で復旧する");
+
+/* -------- 21. それでも駄目なら、全モデルの失敗理由と使えるモデルを返す -------- */
+attempted = [];
+let thrown = "";
+try {
+  g.tryGeminiModels_("運賃照合", "dummy", "", function (model) {
+    attempted.push(model);
+    throw new Error("運賃照合エラー(" + model + " / HTTP 429): You exceeded your current quota");
+  });
+} catch (err) {
+  thrown = String(err.message);
+}
+assert.ok(thrown.indexOf("gemini-flash-latest → ") > 0, "各モデルの失敗理由を含む");
+assert.ok(thrown.indexOf("gemini-3-flash-preview → ") > 0, "2つ目以降の失敗理由も含む");
+assert.ok(thrown.indexOf("このAPIキーで使えるモデル") > 0, "使えるモデルを案内する");
+assert.ok(thrown.indexOf("embedding-001") < 0, "generateContent非対応のモデルは出さない");
+assert.ok(attempted.length <= 6, "追い試しは上限3件までで、無限に試さない");
+
+// APIキー自体が無効な場合は、他のモデルを試さず即座に止める
+attempted = [];
+try {
+  g.tryGeminiModels_("AI解析", "dummy", "", function (model) {
+    attempted.push(model);
+    throw new Error("AI解析エラー: API_KEY_INVALID");
+  });
+} catch (err) {
+  thrown = String(err.message);
+}
+assert.strictEqual(attempted.length, 1, "キーが無効ならモデルを試し続けない");
+assert.ok(thrown.indexOf("API_KEY_INVALID") >= 0);
+console.log("✓ 全滅時の案内と、APIキー無効時の即時中断");
 
 console.log("\nすべて成功");
