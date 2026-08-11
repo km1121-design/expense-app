@@ -1201,6 +1201,15 @@ function callFareSearch_(apiKey, model, prompt) {
     code = res.getResponseCode();
     text = res.getContentText();
   }
+  // 無料枠では Google 検索を伴うリクエストの割当が 0 のことがある（429 / limit: 0）。
+  // その場合は検索なしで一度だけ試す。出典が付かないため画面には
+  // 「出典が取れていない＝要確認」の警告が出て、運賃マスタにも印が残る。
+  if ((code === 429 || code === 403) && payload.tools) {
+    delete payload.tools;
+    res = fetchOnce(payload);
+    code = res.getResponseCode();
+    text = res.getContentText();
+  }
 
   let data;
   try {
@@ -1860,15 +1869,32 @@ function listAvailableGeminiModels_(apiKey) {
   }
 }
 
-/** 全モデルで失敗したときの案内文（各モデルの失敗理由＋使えるモデル一覧） */
+/** 全モデルで失敗したときの案内文（各モデルの失敗理由＋原因別の対処） */
 function buildModelFailureMessage_(label, usableModels, failures) {
-  let msg = label + "に失敗しました。試したモデル: " + failures.join(" / ");
-  const usable = pickUsableGeminiModels_(usableModels);
-  if (usable.length) {
+  const all = failures.join(" / ");
+  let msg = label + "に失敗しました。試したモデル: " + all;
+
+  // limit: 0 は「使いすぎ」ではなく「そのリクエストの無料枠の割当が最初から無い」。
+  // モデルを変えても解決しないので、課金の有効化か手動登録を案内する。
+  if (/limit:\s*0/.test(all)) {
     msg +=
-      "\nこのAPIキーで使えるモデル: " +
-      usable.slice(0, 12).join(", ") +
-      "\nスクリプトプロパティにこのいずれかを設定してください。";
+      "\n\n【原因】このAPIキーの無料枠では、このリクエストの割当が 0 です" +
+      "（limit: 0）。モデルを変えても解決しません。" +
+      "\n【対処】次のいずれかをご検討ください。" +
+      "\n・Google Cloud プロジェクトで課金を有効にする（従量課金。少量なら数十円/月程度）" +
+      "\n・運賃マスタに区間と片道運賃を手で登録する（AIを使わないので無料・確実）";
+  } else if (/429|quota|RESOURCE_EXHAUSTED/i.test(all)) {
+    msg +=
+      "\n\n【原因】無料枠の上限に達している可能性があります。" +
+      "時間をおいて再試行するか、運賃マスタへ手で登録してください。";
+  } else {
+    const usable = pickUsableGeminiModels_(usableModels);
+    if (usable.length) {
+      msg +=
+        "\nこのAPIキーで使えるモデル: " +
+        usable.slice(0, 12).join(", ") +
+        "\nスクリプトプロパティにこのいずれかを設定してください。";
+    }
   }
   return msg;
 }

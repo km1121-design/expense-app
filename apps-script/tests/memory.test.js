@@ -546,9 +546,20 @@ try {
 }
 assert.ok(thrown.indexOf("gemini-flash-latest → ") > 0, "各モデルの失敗理由を含む");
 assert.ok(thrown.indexOf("gemini-3-flash-preview → ") > 0, "2つ目以降の失敗理由も含む");
-assert.ok(thrown.indexOf("このAPIキーで使えるモデル") > 0, "使えるモデルを案内する");
-assert.ok(thrown.indexOf("embedding-001") < 0, "generateContent非対応のモデルは出さない");
+assert.ok(thrown.indexOf("無料枠の上限") > 0, "クォータ超過時は時間をおく／手動登録を案内する");
 assert.ok(attempted.length <= 6, "追い試しは上限3件までで、無限に試さない");
+
+// limit: 0（無料枠の割当が最初から無い）は、モデルを変えても解決しないと伝える
+const zeroLimit = g.buildModelFailureMessage_("運賃照合", REAL_LIST, [
+  "gemini-flash-latest → HTTP 429: Quota exceeded for metric: ... limit: 0, model: gemini-3.1-pro",
+]);
+assert.ok(zeroLimit.indexOf("モデルを変えても解決しません") > 0, "原因を明示する");
+assert.ok(zeroLimit.indexOf("課金を有効に") > 0, "課金の有効化を案内する");
+assert.ok(zeroLimit.indexOf("運賃マスタに区間") > 0, "無料で確実な代替手段を案内する");
+assert.ok(
+  zeroLimit.indexOf("使えるモデル") < 0,
+  "モデル変更では解決しないので、モデル一覧は出さない"
+);
 
 // APIキー自体が無効な場合は、他のモデルを試さず即座に止める
 attempted = [];
