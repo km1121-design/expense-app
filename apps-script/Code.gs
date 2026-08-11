@@ -20,8 +20,8 @@
  *   SHARED_TOKEN    : 分析ツール用の読み取りトークン（設定時、doGet ?token= で全件取得可）
  *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）と
  *                       交通費の運賃Web照合（Google検索グラウンディング）が有効
- *   FARE_MODEL        : 運賃照合に使うモデル（既定: gemini-3.5-flash）
- *   GEMINI_MODEL      : Geminiのモデル（既定: gemini-2.5-flash）
+ *   FARE_MODEL        : 運賃照合に使うモデル（未設定なら現行の flash 系を順に試す）
+ *   GEMINI_MODEL      : Geminiのモデル（未設定なら現行の flash 系を順に試す）
  *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効
  *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-4-8。安価なら claude-haiku-4-5）
  *   OCR_PROVIDER      : 併用時の優先プロバイダ "gemini"/"claude"（未指定なら gemini 優先）
@@ -1130,24 +1130,19 @@ function searchFareOnWeb_(from, to) {
   // モデル未提供・混雑時は次の候補へ。Web アプリの応答時間に収めるため
   // 思考は最小にする（運賃の照合は推論よりも検索結果の読み取りが主）。
   const configured = String(getProp_("FARE_MODEL") || "").trim();
-  const candidates = [];
-  [configured, "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"].forEach(
-    function (m) {
-      if (m && candidates.indexOf(m) < 0) candidates.push(m);
-    }
-  );
+  const candidates = buildModelCandidates_(configured);
 
-  let lastErr = null;
+  const failures = [];
   let cand = null;
   for (let i = 0; i < candidates.length && !cand; i++) {
     try {
       cand = callFareSearch_(apiKey, candidates[i], prompt);
     } catch (err) {
-      lastErr = err;
       const msg = String((err && err.message) || err);
+      failures.push(candidates[i] + " → " + msg);
       if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
       if (
-        !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
+        !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|not found|not supported|no longer available|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
           msg
         )
       ) {
@@ -1155,7 +1150,9 @@ function searchFareOnWeb_(from, to) {
       }
     }
   }
-  if (!cand) throw lastErr || new Error("運賃照合に失敗しました");
+  // 全滅したときは「どのモデルがどう失敗したか」と「このキーで使えるモデル」を
+  // まとめて返す。1つのモデルのエラーだけでは原因が分からないため。
+  if (!cand) throw new Error(buildModelFailureMessage_("運賃照合", apiKey, failures));
 
   let out = "";
   (cand.content.parts || []).forEach(function (p) {
@@ -1738,6 +1735,88 @@ function buildReceiptPrompt_(hint) {
   );
 }
 
+/* ---------------- Gemini のモデル選択と失敗時の案内 ---------------- */
+
+/**
+ * 試すモデルの候補。設定値があれば最優先し、続けて現行の flash 系を新しい順に試す。
+ * 旧モデル（gemini-2.5-flash 等）は新しいAPIキーでは 404 になるため候補に入れない。
+ */
+const GEMINI_FALLBACK_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.1-flash-lite",
+];
+
+function buildModelCandidates_(configured) {
+  const out = [];
+  [String(configured || "").trim()]
+    .concat(GEMINI_FALLBACK_MODELS)
+    .forEach(function (m) {
+      if (m && out.indexOf(m) < 0) out.push(m);
+    });
+  return out;
+}
+
+/**
+ * このAPIキーで実際に使えるモデル名を取得する（generateContent 対応のもの）。
+ * モデル名の変更・廃止で全滅したときに、設定すべき値をその場で示すために使う。
+ */
+function listAvailableGeminiModels_(apiKey) {
+  try {
+    const res = UrlFetchApp.fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=" +
+        encodeURIComponent(apiKey),
+      { muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) return [];
+    const data = JSON.parse(res.getContentText());
+    return (data.models || [])
+      .filter(function (m) {
+        const methods = m.supportedGenerationMethods || m.supportedActions || [];
+        return methods.indexOf("generateContent") >= 0;
+      })
+      .map(function (m) {
+        return String(m.name || "").replace(/^models\//, "");
+      })
+      .filter(function (n) {
+        return n;
+      });
+  } catch (err) {
+    return [];
+  }
+}
+
+/** 全モデルで失敗したときの案内文（各モデルの失敗理由＋使えるモデル一覧） */
+function buildModelFailureMessage_(label, apiKey, failures) {
+  let msg = label + "に失敗しました。試したモデル: " + failures.join(" / ");
+  const usable = listAvailableGeminiModels_(apiKey).filter(function (n) {
+    return n.indexOf("flash") >= 0 || n.indexOf("pro") >= 0;
+  });
+  if (usable.length) {
+    msg +=
+      "\nこのAPIキーで使えるモデル: " +
+      usable.slice(0, 12).join(", ") +
+      "\nスクリプトプロパティにこのいずれかを設定してください。";
+  }
+  return msg;
+}
+
+/**
+ * メンテナンス用：エディタから実行すると、このAPIキーで使えるモデルをログに出す。
+ * モデル名が変わって解析・照合が失敗したときの確認用（デプロイ不要）。
+ */
+function showGeminiModels() {
+  const apiKey = getProp_("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("GEMINI_API_KEY が未設定です");
+  const models = listAvailableGeminiModels_(apiKey);
+  Logger.log(
+    "使えるモデル（%s件）:\n%s",
+    models.length,
+    models.join("\n") || "(取得できませんでした)"
+  );
+  return models;
+}
+
 /**
  * 使用するAI解析プロバイダを決定する。
  * 優先: スクリプトプロパティ OCR_PROVIDER（"gemini" / "claude"）。
@@ -1858,31 +1937,21 @@ function actionAnalyzeReceipt_(body) {
  * 全滅した場合は最後のエラーを投げる（＝原因が画面に出る）。
  */
 function analyzeWithGemini_(body, hint) {
-  const configured = String(getProp_("GEMINI_MODEL") || "").trim();
-  const candidates = [];
-  [
-    configured,
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash",
-  ].forEach(function (m) {
-    if (m && candidates.indexOf(m) < 0) candidates.push(m);
-  });
-  let lastErr = null;
+  const candidates = buildModelCandidates_(getProp_("GEMINI_MODEL"));
+  const failures = [];
   // 1巡目で全滅した場合は少し待って再挑戦（503は一時的な混雑が多い）
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < candidates.length; i++) {
       try {
         return callGemini_(body, candidates[i], hint);
       } catch (err) {
-        lastErr = err;
         const msg = String((err && err.message) || err);
+        if (pass === 0) failures.push(candidates[i] + " → " + msg);
         // APIキー自体が無効なら、どのモデルでも成功しないので即中断
         if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) throw err;
         // 混雑(503/500/UNAVAILABLE/overloaded)・未提供・権限・クォータは次候補へ
         if (
-          !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|high demand|not found|not supported|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
+          !/HTTP (40[0349]|429|500|503)|UNAVAILABLE|overloaded|high demand|not found|not supported|no longer available|quota|RESOURCE_EXHAUSTED|PERMISSION/i.test(
             msg
           )
         ) {
@@ -1892,7 +1961,9 @@ function analyzeWithGemini_(body, hint) {
     }
     if (pass === 0) Utilities.sleep(1500);
   }
-  throw lastErr || new Error("Gemini解析に失敗しました");
+  throw new Error(
+    buildModelFailureMessage_("AI解析", getProp_("GEMINI_API_KEY"), failures)
+  );
 }
 
 function callGemini_(body, model, hint) {

@@ -462,4 +462,49 @@ assert.strictEqual(
 assert.strictEqual(g.groundingSource_({}), "", "出典が無ければ空文字");
 console.log("✓ AI応答のJSON抽出と出典URLの取得");
 
+/* -------- 18. モデル候補の組み立てと、全滅時のエラー内容 -------- */
+assert.strictEqual(
+  g.buildModelCandidates_("").join(","),
+  val("GEMINI_FALLBACK_MODELS").join(","),
+  "未設定なら現行の flash 系を新しい順に試す"
+);
+assert.strictEqual(
+  g.buildModelCandidates_("gemini-3.6-flash")[0],
+  "gemini-3.6-flash",
+  "設定値が最優先"
+);
+assert.strictEqual(
+  g.buildModelCandidates_("gemini-3.6-flash").filter((m) => m === "gemini-3.6-flash").length,
+  1,
+  "設定値が候補と重複しても1回だけ"
+);
+assert.ok(
+  val("GEMINI_FALLBACK_MODELS").indexOf("gemini-2.5-flash") < 0,
+  "新しいAPIキーで404になる旧モデルは候補に含めない"
+);
+
+// 全滅時は「どのモデルがどう失敗したか」と「使えるモデル」の両方を返す
+sandbox.UrlFetchApp = {
+  fetch: () => ({
+    getResponseCode: () => 200,
+    getContentText: () =>
+      JSON.stringify({
+        models: [
+          { name: "models/gemini-3.6-flash", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/embedding-001", supportedGenerationMethods: ["embedContent"] },
+        ],
+      }),
+  }),
+};
+const failMsg = g.buildModelFailureMessage_("運賃照合", "dummy", [
+  "gemini-3.6-flash → HTTP 404: not found",
+  "gemini-3.5-flash → HTTP 429: quota",
+]);
+assert.ok(failMsg.indexOf("gemini-3.6-flash → HTTP 404") > 0, "1つ目の失敗理由を含む");
+assert.ok(failMsg.indexOf("gemini-3.5-flash → HTTP 429") > 0, "2つ目の失敗理由も含む");
+assert.ok(failMsg.indexOf("このAPIキーで使えるモデル") > 0, "使えるモデルを案内する");
+assert.ok(failMsg.indexOf("gemini-3.6-flash,") > 0 || failMsg.indexOf("gemini-3.6-flash\n") > 0);
+assert.ok(failMsg.indexOf("embedding-001") < 0, "generateContent非対応のモデルは出さない");
+console.log("✓ モデル候補の組み立てと、全滅時に全モデルの失敗理由＋使えるモデルを返す");
+
 console.log("\nすべて成功");

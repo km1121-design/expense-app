@@ -82,7 +82,7 @@
 - **3段フォールバック**: AI解析 → 端末内OCR → 手入力。
 - **①AI解析（高精度）**: GAS に AIキー設定時、画像解析＋構造化出力で
   **金額・日付・店名・科目・摘要** を抽出しフォームへ自動入力。プロバイダは設定で選択:
-  - **Gemini（推奨・無料枠可）**: `GEMINI_API_KEY`。モデルは `GEMINI_MODEL`（既定 `gemini-2.5-flash`）。
+  - **Gemini（推奨・無料枠可）**: `GEMINI_API_KEY`。モデルは `GEMINI_MODEL`（未設定なら現行の flash 系を新しい順に自動で試す）。
     無料枠は入力/出力が学習に利用される点に留意。
   - **Claude**: `ANTHROPIC_API_KEY`。モデルは `OCR_MODEL`（既定 `claude-opus-4-8`）。学習利用なし。
   - 両方設定時は Gemini 優先（`OCR_PROVIDER` で切替）。
@@ -291,8 +291,8 @@ GET `?token=<SHARED_TOKEN>` で全件を読み取り専用取得できる（Look
 
 主なスクリプトプロパティ: `AUTO_APPROVE`（`"false"`で承認フロー有効。既定は自動承認）、
 `SPREADSHEET_ID` / `DRIVE_FOLDER_ID` / `AUTH_SECRET`（自動保存）、`SHARED_TOKEN`、
-`GEMINI_API_KEY`（AI解析・運賃のWeb照合に共通で使用）、`FARE_MODEL`（運賃照合の
-モデル。既定 `gemini-3.5-flash`）。
+`GEMINI_API_KEY`（AI解析・運賃のWeb照合に共通で使用）、`GEMINI_MODEL` / `FARE_MODEL`
+（モデルの固定。未設定なら現行の flash 系を新しい順に自動で試す）。
 
 保存先は共有ドライブへ移行可能（ファイルIDは移動しても不変のため設定変更不要。
 GAS実行アカウントを共有ドライブの「コンテンツ管理者」以上にすること）。
