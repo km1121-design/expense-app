@@ -703,14 +703,49 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface-2);
-  padding: 12px 14px 14px;
+  padding: 10px 14px;
   margin: 0 0 4px;
 }
-.fare-box legend {
-  font-size: 0.8rem;
+/* 既定は閉じた状態。開いたときだけ中身の余白を足す */
+.fare-box[open] {
+  padding-bottom: 14px;
+}
+.fare-box > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  cursor: pointer;
+  font-size: 0.85rem;
   font-weight: 700;
   color: var(--muted);
-  padding: 0 6px;
+  list-style: none; /* 既定の三角は下の ::before で置き換える */
+}
+.fare-box > summary::-webkit-details-marker {
+  display: none;
+}
+/* display:flex の summary では既定の三角が出ないため、開閉の目印を自分で描く */
+.fare-box > summary::before {
+  content: "▶";
+  font-size: 0.6rem;
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+.fare-box[open] > summary::before {
+  transform: rotate(90deg);
+}
+.fare-box[open] > summary {
+  margin-bottom: 12px;
+}
+.fare-box__state {
+  font-weight: 400;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+/* 区間が入っていることが閉じたままでも分かるようにする */
+.fare-box__state.is-set {
+  color: var(--accent-strong);
+  font-weight: 700;
 }
 .fare-grid {
   display: grid;

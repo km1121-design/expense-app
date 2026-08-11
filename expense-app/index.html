@@ -146,8 +146,11 @@
               </div>
 
               <!-- 交通費の運賃照合（科目が交通費のときだけ表示） -->
-              <fieldset class="fare-box" id="fareBox" hidden>
-                <legend>電車賃の照合（区間から運賃を調べます）</legend>
+              <details class="fare-box" id="fareBox" hidden>
+                <summary>
+                  <span>電車賃の照合（任意）</span>
+                  <span class="fare-box__state" id="fareSummary">区間を入れると運賃を照合できます</span>
+                </summary>
                 <div class="fare-grid">
                   <div class="form__row">
                     <label for="fareFrom">出発駅</label>
@@ -183,7 +186,7 @@
                   </button>
                 </div>
                 <p class="fare-result" id="fareResult" hidden></p>
-              </fieldset>
+              </details>
 
               <div class="form__row">
                 <label for="expAmount">金額（円） <span class="req">*</span></label>
