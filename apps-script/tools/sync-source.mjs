@@ -19,8 +19,18 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** 反映先の候補になる既定ファイル名（ロケール差） */
-const DEFAULT_NAMES = ["Code.gs", "コード.gs"];
+/**
+ * スクリプトファイルの拡張子。
+ *
+ * clasp は Apps Script の SERVER_JS ファイルを **`.js`** として取得する
+ * （v2 の既定は `.gs` だった）。`.gs` だけを見ていると「ファイルが無い」と
+ * 誤判定して新規ファイルを作ってしまい、プロジェクト内に同じコードが2つ並んで
+ * 全体が二重宣言のSyntaxErrorになる。両方を見る。
+ */
+const SCRIPT_EXTENSIONS = [".js", ".gs"];
+
+/** プロジェクトが空だったときに作るファイル名（clasp の取得形式に合わせる） */
+const DEFAULT_TARGET = "Code.js";
 
 function fail(message) {
   // GitHub Actions のログでエラーとして目立たせる（ローカル実行でも読める）
@@ -48,36 +58,45 @@ if (!fs.existsSync(path.join(projectDir, "appsscript.json"))) {
   );
 }
 
-const gsFiles = fs
+const next = fs.readFileSync(sourcePath, "utf8");
+
+const scripts = fs
   .readdirSync(projectDir)
-  .filter((name) => name.endsWith(".gs"))
+  .filter((name) => SCRIPT_EXTENSIONS.includes(path.extname(name)))
   .sort();
 
-let target;
-if (gsFiles.length === 1) {
-  target = gsFiles[0];
-} else if (gsFiles.length === 0) {
-  // 空のプロジェクトなら、リポジトリ側の名前でそのまま作る
-  target = path.basename(sourcePath);
-  console.log(`プロジェクトに .gs がないため新規作成します: ${target}`);
-} else {
-  // 複数ある場合は取り違えが致命的なので、確実に判断できるときだけ進む
-  const byName = gsFiles.filter((name) => name === path.basename(sourcePath));
-  const byDefault = gsFiles.filter((name) => DEFAULT_NAMES.includes(name));
-  const picked = byName.length === 1 ? byName : byDefault;
-  if (picked.length !== 1) {
-    fail(
-      `反映先を特定できません。プロジェクト側の .gs: ${gsFiles.join(", ")} / ` +
-        `リポジトリ側: ${path.basename(sourcePath)}。` +
-        "Apps Script エディタでファイル名を揃えてから再実行してください。",
-    );
-  }
-  target = picked[0];
+// Apps Script は全スクリプトファイルを同じスコープに結合するため、プロジェクトが
+// 持つスクリプトファイルは1つ（＝リポジトリの Code.gs）でなければならない。
+// 内容が一致するファイルは過去の実行がこのリポジトリから作ったものなので、
+// 反映先の候補は「内容が違うファイル」に絞る。
+const others = scripts.filter(
+  (name) => fs.readFileSync(path.join(projectDir, name), "utf8") !== next,
+);
+
+if (others.length > 1) {
+  fail(
+    `プロジェクトに内容の異なるスクリプトファイルが複数あります: ${others.join(", ")}。` +
+      "どれを更新すべきか判断できないため中止しました。" +
+      "Apps Script エディタで1つに統合してから再実行してください。",
+  );
 }
 
+const target = others[0] || scripts[0] || DEFAULT_TARGET;
 const targetPath = path.join(projectDir, target);
-const next = fs.readFileSync(sourcePath, "utf8");
 const prev = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, "utf8") : null;
+
+if (!scripts.length) {
+  console.log(`プロジェクトにスクリプトファイルがないため新規作成します: ${target}`);
+}
+
+// 反映先以外のスクリプトファイルは重複なので取り除く（push でプロジェクトからも消える）。
+// HTML や appsscript.json は対象外なので触らない。
+scripts
+  .filter((name) => name !== target)
+  .forEach((name) => {
+    fs.unlinkSync(path.join(projectDir, name));
+    console.log(`重複していたスクリプトファイルを取り除きました: ${name}`);
+  });
 
 fs.writeFileSync(targetPath, next);
 
