@@ -754,6 +754,30 @@ body {
   color: var(--blue);
   align-self: flex-start;
 }
+/* 区間のまとめて登録 */
+.fare-bulk {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.fare-bulk summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+.fare-bulk textarea {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
 /* 駅名が未入力のあいだ「路線検索で調べる」リンクを押せなくする */
 .btn.is-disabled {
   opacity: 0.45;

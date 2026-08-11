@@ -411,6 +411,22 @@
             </a>
             <button type="submit" class="btn btn--primary">追加</button>
           </form>
+
+          <details class="fare-bulk">
+            <summary>まとめて登録する（初期設定用）</summary>
+            <p class="card__hint">
+              1行に <code>出発駅, 到着駅, 片道運賃</code> の順で入力します
+              （4つ目に経路も書けます）。スプレッドシートからの貼り付けにも対応します。
+            </p>
+            <textarea id="fareBulkText" rows="6"
+              placeholder="新井薬師前, 武蔵浦和, 510, 西武新宿線→JR埼京線 池袋乗換&#10;新井薬師前, 西武新宿, 220&#10;新井薬師前, 椎名町, 180"></textarea>
+            <div class="fare-actions">
+              <button id="fareBulkBtn" type="button" class="btn btn--primary">
+                まとめて登録
+              </button>
+            </div>
+            <p class="fare-result" id="fareBulkResult" hidden></p>
+          </details>
         </div>
 
         <!-- AI解析の学習データ（クラウド＋認証モードのみ） -->

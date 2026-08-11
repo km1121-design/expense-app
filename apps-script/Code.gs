@@ -763,6 +763,7 @@ function doPost(e) {
           // アプリは機能が無いものとして扱い、再デプロイを促す。
           features: {
             fare: true, // 交通費の運賃照合
+            fareWeb: isFareWebEnabled_(), // 運賃のWeb照合が使える設定か
             receiptImage: true, // 領収書画像のアプリ経由取得
             vendorMemory: true, // AI解析の学習
             jaSheets: true, // シートの日本語化
@@ -809,6 +810,8 @@ function doPost(e) {
         return json_(actionListFares_(body));
       case "upsertFare":
         return json_(actionUpsertFare_(body));
+      case "bulkUpsertFares":
+        return json_(actionBulkUpsertFares_(body));
       case "deleteFare":
         return json_(actionDeleteFare_(body));
       // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
@@ -1047,6 +1050,43 @@ function saveFare_(rec) {
   }
 }
 
+/**
+ * 運賃のWeb照合（Gemini＋Google検索）を使うか。
+ * Google検索を伴うリクエストは無料枠では割当が無いことがあり、その場合は
+ * 自動で "false" が保存され、以降は運賃マスタのみで照合する。
+ * 課金を有効にしたら、このプロパティを削除すれば再びWeb照合を使う。
+ */
+function isFareWebEnabled_() {
+  return getProp_("FARE_WEB_LOOKUP") !== "false";
+}
+
+/**
+ * 運賃マスタに未登録の区間を返す（エラーにしない）。
+ * 申請自体は金額を手入力すれば進められるため、次の行動を伝えるだけにする。
+ */
+function unregisteredFare_(from, to, round, trips, justDisabled) {
+  return {
+    ok: true,
+    registered: false,
+    webDisabled: !isFareWebEnabled_(),
+    justDisabled: !!justDisabled,
+    from: from,
+    to: to,
+    round: round,
+    trips: trips,
+    unit: 0,
+    expected: 0,
+    route: "",
+    source: "",
+    message:
+      "この区間は運賃マスタに未登録です。「🚉 路線検索で調べる」で運賃を確認して" +
+      "金額を入力してください。管理者が運賃マスタへ登録すると、次回から自動で照合されます。" +
+      (justDisabled
+        ? "（無料枠ではWeb検索による照合が使えないため、以降はマスタのみで照合します）"
+        : ""),
+  };
+}
+
 /** 回数・往復から想定金額を組み立てる */
 function fareTotal_(unit, round, trips) {
   const u = Math.max(0, Math.round(Number(unit) || 0));
@@ -1073,9 +1113,29 @@ function actionLookupFare_(body) {
   );
 
   let hit = findFare_(key);
-  let cached = !!hit;
+  const cached = !!hit;
   if (!hit) {
-    const found = searchFareOnWeb_(from, to);
+    // Web照合を使わない運用（運賃マスタのみ）では、未登録をそのまま返す。
+    // 申請者は路線検索で調べて金額を手入力し、管理者が区間を登録すれば
+    // 次回から自動で照合される。
+    if (!isFareWebEnabled_()) {
+      return unregisteredFare_(from, to, round, trips, false);
+    }
+    let found;
+    try {
+      found = searchFareOnWeb_(from, to);
+    } catch (err) {
+      // limit: 0 は無料枠にそのリクエストの割当が無い状態。何度試しても同じなので、
+      // 以降はWeb照合を止めて運賃マスタのみの運用に切り替える。
+      if (/limit:\s*0/.test(String((err && err.message) || err))) {
+        PropertiesService.getScriptProperties().setProperty(
+          "FARE_WEB_LOOKUP",
+          "false"
+        );
+        return unregisteredFare_(from, to, round, trips, true);
+      }
+      throw err;
+    }
     hit = {
       key: key,
       from: from,
@@ -1092,6 +1152,7 @@ function actionLookupFare_(body) {
   }
   return {
     ok: true,
+    registered: true,
     cached: cached,
     from: String(hit.from || from),
     to: String(hit.to || to),
@@ -1334,6 +1395,55 @@ function actionUpsertFare_(body) {
     checkedBy: "手動（" + (u.displayName || u.username || "管理者") + "）",
   });
   return { ok: true, items: actionListFares_(body).items };
+}
+
+/**
+ * 管理者向け: 区間をまとめて登録する（初期設定を一気に済ませるため）。
+ * 1行に「出発駅, 到着駅, 片道運賃[, 経路]」。区切りはカンマ・タブ・全角カンマ。
+ * 読めない行は理由を付けて返し、読めた行だけ登録する（途中で止めない）。
+ */
+function actionBulkUpsertFares_(body) {
+  const u = requireUser_(body.token, true);
+  const lines = String(body.text || "").split(/\r?\n/);
+  const by = "手動（" + (u.displayName || u.username || "管理者") + "）";
+  let added = 0;
+  const errors = [];
+  lines.forEach(function (line, i) {
+    const raw = String(line || "").trim();
+    if (!raw) return;
+    const cols = raw.split(/[,\t、，]/).map(function (c) {
+      return c.trim();
+    });
+    const from = cols[0] || "";
+    const to = cols[1] || "";
+    const fare = Math.round(Number(String(cols[2] || "").replace(/[^\d.-]/g, "")));
+    const key = fareKey_(from, to);
+    if (!key) {
+      errors.push(i + 1 + "行目: 出発駅と到着駅を別々の駅名で指定してください（" + raw + "）");
+      return;
+    }
+    if (!fare || fare <= 0) {
+      errors.push(i + 1 + "行目: 片道運賃を1円以上の数値で指定してください（" + raw + "）");
+      return;
+    }
+    saveFare_({
+      key: key,
+      from: from,
+      to: to,
+      fare: fare,
+      route: cols[3] || "",
+      source: "",
+      checkedAt: new Date().toISOString(),
+      checkedBy: by,
+    });
+    added++;
+  });
+  return {
+    ok: true,
+    added: added,
+    errors: errors,
+    items: actionListFares_(body).items,
+  };
 }
 
 /** 管理者向け: 運賃マスタから区間を削除（次回は再びWebで調べ直す） */

@@ -441,6 +441,71 @@ g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", ro
 assert.strictEqual(searchCalls, 1, "削除後は再びWebで調べ直す");
 console.log("✓ 運賃マスタ: 管理者が上書き・削除でき、削除後は再照合される");
 
+/* -------- 16.5 運賃マスタのみの運用（Web照合を使わない） -------- */
+props.FARE_WEB_LOOKUP = "false";
+let webCalls = 0;
+g.searchFareOnWeb_ = function () {
+  webCalls++;
+  throw new Error("呼ばれてはいけない");
+};
+// 未登録の区間はエラーにせず、次の行動を伝える応答を返す
+const notRegistered = g.actionLookupFare_({
+  token: "", from: "池袋", to: "大宮", round: true, trips: 1,
+});
+assert.strictEqual(notRegistered.ok, true, "未登録でもエラーにしない");
+assert.strictEqual(notRegistered.registered, false);
+assert.strictEqual(notRegistered.expected, 0);
+assert.ok(notRegistered.message.indexOf("路線検索") > 0, "調べ方を案内する");
+assert.strictEqual(webCalls, 0, "Web照合は呼ばない");
+
+// 手で登録すれば、以降はマスタの値で照合できる
+g.actionUpsertFare_({ token: "", from: "池袋", to: "大宮", fare: 480 });
+const registered = g.actionLookupFare_({
+  token: "", from: "大宮駅", to: "池袋駅", round: true, trips: 2,
+});
+assert.strictEqual(registered.registered, true);
+assert.strictEqual(registered.unit, 480);
+assert.strictEqual(registered.expected, 480 * 2 * 2, "往復×2回");
+assert.strictEqual(webCalls, 0, "登録済みならWeb照合は不要");
+console.log("✓ 運賃マスタのみの運用: 未登録は案内を返し、手登録すれば以降は照合できる");
+
+/* -------- 16.6 区間のまとめて登録 -------- */
+const bulk = g.actionBulkUpsertFares_({
+  token: "",
+  text: [
+    "新宿, 渋谷, 170, JR山手線",
+    "\t品川\t東京\t180", // タブ区切りも受ける
+    "上野，秋葉原，150", // 全角カンマも受ける
+    "", // 空行は無視
+    "駅名だけ", // 到着駅が無い
+    "浜松町, 浜松町, 150", // 同じ駅
+    "新橋, 有楽町, 0", // 運賃が0
+  ].join("\n"),
+});
+assert.strictEqual(bulk.added, 3, "読めた行だけ登録する");
+assert.strictEqual(bulk.errors.length, 3, "読めない行は理由を返す");
+assert.ok(bulk.errors[0].indexOf("5行目") === 0, "何行目かを示す");
+assert.ok(bulk.errors[2].indexOf("1円以上") > 0, "運賃が0の行は理由が分かる");
+assert.strictEqual(
+  g.actionLookupFare_({ token: "", from: "品川", to: "東京", round: false, trips: 1 }).unit,
+  180,
+  "タブ区切りの行も登録されている"
+);
+assert.strictEqual(
+  g.actionLookupFare_({ token: "", from: "上野", to: "秋葉原", round: false, trips: 1 }).unit,
+  150,
+  "全角カンマの行も登録されている"
+);
+const listed2 = g.actionListFares_({ token: "" }).items;
+const bulkAdded = listed2.filter((f) => ["渋谷", "東京", "秋葉原"].indexOf(f.to) >= 0);
+assert.strictEqual(bulkAdded.length, 3);
+assert.ok(
+  bulkAdded.every((f) => f.checkedBy.indexOf("手動") === 0),
+  "一括登録も手動として記録される"
+);
+delete props.FARE_WEB_LOOKUP;
+console.log("✓ actionBulkUpsertFares_: カンマ/タブ/全角に対応し、読めない行は理由を返す");
+
 /* -------- 17. AIの応答から運賃JSONを取り出す -------- */
 assert.strictEqual(
   g.parseJsonLoosely_('```json\n{"fare": 480, "route": "JR中央線"}\n```').fare,
