@@ -173,6 +173,11 @@
                   <button id="fareLookupBtn" type="button" class="btn btn--ghost btn--sm">
                     🔎 Webで運賃を照合
                   </button>
+                  <a id="fareSearchLink" class="btn btn--ghost btn--sm" href="#"
+                     target="_blank" rel="noopener"
+                     title="自分のブラウザで路線検索を開きます（無料・AIを使いません）">
+                    🚉 路線検索で調べる ↗
+                  </a>
                   <button id="fareApplyBtn" type="button" class="btn btn--ghost btn--sm" hidden>
                     金額に反映
                   </button>
@@ -400,6 +405,10 @@
             <input id="nfTo" type="text" placeholder="到着駅" required />
             <input id="nfFare" type="number" min="1" step="1" placeholder="片道運賃" required />
             <input id="nfRoute" type="text" placeholder="経路（任意）" />
+            <a id="nfSearchLink" class="btn btn--ghost" href="#" target="_blank" rel="noopener"
+               title="駅名を入れると路線検索を開けます（無料・AIを使いません）">
+              🚉 調べる ↗
+            </a>
             <button type="submit" class="btn btn--primary">追加</button>
           </form>
         </div>

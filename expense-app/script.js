@@ -1231,6 +1231,30 @@ function clearFareResult() {
   $("#fareApplyBtn").hidden = true;
 }
 
+/**
+ * 路線検索を開くURL。AI・APIを使わず、利用者が自分のブラウザで確認するためのもの。
+ * （検索サイトを自動で読み取る行為は各社の規約で禁止されているため、
+ *   あくまで人が開くリンクとして提供する）
+ */
+function transitSearchUrl(from, to) {
+  if (!from || !to) return "";
+  return (
+    "https://transit.yahoo.co.jp/search/result?from=" +
+    encodeURIComponent(from) +
+    "&to=" +
+    encodeURIComponent(to)
+  );
+}
+
+/** 区間の入力に合わせて「路線検索で調べる」リンクを更新する */
+function syncFareSearchLink(linkId, from, to) {
+  const el = $(linkId);
+  if (!el) return;
+  const url = transitSearchUrl(from, to);
+  el.href = url || "#";
+  el.classList.toggle("is-disabled", !url);
+}
+
 /** 入力欄から区間の指定を読み取る */
 function readFareInput() {
   return {
@@ -1417,6 +1441,7 @@ async function handleFareAdd(evt) {
       route: $("#nfRoute").value.trim(),
     });
     $("#fareAddForm").reset();
+    syncFareSearchLink("#nfSearchLink", "", "");
     renderFares(data.items || []);
     toast("区間を登録しました");
   } catch (err) {
@@ -2413,6 +2438,8 @@ function init() {
   $("#currentUser").value = state.currentUser;
   $("#expDate").valueAsDate = new Date();
   applyFareUI(); // 既定の科目（交通費）に合わせて区間欄を出す
+  syncFareSearchLink("#fareSearchLink", "", "");
+  syncFareSearchLink("#nfSearchLink", "", "");
 
   // タブ
   $("#tabs").addEventListener("click", (e) => {
@@ -2470,7 +2497,16 @@ function init() {
     if (state.lastFare) renderFareResult();
   });
   ["#fareFrom", "#fareTo"].forEach((sel) =>
-    $(sel).addEventListener("input", clearFareResult)
+    $(sel).addEventListener("input", () => {
+      clearFareResult();
+      const f = readFareInput();
+      syncFareSearchLink("#fareSearchLink", f.from, f.to);
+    })
+  );
+  ["#nfFrom", "#nfTo"].forEach((sel) =>
+    $(sel).addEventListener("input", () =>
+      syncFareSearchLink("#nfSearchLink", $("#nfFrom").value.trim(), $("#nfTo").value.trim())
+    )
   );
 
   // 運賃マスタ（管理者）
