@@ -48,6 +48,10 @@ docs/           仕様書
 
 ## デプロイ
 
+画面とバックエンドは別々の場所で動くため、デプロイ経路も2つあります。
+
+### フロントエンド（GitHub Pages・常に自動）
+
 `.github/workflows/deploy-pages.yml` により、`main` への push で GitHub Pages へ
 自動デプロイされます（`expense-app/` 配下をサイトルートとして配信）。
 
@@ -56,3 +60,14 @@ docs/           仕様書
   対応プランに限られるため、Public にするか対応プランで有効化してください。
 - 静的サイトのため、任意の静的ホスティングや `expense-app/index.html` を直接開いても
   動作します。
+
+### バックエンド（Apps Script・自動化は任意）
+
+`apps-script/Code.gs` は Google 側にある Apps Script プロジェクトの写しで、
+リポジトリと直接つながっていません。既定では Apps Script エディタへ貼り替えて
+手動でデプロイします。
+
+`.github/workflows/deploy-apps-script.yml` にシークレットを3つ設定すると、
+`main` への push で自動反映できます（既存デプロイを新バージョンへ更新するため
+ウェブアプリURLは変わりません）。手順は
+[`apps-script/README.md`](apps-script/README.md) の「自動デプロイ」を参照。
