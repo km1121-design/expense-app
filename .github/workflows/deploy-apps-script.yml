@@ -71,13 +71,23 @@ jobs:
         env:
           CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
           APPS_SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+          APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
         run: |
+          # URL を丸ごと登録してしまう間違いを、分かりやすい形で先に弾く。
+          # 値そのものは出力しない（シークレットのため）。
+          for name in APPS_SCRIPT_ID APPS_SCRIPT_DEPLOYMENT_ID; do
+            case "${!name}" in
+              *[!A-Za-z0-9_-]*)
+                echo "::error::$name にID以外の文字（記号・空白など）が含まれています。URL全体ではなくID部分だけを登録してください。"
+                exit 1;;
+            esac
+          done
+
           # 認証情報は clasp 既定の場所（ホーム直下）へ。プロジェクト側へ置くと
           # push 対象のディレクトリに認証情報を持ち込むことになるため避ける。
           umask 077
           printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
-          node -e 'JSON.parse(require("fs").readFileSync(process.env.HOME + "/.clasprc.json", "utf8"))' \
-            || { echo "::error::CLASPRC_JSON がJSONとして読めません。~/.clasprc.json の中身をそのまま貼り直してください。"; exit 1; }
+          node apps-script/tools/check-credentials.mjs "$HOME/.clasprc.json"
           mkdir -p "$RUNNER_TEMP/$GAS_DIR"
           jq -n --arg id "$APPS_SCRIPT_ID" '{scriptId: $id, rootDir: "."}' \
             > "$RUNNER_TEMP/$GAS_DIR/.clasp.json"
