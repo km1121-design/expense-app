@@ -1301,8 +1301,12 @@ function renderFareResult() {
       ? "運賃マスタの登録値で照合（Web検索なし）"
       : "Web検索で照合し、運賃マスタへ登録しました"
   );
+  // 出典が無い＝検索が使われずAIの記憶で答えた可能性があり、運賃の裏付けが弱い
+  if (!f.source) {
+    lines.push("⚠️ 検索の出典が取れていません。運賃が正しいか必ず確認してください");
+  }
 
-  let cls = "fare-result is-ok";
+  let cls = f.source ? "fare-result is-ok" : "fare-result is-warn";
   if (!amount) {
     lines.push("金額が空のため「金額に反映」で入力できます");
   } else if (amount === f.expected) {
