@@ -1084,7 +1084,9 @@ function actionLookupFare_(body) {
       route: found.route,
       source: found.source,
       checkedAt: new Date().toISOString(),
-      checkedBy: "web",
+      // 出典が取れなかった＝Google検索が使われず、AIの記憶で答えた可能性がある。
+      // 運賃マスタに残るので、後から確認・訂正できるよう印を付けておく。
+      checkedBy: found.source ? "web" : "web（出典なし・要確認）",
     };
     saveFare_(hit);
   }
