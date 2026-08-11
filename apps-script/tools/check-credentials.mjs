@@ -38,19 +38,38 @@ const SAFE_WORDS = [
   "redirectUri",
 ];
 
-/** 英数字を伏せ、JSONの記号・空白・既知のキー名だけを残す */
+/**
+ * 英数字を伏せ、JSONの記号・空白・既知のキー名だけを残す。
+ *
+ * 括弧は全角（｛｝［］）で出す。GitHub Actions は複数行シークレットの各行を
+ * それぞれマスク対象として登録するため、`{` だけの行を含むJSONを登録すると
+ * ログ中のすべての半角括弧が `***` に置き換わり、構造が読めなくなる。
+ */
 function redact(text) {
   const safe = SAFE_WORDS.join("|");
   const re = new RegExp(`("(?:${safe})")|([{}\\[\\],:"])|(\\n)|(\\s)|([\\s\\S])`, "g");
+  const wide = { "{": "｛", "}": "｝", "[": "［", "]": "］" };
   const out = text.replace(re, (m, word, punct, nl, ws) => {
     if (word) return word;
-    if (punct) return punct;
+    if (punct) return wide[punct] || punct;
     if (nl) return "⏎";
     if (ws) return " ";
     return "x";
   });
   // 長い伏せ字は桁数だけ示す（250文字の x の壁を出さない）
   return out.replace(/x{13,}/g, (m) => `x*${m.length}`);
+}
+
+/** 文字列の中身を除いて括弧の対応を数える（貼り付けの途中・末尾の欠けを名指しするため） */
+function braceBalance(text) {
+  const outsideStrings = text.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  const count = (ch) => (outsideStrings.split(ch).length - 1);
+  return {
+    curlyOpen: count("{"),
+    curlyClose: count("}"),
+    squareOpen: count("["),
+    squareClose: count("]"),
+  };
 }
 
 function fail(lines) {
@@ -74,12 +93,27 @@ const hadBom = raw.charCodeAt(0) === 0xfeff;
 const normalized = (hadBom ? raw.slice(1) : raw).trim();
 const changed = normalized !== raw;
 
+const balance = braceBalance(normalized);
+const missingCurly = balance.curlyOpen - balance.curlyClose;
+const missingSquare = balance.squareOpen - balance.squareClose;
+
 const facts = [
   `文字数: ${normalized.length}`,
   `行数: ${normalized.split("\n").length}`,
-  `先頭の文字: ${JSON.stringify(normalized.slice(0, 1))} / 末尾の文字: ${JSON.stringify(normalized.slice(-1))}`,
+  `先頭の文字: ${redact(normalized.slice(0, 1))} / 末尾の文字: ${redact(normalized.slice(-1))}`,
+  `括弧の数: ｛ ${balance.curlyOpen} 個 / ｝ ${balance.curlyClose} 個`,
   hadBom ? "先頭にBOMがありました（除去しました）" : null,
 ].filter(Boolean);
+
+// 括弧の数が合わない＝貼り付けの一部が欠けている。パースエラーより直接的なので先に言う。
+const truncationHint =
+  missingCurly > 0
+    ? `閉じ括弧 ｝ が ${missingCurly} 個足りません。貼り付けの末尾が欠けています（最後の行までコピーできていません）。`
+    : missingCurly < 0
+      ? `閉じ括弧 ｝ が ${-missingCurly} 個多いです。貼り付けが重複しているか、余分な文字が入っています。`
+      : missingSquare !== 0
+        ? `角括弧 ［］ の数が合っていません（${balance.squareOpen} 対 ${balance.squareClose}）。`
+        : null;
 
 let creds;
 try {
@@ -87,7 +121,9 @@ try {
 } catch (err) {
   const message = String((err && err.message) || err);
   const at = /position (\d+)/.exec(message);
-  const lines = ["::group::CLASPRC_JSON の診断（中身は伏せています）", ...facts, `エラー: ${message}`];
+  const lines = ["::group::CLASPRC_JSON の診断（中身は伏せています）", ...facts];
+  if (truncationHint) lines.push(`▶ ${truncationHint}`);
+  lines.push(`エラー: ${message}`);
   if (at) {
     const pos = Number(at[1]);
     const from = Math.max(0, pos - 70);
