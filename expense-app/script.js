@@ -1222,11 +1222,38 @@ function applyBackendNotice() {
   el.hidden = false;
 }
 
-/** 科目が交通費のときだけ区間の入力欄を出す */
+/**
+ * 科目が交通費のときだけ区間の欄を出す。
+ * 電車賃を入れない申請も多いため既定は閉じておき、必要なときだけ開く。
+ */
 function applyFareUI() {
   const isTransit = $("#expCategory").value === "交通費";
-  $("#fareBox").hidden = !isTransit;
-  if (!isTransit) clearFareResult();
+  const box = $("#fareBox");
+  box.hidden = !isTransit;
+  if (!isTransit) {
+    box.open = false;
+    clearFareResult();
+  }
+  syncFareSummary();
+}
+
+/**
+ * 閉じたままでも中身が分かるよう、見出しに区間の要約を出す。
+ * 入力済みなら「新井薬師前→武蔵浦和 往復 ×2回」のように表示する。
+ */
+function syncFareSummary() {
+  const el = $("#fareSummary");
+  if (!el) return;
+  const f = readFareInput();
+  if (!f.from && !f.to) {
+    el.textContent = "区間を入れると運賃を照合できます";
+    el.classList.remove("is-set");
+    return;
+  }
+  const parts = [`${f.from || "?"}→${f.to || "?"}`, f.round ? "往復" : "片道"];
+  if (f.trips > 1) parts.push(`×${f.trips}回`);
+  el.textContent = parts.join(" ");
+  el.classList.add("is-set");
 }
 
 function clearFareResult() {
@@ -2532,6 +2559,7 @@ function init() {
   $("#fareApplyBtn").addEventListener("click", applyFareToAmount);
   ["#fareRound", "#fareTrips"].forEach((sel) =>
     $(sel).addEventListener("change", () => {
+      syncFareSummary();
       // 往復・回数を変えたら想定金額を作り直す（運賃は照合済みの値を再利用）
       if (!state.lastFare) return;
       const input = readFareInput();
@@ -2552,6 +2580,7 @@ function init() {
       clearFareResult();
       const f = readFareInput();
       syncFareSearchLink("#fareSearchLink", f.from, f.to);
+      syncFareSummary();
     })
   );
   ["#nfFrom", "#nfTo"].forEach((sel) =>
