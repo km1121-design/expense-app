@@ -81,8 +81,20 @@
    ```bash
    npm install -g @google/clasp@3
    clasp login           # ブラウザが開けない環境では clasp login --no-localhost
-   cat ~/.clasprc.json   # この中身を丸ごとコピーする
    ```
+
+   できた `~/.clasprc.json` を、**ファイルから直接クリップボードへ**入れます。
+   `cat` の出力を端末で選択してコピーすると、行の折返しや選択範囲のずれで壊れやすく、
+   1文字違うだけで JSON として読めなくなるためです。
+
+   | OS | コマンド |
+   | --- | --- |
+   | macOS | `pbcopy < ~/.clasprc.json` |
+   | Windows (PowerShell) | `Get-Content $HOME/.clasprc.json \| Set-Clipboard` |
+   | Linux | `xclip -selection clipboard < ~/.clasprc.json`（Wayland は `wl-copy < ~/.clasprc.json`） |
+
+   壊れた状態で登録した場合も、ワークフローが
+   「どこが壊れているか」を中身を伏せた形で表示します（トークンはログに出ません）。
 
 3. **IDを2つ調べる**
 
