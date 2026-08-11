@@ -1,0 +1,119 @@
+name: Deploy Apps Script
+
+# apps-script/Code.gs を Apps Script プロジェクトへ反映し、既存のウェブアプリ
+# デプロイを新バージョンへ更新する（ウェブアプリURL `.../exec` は変わらない）。
+#
+# 必要なシークレット（設定手順は apps-script/README.md「自動デプロイ」を参照）:
+#   CLASPRC_JSON               … `clasp login` 後の ~/.clasprc.json の中身
+#   APPS_SCRIPT_ID             … スクリプトID
+#   APPS_SCRIPT_DEPLOYMENT_ID  … 既存デプロイのID（アプリURLの `AKfycb...` の部分）
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps-script/**/*.gs"
+      - "apps-script/tools/**"
+      - ".github/workflows/deploy-apps-script.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-script
+  cancel-in-progress: false
+
+env:
+  CLASP_VERSION: "3.3.0"
+  # clasp の作業ディレクトリ。認証情報や取得したマニフェストをリポジトリ内に
+  # 置かないよう、チェックアウトとは別の場所に作る。
+  GAS_DIR: gas-project
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check required secrets
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          APPS_SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+          APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
+        run: |
+          missing=""
+          [ -n "$CLASPRC_JSON" ] || missing="$missing CLASPRC_JSON"
+          [ -n "$APPS_SCRIPT_ID" ] || missing="$missing APPS_SCRIPT_ID"
+          [ -n "$APPS_SCRIPT_DEPLOYMENT_ID" ] || missing="$missing APPS_SCRIPT_DEPLOYMENT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::シークレットが未設定です:$missing / 設定手順は apps-script/README.md「自動デプロイ」を参照してください。"
+            exit 1
+          fi
+
+      # 壊れたコードをデプロイしないための門番。構文チェックと既存の回帰テスト。
+      - name: Verify Code.gs
+        run: |
+          cp apps-script/Code.gs "$RUNNER_TEMP/Code.js"
+          node --check "$RUNNER_TEMP/Code.js"
+          node apps-script/tests/memory.test.js
+
+      - name: Install clasp
+        run: npm install --global --no-audit --no-fund "@google/clasp@${CLASP_VERSION}"
+
+      - name: Configure clasp
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          APPS_SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+        run: |
+          # 認証情報は clasp 既定の場所（ホーム直下）へ。プロジェクト側へ置くと
+          # push 対象のディレクトリに認証情報を持ち込むことになるため避ける。
+          umask 077
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          node -e 'JSON.parse(require("fs").readFileSync(process.env.HOME + "/.clasprc.json", "utf8"))' \
+            || { echo "::error::CLASPRC_JSON がJSONとして読めません。~/.clasprc.json の中身をそのまま貼り直してください。"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/$GAS_DIR"
+          jq -n --arg id "$APPS_SCRIPT_ID" '{scriptId: $id, rootDir: "."}' \
+            > "$RUNNER_TEMP/$GAS_DIR/.clasp.json"
+
+      # 先に現在のプロジェクトを丸ごと取得する。appsscript.json（ウェブアプリの
+      # 公開設定・タイムゾーン・OAuthスコープ）を取得したまま押し戻すことで、
+      # CIがマニフェストを書き換えてしまう事故を防ぐ。
+      - name: Pull current Apps Script project
+        run: clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" pull --force
+
+      - name: Apply repository source
+        id: sync
+        run: |
+          node apps-script/tools/sync-source.mjs \
+            "$RUNNER_TEMP/$GAS_DIR" apps-script/Code.gs
+
+      - name: Push to Apps Script
+        run: clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" push --force
+
+      - name: Update Web App deployment
+        env:
+          APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
+        run: |
+          subject=$(git log -1 --pretty=%s | cut -c1-90)
+          clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" \
+            redeploy "$APPS_SCRIPT_DEPLOYMENT_ID" \
+            -d "GitHub Actions ${GITHUB_SHA:0:7}: ${subject}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Apps Script を更新しました"
+            echo ""
+            echo "- 反映先ファイル: \`${{ steps.sync.outputs.target }}\`"
+            echo "- コード変更あり: ${{ steps.sync.outputs.changed }}"
+            echo "- コミット: \`${GITHUB_SHA:0:7}\`"
+            echo ""
+            echo "既存のデプロイを新バージョンへ更新したため、ウェブアプリURL（\`.../exec\`）は変わりません。"
+          } >> "$GITHUB_STEP_SUMMARY"

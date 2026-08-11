@@ -43,6 +43,92 @@
    - 以降は全員ログインが必要になります。ユーザーの追加は管理者ダッシュボードの
      「ユーザー管理」から行います。
 
+## コードの更新（手動デプロイ）
+
+`Code.gs` を書き換えたら、Apps Script エディタで貼り替えたうえで
+**「デプロイ」>「デプロイを管理」> ✏️（編集）> バージョン「新しいバージョン」> デプロイ**
+を実行します。保存だけではウェブアプリに反映されません。
+
+「新しいデプロイ」ではなく既存デプロイの編集にすると、ウェブアプリURL（`.../exec`）が
+変わらないため、アプリ側の設定をやり直す必要がありません。
+
+この作業は下記の自動デプロイを設定すると不要になります。
+
+## 自動デプロイ（GitHub Actions・任意）
+
+`main` への push で `apps-script/Code.gs` を Apps Script プロジェクトへ自動反映し、
+既存のウェブアプリを新バージョンへ更新できます
+（`.github/workflows/deploy-apps-script.yml`）。
+**ウェブアプリURL（`.../exec`）は変わらない**ので、アプリ側の設定はそのままです。
+
+設定しなくてもアプリの動作には影響しません（上記の手動デプロイのままになります）。
+
+### なぜ既定が手動なのか
+
+`expense-app/`（画面）は GitHub Pages なので push だけで自動公開されますが、
+`apps-script/Code.gs` は **Apps Script プロジェクトのコードの写し**です。
+プロジェクトの実体は Google 側にあってリポジトリとは何のつながりもないため、
+マージしても Google 側は 1 文字も変わりません。つなぐには Google アカウントの
+認証情報を GitHub に預ける必要があるので、既定では手動にしています。
+
+### 手順
+
+1. **Apps Script API を有効化**
+   - <https://script.google.com/home/usersettings> で「Google Apps Script API」をオン。
+
+2. **認証情報を作る**（自分のPC等で1回だけ。Node.js が必要）
+
+   ```bash
+   npm install -g @google/clasp@3
+   clasp login           # ブラウザが開けない環境では clasp login --no-localhost
+   cat ~/.clasprc.json   # この中身を丸ごとコピーする
+   ```
+
+3. **IDを2つ調べる**
+
+   | 値 | 調べ方 |
+   | --- | --- |
+   | スクリプトID | Apps Script エディタ > プロジェクトの設定（歯車）> 「スクリプト ID」 |
+   | デプロイID | 「デプロイ」>「デプロイを管理」に表示される `AKfycb...`。ウェブアプリURL `https://script.google.com/macros/s/【ここ】/exec` の中央部分と同じ |
+
+4. **GitHub にシークレットを登録**
+   - リポジトリの Settings > Secrets and variables > Actions >「New repository secret」
+
+     | 名前 | 値 |
+     | --- | --- |
+     | `CLASPRC_JSON` | 手順2でコピーした `~/.clasprc.json` の中身（JSON全文） |
+     | `APPS_SCRIPT_ID` | スクリプトID |
+     | `APPS_SCRIPT_DEPLOYMENT_ID` | デプロイID（`AKfycb...`） |
+
+5. **試す**
+   - Actions タブ >「Deploy Apps Script」>「Run workflow」で手動実行。
+   - 成功すれば、以降は `Code.gs` を含む `main` への push で自動実行されます。
+
+### 何をしているか
+
+1. `Code.gs` の構文チェックと回帰テスト（`apps-script/tests/memory.test.js`）。
+   失敗したらデプロイしません。
+2. `clasp pull` で現在のプロジェクトを丸ごと取得。
+3. `apps-script/tools/sync-source.mjs` で **ソースだけ**を差し替える。
+   - `appsscript.json`（アクセスできるユーザー・実行するユーザー・タイムゾーン・
+     OAuthスコープ）は取得したものをそのまま押し戻すため、公開設定がCIで
+     書き換わることはありません。
+   - 反映先はプロジェクト側のファイル名に合わせます（日本語ロケールの既定名は
+     `コード.gs` で、そこへ `Code.gs` を追加すると関数が二重定義になるため）。
+4. `clasp push` → `clasp redeploy <デプロイID>` で既存デプロイを新バージョンへ更新。
+
+### 注意
+
+- `CLASPRC_JSON` は **そのGoogleアカウントの Apps Script とドライブを操作できる
+  認証情報**です。リポジトリを触れる人を信頼できる範囲に限ってください
+  （Actions のログ上ではシークレットは自動的にマスクされます）。
+- 認証が切れることがあります。`Invalid credentials` 等で失敗したら手順2をやり直して
+  `CLASPRC_JSON` を更新してください。
+- スクリプトプロパティ（APIキー等）はコードではないため自動化の対象外です。
+  従来どおりエディタの「プロジェクトの設定」で設定します。
+- 自動デプロイを有効にしたあとにエディタ側で `Code.gs` を直接編集すると、次回の
+  自動デプロイで上書きされます。編集はリポジトリ側で行ってください。
+
 ## AIレシート解析（オプション・高精度）
 
 レシート画像の読み取りは **3段フォールバック** です:
