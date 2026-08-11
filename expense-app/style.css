@@ -754,6 +754,11 @@ body {
   color: var(--blue);
   align-self: flex-start;
 }
+/* 駅名が未入力のあいだ「路線検索で調べる」リンクを押せなくする */
+.btn.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
 .fare-badge {
   display: inline-block;
   margin-left: 6px;
