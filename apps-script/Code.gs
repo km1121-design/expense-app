@@ -1051,13 +1051,17 @@ function saveFare_(rec) {
 }
 
 /**
- * 運賃のWeb照合（Gemini＋Google検索）を使うか。
- * Google検索を伴うリクエストは無料枠では割当が無いことがあり、その場合は
- * 自動で "false" が保存され、以降は運賃マスタのみで照合する。
- * 課金を有効にしたら、このプロパティを削除すれば再びWeb照合を使う。
+ * 運賃のWeb照合（Gemini＋Google検索）を使うか。**既定は無効**。
+ *
+ * Google検索グラウンディングは Gemini API の無料枠では割当が0（limit: 0）で
+ * 使えない。既定を有効にすると必ず一度失敗してから自動停止することになるため、
+ * 使える環境でだけ明示的に有効化する形にしている。
+ *
+ * 有効にするには、スクリプトプロパティ `FARE_WEB_LOOKUP` に `"true"` を設定する
+ * （課金を有効にした場合）。失敗を検知したときは "false" が保存される。
  */
 function isFareWebEnabled_() {
-  return getProp_("FARE_WEB_LOOKUP") !== "false";
+  return getProp_("FARE_WEB_LOOKUP") === "true";
 }
 
 /**
