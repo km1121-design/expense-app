@@ -366,6 +366,7 @@ console.log("✓ fareTotal_: 往復と回数を掛けた想定金額を出し、
 
 /* -------- 14. Webで調べた運賃が運賃マスタへ蓄積され、2回目は検索しない -------- */
 props.GEMINI_API_KEY = "dummy";
+props.FARE_WEB_LOOKUP = "true"; // Web照合の既定は無効なので、この節では明示的に有効化する
 let searchCalls = 0;
 g.searchFareOnWeb_ = function (from, to) {
   searchCalls++;
@@ -505,6 +506,33 @@ assert.ok(
 );
 delete props.FARE_WEB_LOOKUP;
 console.log("✓ actionBulkUpsertFares_: カンマ/タブ/全角に対応し、読めない行は理由を返す");
+
+/* -------- 16.7 Web照合は既定で無効（無料枠では割当が無いため） -------- */
+assert.strictEqual(
+  g.isFareWebEnabled_(),
+  false,
+  "プロパティ未設定なら無効（無料枠で必ず失敗する経路に入らない）"
+);
+props.FARE_WEB_LOOKUP = "false";
+assert.strictEqual(g.isFareWebEnabled_(), false, "false でも無効");
+props.FARE_WEB_LOOKUP = "true";
+assert.strictEqual(g.isFareWebEnabled_(), true, "true のときだけ有効");
+delete props.FARE_WEB_LOOKUP;
+
+// 未設定のまま未登録区間を引いても、Web照合は呼ばれず案内だけを返す
+let webCallsDefault = 0;
+g.searchFareOnWeb_ = function () {
+  webCallsDefault++;
+  throw new Error("既定では呼ばれてはいけない");
+};
+const defaultLookup = g.actionLookupFare_({
+  token: "", from: "横浜", to: "川崎", round: false, trips: 1,
+});
+assert.strictEqual(webCallsDefault, 0, "既定ではWeb照合を呼ばない");
+assert.strictEqual(defaultLookup.ok, true);
+assert.strictEqual(defaultLookup.registered, false);
+assert.strictEqual(defaultLookup.webDisabled, true, "運賃マスタのみの運用として応答する");
+console.log("✓ Web照合は既定で無効で、未登録区間は案内だけを返す");
 
 /* -------- 17. AIの応答から運賃JSONを取り出す -------- */
 assert.strictEqual(
