@@ -108,13 +108,49 @@ jobs:
         run: clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" push --force
 
       - name: Update Web App deployment
+        id: deploy
         env:
           APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
         run: |
+          # 疎通確認が失敗したときに戻せるよう、更新前の版を控えておく。
+          # ここで版が取れなくてもデプロイ自体は続ける（戻せないだけ）。
+          previous=$(
+            clasp --json -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" list-deployments 2>/dev/null \
+              | jq -r --arg id "$APPS_SCRIPT_DEPLOYMENT_ID" \
+                'map(select(.deploymentId == $id)) | .[0].versionNumber // empty' 2>/dev/null
+          ) || previous=""
+          echo "previous_version=${previous}" >> "$GITHUB_OUTPUT"
+          echo "更新前の版: ${previous:-（取得できませんでした）}"
+
           subject=$(git log -1 --pretty=%s | cut -c1-90)
           clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" \
             redeploy "$APPS_SCRIPT_DEPLOYMENT_ID" \
             -d "GitHub Actions ${GITHUB_SHA:0:7}: ${subject}"
+
+      # 公開されたウェブアプリを実際に叩く。Apps Script は全スクリプトファイルを
+      # 同じスコープへ結合するため、ファイル単体の構文チェックでは検出できない
+      # 不具合（同じ識別子の二重宣言など）がある。ここで初めて分かる。
+      - name: Smoke test the deployed Web App
+        id: smoke
+        env:
+          WEB_APP_URL: https://script.google.com/macros/s/${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}/exec
+        run: node apps-script/tools/smoke-test.mjs
+
+      # 壊れたまま公開し続けないよう、直前の版へ戻す。
+      - name: Roll back to previous version
+        if: failure() && steps.smoke.outcome == 'failure'
+        env:
+          APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
+          PREVIOUS_VERSION: ${{ steps.deploy.outputs.previous_version }}
+        run: |
+          if [ -z "$PREVIOUS_VERSION" ]; then
+            echo "::error::戻せる版がありません（デプロイが @HEAD か、初回のデプロイです）。Apps Script エディタで確認してください。"
+            exit 1
+          fi
+          clasp -P "$RUNNER_TEMP/$GAS_DIR/.clasp.json" \
+            redeploy "$APPS_SCRIPT_DEPLOYMENT_ID" -V "$PREVIOUS_VERSION" \
+            -d "自動ロールバック（${GITHUB_SHA:0:7} の疎通確認が失敗）"
+          echo "::warning::疎通確認に失敗したため、版 ${PREVIOUS_VERSION} へ戻しました。プロジェクトのコードは新しいままなので、原因を直して再実行してください。"
 
       - name: Summary
         run: |
@@ -124,6 +160,7 @@ jobs:
             echo "- 反映先ファイル: \`${{ steps.sync.outputs.target }}\`"
             echo "- コード変更あり: ${{ steps.sync.outputs.changed }}"
             echo "- コミット: \`${GITHUB_SHA:0:7}\`"
+            echo "- 疎通確認: ${{ steps.smoke.outcome }}"
             echo ""
             echo "既存のデプロイを新バージョンへ更新したため、ウェブアプリURL（\`.../exec\`）は変わりません。"
           } >> "$GITHUB_STEP_SUMMARY"
