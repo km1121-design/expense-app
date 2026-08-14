@@ -12,6 +12,36 @@ const vm = require("vm");
 const assert = require("assert");
 
 // ---- 最小限の GAS スタブ ----
+/**
+ * タイムゾーンの再現。スプレッドシートは「シートのTZで見た日時」を保存し、
+ * Apps Script が読み出すときは「スクリプトのTZ」で解釈される。この往復で
+ * 日付が1日ずれる事故が実際に起きたため、テストでも往復を再現する。
+ */
+const SCRIPT_TZ = "Asia/Tokyo";
+/** vm の中と外では Date が別物なので、シートに入れる日付は中側の Date で作る */
+let SBDate = null;
+const mkDate = (ms) => new (SBDate || Date)(ms);
+const TZ_OFFSET = { "Asia/Tokyo": 9, "America/Los_Angeles": -7, UTC: 0 };
+const shownParts = (d, tz) => {
+  const t = new Date(d.getTime() + TZ_OFFSET[tz] * 3600000);
+  return [t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate(), t.getUTCHours(), t.getUTCMinutes()];
+};
+const instantFor = (p, tz) =>
+  mkDate(Date.UTC(p[0], p[1], p[2], p[3], p[4]) - TZ_OFFSET[tz] * 3600000);
+/** シートへ日付を保存 → 読み出す、の往復 */
+const roundTripDate = (d, sheetTz) => instantFor(shownParts(d, sheetTz), SCRIPT_TZ);
+
+/**
+ * シート上での表示（検証用）。
+ * シートから読み出した値は「表示どおりの日時をスクリプトTZで解釈した瞬間」なので、
+ * 表示を知りたいときはスクリプトTZで見る。
+ */
+const displayed = (v) => shownIn(v, SCRIPT_TZ);
+const shownIn = (d, tz) => {
+  const p = shownParts(d, tz);
+  const z = (n) => String(n).padStart(2, "0");
+  return `${p[0]}-${z(p[1] + 1)}-${z(p[2])} ${z(p[3])}:${z(p[4])}`;
+};
 class FakeSheet {
   constructor(name, rows) {
     this.name = name;
@@ -21,6 +51,13 @@ class FakeSheet {
   }
   getName() { return this.name; }
   setName(n) { renameSheet(this, n); }
+  getParent() { return this.parent || FAKE_SS; }
+  /** 日付を書くと、シートのTZを経由した値になって読み戻される */
+  store(v) {
+    // vm の中と外で Date が別物なので instanceof は使えない
+    const isDateLike = !!v && typeof v.getTime === "function";
+    return this.tz && isDateLike ? roundTripDate(v, this.tz) : v;
+  }
   getLastRow() { return this.rows.length; }
   getLastColumn() {
     return this.rows.reduce((max, r) => Math.max(max, (r || []).length), 0);
@@ -58,7 +95,7 @@ class FakeSheet {
           const target = (self.rows[row - 1 + i] = self.rows[row - 1 + i] || []);
           const fRow = (self.formulas[row - 1 + i] = self.formulas[row - 1 + i] || []);
           line.forEach((v, j) => {
-            target[col - 1 + j] = v;
+            target[col - 1 + j] = self.store(v);
             // "=" で始まる文字列を書くと数式になる
             fRow[col - 1 + j] = typeof v === "string" && v[0] === "=" ? v : "";
           });
@@ -93,7 +130,7 @@ class FakeSheet {
       },
       setValue(v) {
         const target = (self.rows[row - 1] = self.rows[row - 1] || []);
-        target[col - 1] = v;
+        target[col - 1] = self.store(v);
       },
       getValue() { return (self.rows[row - 1] || [])[col - 1]; },
       setNumberFormat() {},
@@ -119,10 +156,21 @@ const sandbox = {
   SpreadsheetApp: {},
   Session: { getScriptTimeZone: () => "Asia/Tokyo" },
   Utilities: {
+    // タイムゾーンを固定オフセットで再現する（PL連携の日付ずれを検証するため）
     formatDate: (d, tz, fmt) => {
+      const OFFSET = { "Asia/Tokyo": 9, "America/Los_Angeles": -7, UTC: 0 };
+      const off = OFFSET[tz] === undefined ? 9 : OFFSET[tz];
+      const t = new Date(d.getTime() + off * 3600000);
       const p = (n) => String(n).padStart(2, "0");
-      const s = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-      return fmt === "yyyy-MM" ? s.slice(0, 7) : s;
+      const map = {
+        yyyy: String(t.getUTCFullYear()),
+        MM: p(t.getUTCMonth() + 1),
+        dd: p(t.getUTCDate()),
+        HH: p(t.getUTCHours()),
+        mm: p(t.getUTCMinutes()),
+        ss: p(t.getUTCSeconds()),
+      };
+      return fmt.replace(/yyyy|MM|dd|HH|mm|ss/g, (k) => map[k]);
     },
     getUuid: () => "uuid",
   },
@@ -140,13 +188,23 @@ const FAKE_SS = {
 const plSheets = {};
 const FAKE_PL_SS = {
   getId: () => "pl-model",
+  // 実物と同じ条件: スクリプトは Asia/Tokyo、PLモデルは America/Los_Angeles
+  getSpreadsheetTimeZone: () => "America/Los_Angeles",
   getSheetByName: (n) => plSheets[n] || null,
-  insertSheet: (n) => (plSheets[n] = new FakeSheet(n)),
+  insertSheet: (n) => (plSheets[n] = plSheet(n)),
   getSheets: () => Object.keys(plSheets).map((k) => plSheets[k]),
 };
 sandbox.SpreadsheetApp.getActiveSpreadsheet = () => FAKE_SS;
 sandbox.SpreadsheetApp.openById = (id) => (id === "pl-model" ? FAKE_PL_SS : FAKE_SS);
 sandbox.SpreadsheetApp.create = () => FAKE_SS;
+
+/** PL側のシートを作る（getParent が PLスプレッドシートを返すようにする） */
+function plSheet(name, rows) {
+  const s = new FakeSheet(name, rows);
+  s.parent = FAKE_PL_SS;
+  s.tz = "America/Los_Angeles";
+  return s;
+}
 
 // 旧版（英語タブ・英語見出し）で作られた状態を用意し、自動移行を検証する。
 // corrections は「AI解析を使った申請」でしか触られないタブなので、
@@ -168,6 +226,7 @@ sheets["expenses"] = new FakeSheet("expenses", [
 ]);
 
 vm.createContext(sandbox);
+SBDate = vm.runInContext("Date", sandbox);
 vm.runInContext(fs.readFileSync(__dirname + "/../Code.gs", "utf8"), sandbox);
 const g = sandbox; // function 宣言はグローバルオブジェクトに乗る
 /** const 宣言はグローバルオブジェクトに乗らないため、式を評価して取り出す */
@@ -898,12 +957,13 @@ console.log("✓ 全滅時の案内と、APIキー無効時の即時中断");
 
 // 連携先の『経費入力テーブル』を実物と同じ形で用意する。
 // 1行目がタイトル・4行目が見出し・データは5行目から。手動入力行が1件ある。
-plSheets["経費入力テーブル"] = new FakeSheet("経費入力テーブル", [
+plSheets["経費入力テーブル"] = plSheet("経費入力テーブル", [
   ["経費入力テーブル（経費精算アプリ等から自動連携・手動入力）"],
   [],
   [],
   ["日付", "担当者名", "所属事業部", "経費項目", "金額", "備考"],
-  [new Date(2026, 7, 15), "中原聖人", "人材", "広告費", 1200000, "人材広告費(8月分)"],
+  [instantFor([2026, 7, 15, 0, 0], SCRIPT_TZ), "中原聖人", "人材", "広告費", 1200000,
+   "人材広告費(8月分)"],
 ]);
 const plRows = plSheets["経費入力テーブル"].rows;
 
@@ -943,7 +1003,11 @@ const added = plRows[5];
 // vm の中と外では Date のコンストラクタが別なので instanceof では判定できない
 const isDate = (v) => !!v && typeof v.getMonth === "function";
 assert.ok(isDate(added[0]), "日付は文字列ではなく実日付で書く（SUMIFSの条件が日付比較）");
-assert.strictEqual(added[0].getMonth(), 7, "2026-08-05 の月");
+assert.strictEqual(
+  displayed(added[0]),
+  "2026-08-05 00:00",
+  "シート上で申請どおりの日付・0:00 になる（スクリプトのTZで書くと1日前になる）"
+);
 assert.strictEqual(added[2], "イベント営業", "事業部がPL側の語彙になる");
 assert.strictEqual(added[3], "雑費交通費", "科目がPL側の語彙になる");
 assert.strictEqual(added[4], 1200);
@@ -1055,7 +1119,7 @@ const sumifs = (dept, item, from, to) =>
   "\", '経費入力テーブル'!$D$5:$D$100, \"" + item +
   "\", '経費入力テーブル'!$A$5:$A$100, \">=" + from +
   "\", '経費入力テーブル'!$A$5:$A$100, \"<=" + to + "\")";
-const plCalc = new FakeSheet("営業部PL計算シート");
+const plCalc = plSheet("営業部PL計算シート");
 plSheets["営業部PL計算シート"] = plCalc;
 plCalc.getRange(1, 1, 1, 1).setValues([["イベント営業事業部 PL & インセンティブ計算シート"]]);
 plCalc.getRange(3, 2, 1, 3).setValues([["8月", "9月", "合計"]]);
@@ -1132,7 +1196,7 @@ assert.strictEqual(
 assert.strictEqual(plCalc.rows.length, 17, "行数が変わらない");
 
 // 経費を集計していないシート（ダッシュボード等）は対象外
-const dash = new FakeSheet("ダッシュボード");
+const dash = plSheet("ダッシュボード");
 dash.getRange(1, 1, 2, 1).setValues([["個人ダッシュボード"], ["基本給"]]);
 assert.strictEqual(g.addPlOtherExpenseRow_(dash), "", "経費合計が無いシートは触らない");
 console.log("✓ 「その他経費（実費）」行は総額との差で作り、固定費は引かず、冪等");
@@ -1147,10 +1211,23 @@ assert.strictEqual(converted, 1, "文字列の日付1件だけを移行する（
 const migratedRow = plRows.find((r) => r[5] === "文字列で入力された行");
 assert.ok(isDate(migratedRow[0]), "文字列の日付が実日付になる");
 assert.strictEqual(migratedRow[0].getMonth(), 8, "2026-09-03 の月");
+// 直す必要のないセルを書き戻さないこと。読んだ日付をそのまま書き戻すと
+// （読みはスクリプトTZ基準・書きはシートTZ基準なので）日付が1日ずれる。
+const keptManual = plRows.find((r) => r[5] === "人材広告費(8月分)");
+assert.strictEqual(
+  displayed(keptManual[0]),
+  "2026-08-15 00:00",
+  "移行の対象外だった手動入力の日付が動かない"
+);
 assert.strictEqual(
   g.fixPlDateColumn_(FAKE_PL_SS, "経費入力テーブル"),
   0,
   "2回目は移行するものが無い（冪等）"
+);
+assert.strictEqual(
+  displayed(keptManual[0]),
+  "2026-08-15 00:00",
+  "何度流しても手動入力の日付は動かない"
 );
 assert.strictEqual(
   g.fixPlDateColumn_(FAKE_PL_SS, "存在しないシート"),
@@ -1190,5 +1267,74 @@ assert.strictEqual(
   "経費合計は全ての月の列で追加行まで広がる"
 );
 console.log("✓ 日付列の実日付への移行とSUMIFSの範囲拡張が、既存の値を壊さず冪等に動く");
+
+/* -------- タイムゾーンのずれ（日付が1日前になる事故）-------- */
+const LA = "America/Los_Angeles";
+
+// 月末の申請が、シート上でも月末のままであること。
+// スクリプトのTZ（+9）で 0:00 を作るとシート（-7）では前日 8:00 になり、
+// 8月にも9月にも入らずPLから消えてしまう。
+g.syncExpenseToPl_({
+  id: "p9", status: "approved", applicant: "月末太郎", department: "本部",
+  date: "2026-08-31", category: "交通費", vendor: "月末", amount: 300,
+});
+const monthEnd = plRows[g.findPlRow_(plSheets["経費入力テーブル"], "p9") - 1];
+assert.strictEqual(
+  displayed(monthEnd[0]),
+  "2026-08-31 00:00",
+  "月末の日付が前日にずれない"
+);
+console.log("✓ 月末の申請がシート上でも月末に入る（1日前へずれない）");
+
+// 旧コードが書いた「ずれた日付」を復元できること。
+// Apps Script が読み戻す値は「シート上の表示日時をスクリプトTZで解釈したもの」。
+// 旧コードは Asia/Tokyo の 0:00 を書いていたため、シートには前日 8:00 と表示され、
+// 読み戻すと「前日 8:00（Tokyo）」の瞬間になる。
+const shifted = plSheet("ずれ確認", [
+  [], [], [],
+  ["日付"],
+  [instantFor([2026, 7, 4, 8, 0], SCRIPT_TZ), "旧コードが書いた行（前日 8:00 と表示される）"],
+  [instantFor([2026, 7, 20, 0, 0], SCRIPT_TZ), "人が入力した行（0:00）"],
+  ["", ""],
+]);
+plSheets["ずれ確認"] = shifted;
+assert.strictEqual(
+  g.repairPlShiftedDates_(FAKE_PL_SS, "ずれ確認"),
+  1,
+  "ずれた1件だけを直す（人が入れた行は触らない）"
+);
+assert.strictEqual(
+  displayed(shifted.rows[4][0]),
+  "2026-08-05 00:00",
+  "1日前になっていた 2026-08-04 08:00 が 2026-08-05 へ戻る"
+);
+assert.strictEqual(
+  displayed(shifted.rows[5][0]),
+  "2026-08-20 00:00",
+  "人が入力した日付はそのまま"
+);
+assert.strictEqual(
+  g.repairPlShiftedDates_(FAKE_PL_SS, "ずれ確認"),
+  0,
+  "2回目は対象なし（冪等）"
+);
+console.log("✓ ずれた日付を復元し、人が入力した日付には触らない");
+
+// 月末の条件を半開区間へ変換する（時刻が残っていても取りこぼさないための保険）
+const halfOpenBefore = plCalc.getRange(13, 2).getFormula();
+assert.ok(halfOpenBefore.indexOf('"<=2026-08-31"') > 0, "変換前は <= 月末");
+const halfOpenCount = g.usePlHalfOpenRanges_(FAKE_PL_SS);
+assert.ok(halfOpenCount >= 1, "変換した数式がある: " + halfOpenCount);
+const halfOpenAfter = plCalc.getRange(13, 2).getFormula();
+assert.ok(halfOpenAfter.indexOf('"<2026-09-01"') > 0, "翌月1日未満になる: " + halfOpenAfter);
+assert.ok(halfOpenAfter.indexOf("<=") < 0, "<= が残らない");
+assert.ok(halfOpenAfter.indexOf('">=2026-08-01"') > 0, "月初の条件は変えない");
+assert.strictEqual(
+  plCalc.getRange(14, 3).getFormula().indexOf('"<2026-10-01"') > 0,
+  true,
+  "9月の列は 10月1日未満になる（月をまたぐ繰り上げ）"
+);
+assert.strictEqual(g.usePlHalfOpenRanges_(FAKE_PL_SS), 0, "2回目は変更なし（冪等）");
+console.log("✓ 月末の条件が「<翌月1日」になり、月をまたぐ繰り上げも正しい");
 
 console.log("\nすべて成功");
