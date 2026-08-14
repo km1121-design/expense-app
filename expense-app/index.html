@@ -316,6 +316,7 @@
               <select id="adminFareFilter" class="mini-select">
                 <option value="all">運賃照合：すべて</option>
                 <option value="diff">差額あり</option>
+                <option value="registered">新規登録</option>
                 <option value="unchecked">未照合</option>
                 <option value="match">一致</option>
               </select>
@@ -380,10 +381,12 @@
             </button>
           </div>
           <p class="card__hint">
-            申請時に区間を照合すると、その区間の片道運賃がここに蓄積されます。
-            2回目以降は<strong>Web検索せずにこの値で即照合</strong>するため、結果がぶれません。
-            運賃改定やWeb照合の誤りは、運賃欄を直接書き換えて修正してください
-            （削除すると次回また調べ直します）。上りと下りは同じ区間として扱います。
+            未登録の区間が申請されると、<strong>その申請額から片道運賃を割り戻してここへ登録</strong>
+            します（更新欄が「申請（申請者名）」の行）。2回目以降の同じ区間はこの値で即照合するため、
+            結果がぶれません。<strong>最初の1件は申請額をそのまま基準にしているので、
+            一覧で「新規登録」が付いた申請は承認前に金額を確かめてください。</strong>
+            運賃改定や誤りは運賃欄を直接書き換えて修正します
+            （削除すると次の申請でまた登録し直されます）。上りと下りは同じ区間として扱います。
           </p>
           <div class="table-wrap">
             <table class="table" id="fareTable">
@@ -628,7 +631,11 @@
     <div class="toast" id="toast" hidden></div>
 
     <!-- レシート画像OCR（端末内で完結） -->
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <!--
+      OCR（Tesseract.js）はAIキーが未設定のときのフォールバックでしか使わない。
+      ここで同期読み込みすると script.js の実行がその分だけ遅れ、起動が丸ごと
+      待たされるため、実際に必要になった時点で script.js が動的に読み込む。
+    -->
     <script src="./script.js"></script>
   </body>
 </html>

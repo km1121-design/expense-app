@@ -150,6 +150,12 @@ const CORRECTION_LOOKBACK = 600;
 const CORRECTION_HINT_MAX = 3;
 /** 摘要を自動補正するのに必要な最低一致回数（1回だけの摘要は使い回さない） */
 const DESCRIPTION_MIN_HITS = 2;
+/**
+ * レシートの書き起こし（raw_text）に許す行数の上限。
+ * AI解析の応答時間は出力の長さでほぼ決まるため、根拠として必要な最小限に絞る。
+ * 読み取り精度が落ちるようなら増やす（増やすほど解析は遅くなる）。
+ */
+const RECEIPT_RAW_TEXT_MAX_LINES = 6;
 
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
 
@@ -369,6 +375,59 @@ function buildReceiptFileName_(folder, dateStr, applicant, mime) {
   }
   const ext = String(mime || "").indexOf("png") >= 0 ? ".png" : ".jpg";
   return base + String(count + 1).padStart(3, "0") + ext;
+}
+
+/**
+ * 領収書画像を「リンクを知っている人は閲覧可」にする。
+ *
+ * こうしないと、画像はスクリプト所有者のドライブにあるため、所有者以外のブラウザ
+ * からはサムネイルの直リンクが 403 になる。その場合アプリは画像1枚ごとに
+ * バックエンドへ取得を投げ直すことになり、一覧表示が目に見えて遅くなる。
+ *
+ * **URLを知っていれば誰でも閲覧できる状態になる**（ファイルIDは推測できない長さだが、
+ * 認証はかからない）。この扱いで問題がある運用では、この関数の中身を空にすれば
+ * 従来どおりアプリ経由の取得（遅いが所有者のみに閉じる）へ戻る。
+ */
+function shareReceiptFile_(file) {
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (err) {
+    // 組織のポリシーで外部共有が禁止されている場合など。共有できなくても
+    // アプリ経由の取得で表示はできるので、申請そのものは失敗させない。
+  }
+}
+
+/**
+ * 既存の領収書画像をまとめてリンク共有にする（エディタから手動実行する）。
+ * 共有設定を入れる前に保存された画像は直リンクが通らないままなので、
+ * 一度だけこれを流すと以降は他の画像と同じ速さで表示される。
+ */
+function shareExistingReceipts() {
+  const sheet = getSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return "対象の申請がありません";
+  const head = headerKeys_(
+    sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
+    EXPENSE_COLUMNS
+  );
+  const col = head.indexOf("imageFileId");
+  if (col < 0) return "領収書ファイルIDの列が見つかりません";
+  const ids = sheet.getRange(2, col + 1, last - 1, 1).getValues();
+  let done = 0;
+  let failed = 0;
+  ids.forEach(function (r) {
+    const id = String(r[0] || "").trim();
+    if (!id) return;
+    try {
+      shareReceiptFile_(DriveApp.getFileById(id));
+      done++;
+    } catch (err) {
+      failed++; // 削除済みなど
+    }
+  });
+  const msg = "共有設定: " + done + "件を処理、" + failed + "件は失敗（削除済みなど）";
+  Logger.log(msg);
+  return msg;
 }
 
 /* ========================= 認証 ========================= */
@@ -713,6 +772,27 @@ function findRow_(sheet, id) {
   return -1;
 }
 
+/**
+ * 指定した内部キーの列だけを見て、値が一致する行番号を返す（無ければ -1）。
+ * シート全体を読み込まずに済むよう、対象の1列だけを取得する。
+ */
+function findRowByColumn_(sheet, key, value) {
+  const last = sheet.getLastRow();
+  if (last < 2) return -1;
+  const head = headerKeys_(
+    sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
+    EXPENSE_COLUMNS
+  );
+  const col = head.indexOf(key);
+  if (col < 0) return -1;
+  const values = sheet.getRange(2, col + 1, last - 1, 1).getValues();
+  const target = String(value);
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0]) === target) return i + 2;
+  }
+  return -1;
+}
+
 /* ========================= HTTPエントリポイント ========================= */
 
 /**
@@ -730,18 +810,74 @@ function doGet(e) {
     if (shared && token === shared) {
       records = rowsToRecords_(getSheet_());
     } else {
-      const u = requireUser_(token, false);
-      records = rowsToRecords_(getSheet_());
-      if (!u.legacy && u.role !== "admin") {
-        records = records.filter(function (r) {
-          return String(r.applicantId) === u.username;
-        });
-      }
+      records = recordsForUser_(requireUser_(token, false));
     }
     return json_({ ok: true, records: records });
   } catch (err) {
     return json_({ ok: false, error: String(err && err.message ? err.message : err) });
   }
+}
+
+/** 一般ユーザーには自分の申請だけを返す（絞り込みはサーバー側で行う） */
+function recordsForUser_(u) {
+  const records = rowsToRecords_(getSheet_());
+  if (u.legacy || u.role === "admin") return records;
+  return records.filter(function (r) {
+    return String(r.applicantId) === u.username;
+  });
+}
+
+/**
+ * アプリ側が「このバックエンドで何が使えるか」を判定するための情報。
+ * 古いコードのままデプロイされている場合は features のキー自体が返らないので、
+ * アプリは機能が無いものとして扱い、再デプロイを促す。
+ */
+function statusPayload_() {
+  return {
+    ok: true,
+    authEnabled: usersExist_(),
+    autoApprove: isAutoApprove_(),
+    aiOcr: !!resolveOcrProvider_(),
+    version: SCHEMA_VERSION,
+    features: {
+      fare: true, // 交通費の運賃照合
+      fareWeb: isFareWebEnabled_(), // 運賃のWeb照合が使える設定か
+      receiptImage: true, // 領収書画像のアプリ経由取得
+      vendorMemory: true, // AI解析の学習
+      jaSheets: true, // シートの日本語化
+      bootstrap: true, // 起動を1往復にまとめられるか
+    },
+  };
+}
+
+/**
+ * 起動用。`status` `me` 一覧取得の3往復を1往復にまとめる。
+ *
+ * トークンが無効でもエラーにしない（`user: null` を返す）。ここで例外にすると、
+ * アプリはログイン画面を出すためにもう1往復することになり、統合の意味がなくなる。
+ */
+function actionBootstrap_(body) {
+  const out = statusPayload_();
+  out.user = null;
+  out.departments = null;
+  out.records = null;
+  if (!out.authEnabled) return out; // 初期設定（最初の管理者作成）が先
+  let u;
+  try {
+    u = requireUser_(body.token, false);
+  } catch (err) {
+    return out; // 未ログイン・期限切れ。アプリはログイン画面を出す
+  }
+  const profile = u.legacy ? null : findUser_(u.username);
+  out.user = {
+    username: u.username,
+    displayName: u.displayName,
+    role: u.role,
+    department: String((profile && profile.department) || ""),
+  };
+  out.departments = listDepartments_();
+  out.records = recordsForUser_(u);
+  return out;
 }
 
 /** POST: 認証・申請の作成・更新・削除・ユーザー管理 */
@@ -752,23 +888,10 @@ function doPost(e) {
     switch (body.action) {
       // ---- 認証（トークン不要） ----
       case "status":
-        return json_({
-          ok: true,
-          authEnabled: usersExist_(),
-          autoApprove: isAutoApprove_(),
-          aiOcr: !!resolveOcrProvider_(),
-          version: SCHEMA_VERSION,
-          // アプリ側が「このバックエンドで何が使えるか」を判定するための一覧。
-          // 古いコードのままデプロイされている場合はキー自体が返らないので、
-          // アプリは機能が無いものとして扱い、再デプロイを促す。
-          features: {
-            fare: true, // 交通費の運賃照合
-            fareWeb: isFareWebEnabled_(), // 運賃のWeb照合が使える設定か
-            receiptImage: true, // 領収書画像のアプリ経由取得
-            vendorMemory: true, // AI解析の学習
-            jaSheets: true, // シートの日本語化
-          },
-        });
+        return json_(statusPayload_());
+      // 起動用。status + me + 一覧を1往復で返す（起動の待ち時間を減らすため）。
+      case "bootstrap":
+        return json_(actionBootstrap_(body));
       case "setup":
         return json_(actionSetup_(body));
       case "login":
@@ -882,12 +1005,14 @@ function createExpense_(record, user) {
       fileName
     );
     const file = folder.createFile(blob);
+    shareReceiptFile_(file);
     imageFileId = file.getId();
     imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
   }
   // 交通費の運賃照合。片道運賃は運賃マスタ（サーバー側の正）から取り直して
   // 想定金額を計算するため、クライアントから送られた金額は信用しない。
-  const fare = resolveFareForRecord_(record, Number(record.amount) || 0);
+  // 未登録の区間は、この申請額から運賃マスタへ登録する（誰が入れたか残す）。
+  const fare = resolveFareForRecord_(record, Number(record.amount) || 0, applicant);
 
   // 自動承認モードでは申請と同時に承認済みにする
   const auto = isAutoApprove_();
@@ -979,6 +1104,13 @@ function deleteExpense_(id, user) {
 
 /** 1回の申請で認める回数の上限（打ち間違いで巨額にならないように） */
 const FARE_TRIPS_MAX = 60;
+
+/**
+ * 申請から運賃マスタへ自動登録するときに認める片道運賃の上限。
+ * 桁を打ち間違えた申請がそのままマスタになると、以降の申請が誤った金額で
+ * 「一致」と判定されてしまうため、明らかに運賃ではない額は登録しない。
+ */
+const FARE_UNIT_MAX = 100000;
 
 /** 駅名の照合キー。表記ゆれ（全半角・空白・「駅」の有無）を吸収する */
 function stationKey_(s) {
@@ -1084,7 +1216,8 @@ function unregisteredFare_(from, to, round, trips, justDisabled) {
     source: "",
     message:
       "この区間は運賃マスタに未登録です。「🚉 路線検索で調べる」で運賃を確認して" +
-      "金額を入力してください。管理者が運賃マスタへ登録すると、次回から自動で照合されます。" +
+      "金額を入力してください。この申請の金額から運賃マスタへ登録されるので、" +
+      "次回からは自動で照合されます。" +
       (justDisabled
         ? "（無料枠ではWeb検索による照合が使えないため、以降はマスタのみで照合します）"
         : ""),
@@ -1323,15 +1456,40 @@ function groundingSource_(cand) {
 }
 
 /**
+ * 申請額から片道運賃を割り戻す。運賃マスタへ登録してよい額のときだけ返し、
+ * 登録すべきでないときは 0 を返す。
+ *
+ * 往復・回数で割り切れない金額は、申請額に運賃以外（特急券など）が混ざって
+ * いるか、区間か回数の入力が実態と合っていない。そのまま割ると端数の分だけ
+ * 誤った運賃がマスタに残るため、登録しない。
+ */
+function fareUnitFromAmount_(amount, round, trips) {
+  const total = Math.round(Number(amount) || 0);
+  if (total <= 0) return 0;
+  const n = Math.min(FARE_TRIPS_MAX, Math.max(1, Math.round(Number(trips) || 1)));
+  const divisor = (round ? 2 : 1) * n;
+  if (total % divisor !== 0) return 0;
+  const unit = total / divisor;
+  if (unit <= 0 || unit > FARE_UNIT_MAX) return 0;
+  return unit;
+}
+
+/**
  * 申請に付いてきた区間から、保存する運賃照合の内容を決める。
  * 片道運賃は運賃マスタから取り直すため、申請者側で書き換えられない。
- * マスタに無い区間は「未照合」として区間と回数だけ残す。
- *   match     : 申請額 = 想定金額
- *   diff      : 申請額 ≠ 想定金額（管理者が確認する）
- *   unchecked : 区間はあるがマスタに運賃が無い
- *   ""        : 区間の指定なし（交通費以外など）
+ *
+ * マスタに無い区間は、申請額から片道運賃を割り戻してマスタへ登録する。
+ * 運用しながら区間が貯まっていくようにするためで、以降の同じ区間の申請は
+ * 自動で照合できる。ただし登録の元になった申請そのものは「一致」にしない
+ * （自分の申請額で自分を照合しても確認したことにならない）。マスタ側には
+ * 「申請（申請者名）」と記録されるので、管理者が後から確認・訂正できる。
+ *   match      : 申請額 = 想定金額
+ *   diff       : 申請額 ≠ 想定金額（管理者が確認する）
+ *   registered : この申請額から運賃マスタへ登録した（まだ誰も確認していない）
+ *   unchecked  : 区間はあるが、マスタにも無く申請額からも割り出せない
+ *   ""         : 区間の指定なし（交通費以外など）
  */
-function resolveFareForRecord_(record, amount) {
+function resolveFareForRecord_(record, amount, applicant) {
   const from = String((record && record.fareFrom) || "").trim();
   const to = String((record && record.fareTo) || "").trim();
   const key = fareKey_(from, to);
@@ -1343,7 +1501,34 @@ function resolveFareForRecord_(record, amount) {
   );
   const hit = findFare_(key);
   if (!hit || !hit.fare) {
-    return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    const unit = fareUnitFromAmount_(amount, round, trips);
+    if (!unit) {
+      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    }
+    // マスタへの登録に失敗しても申請そのものは通す（申請を落とさない）。
+    try {
+      saveFare_({
+        key: key,
+        from: from,
+        to: to,
+        fare: unit,
+        route: "",
+        source: "",
+        checkedAt: new Date().toISOString(),
+        checkedBy: "申請（" + (applicant || "不明") + "）",
+      });
+    } catch (err) {
+      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    }
+    return {
+      from: from,
+      to: to,
+      round: round,
+      trips: trips,
+      unit: unit,
+      expected: fareTotal_(unit, round, trips),
+      check: "registered",
+    };
   }
   const expected = fareTotal_(hit.fare, round, trips);
   return {
@@ -1474,24 +1659,21 @@ function actionReceiptImage_(body) {
   const id = String(body.imageFileId || "").trim();
   if (!id) throw new Error("画像が指定されていません");
 
-  // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）
-  const values = getSheet_().getDataRange().getValues();
-  const head = headerKeys_(values[0], EXPENSE_COLUMNS);
-  const cFile = head.indexOf("imageFileId");
-  const cApplicant = head.indexOf("applicantId");
-  let allowed = false;
-  let found = false;
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][cFile]) !== id) continue;
-    found = true;
-    allowed =
-      !!u.legacy ||
-      u.role === "admin" ||
-      String(values[i][cApplicant]) === u.username;
-    break;
+  // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）。
+  // 画像1枚ごとにシート全体を読むと一覧表示が重くなるため、該当行だけを引く。
+  const row = findRowByColumn_(getSheet_(), "imageFileId", id);
+  if (row < 0) throw new Error("画像が見つかりません");
+  if (!u.legacy && u.role !== "admin") {
+    const sheet = getSheet_();
+    const head = headerKeys_(
+      sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
+      EXPENSE_COLUMNS
+    );
+    const applicantId = String(
+      sheet.getRange(row, head.indexOf("applicantId") + 1).getValue()
+    );
+    if (applicantId !== u.username) throw new Error("forbidden");
   }
-  if (!found) throw new Error("画像が見つかりません");
-  if (!allowed) throw new Error("forbidden");
 
   const file = DriveApp.getFileById(id);
   let blob = null;
@@ -1678,6 +1860,25 @@ function applyVendorMemory_(fields, memory) {
 }
 
 /** ②誤読事例: 過去に間違えた読み取りをプロンプトへ添える */
+/**
+ * 今回のAIの読み取りが、この店舗で過去に実際にあった誤読と同じ値かを判定する。
+ * 同じ値を出しているなら、その誤読を伝えて読み直す価値がある。
+ * 違う値なら（正しく読めたか、未知の誤りか）読み直しても直せる根拠が無い。
+ */
+function repeatsKnownMistake_(fields, mistakes) {
+  if (!fields || !mistakes || !mistakes.length) return false;
+  const amount = Math.max(0, Math.round(Number(fields.amount) || 0));
+  const date = String(fields.date || "");
+  const vendorKey = vendorKey_(fields.vendor);
+  for (let i = 0; i < mistakes.length; i++) {
+    const m = mistakes[i];
+    if (m.amountWrong && amount > 0 && amount === Number(m.aiAmount)) return true;
+    if (m.dateWrong && date && date === String(m.aiDate)) return true;
+    if (m.vendorWrong && vendorKey && vendorKey === vendorKey_(m.aiVendor)) return true;
+  }
+  return false;
+}
+
 function buildCorrectionHint_(memory) {
   const lines = memory.mistakes.map(function (m) {
     const parts = [];
@@ -1819,10 +2020,13 @@ function buildReceiptPrompt_(hint) {
     "重要: 写真は90度・180度回転している場合や、斜め・影・感熱紙のかすれがある場合があります。" +
     "文字の向きを判断し、必要なら頭の中で回転させて正しく読んでください。\n\n" +
     "手順を必ず守ってください:\n" +
-    "手順1: まず raw_text に、判断の根拠となる行を上から順に書き起こす" +
-    "（店名・日付・合計金額・主要な品目・支払方法。最大20行程度に絞り、住所や電話番号、" +
-    "同種の品目の羅列は省略してよい。読めない箇所は ? と書く）。\n" +
-    "手順2: その書き起こしを根拠に、他の項目を埋める。書き起こしに無い情報を創作しないこと。\n\n" +
+    // raw_text は精度のための「根拠」だが、応答時間は出力の長さでほぼ決まる。
+    // 全文を書き写させると解析が目に見えて遅くなるため、判断の決め手になる行だけに絞る。
+    "手順1: まず raw_text に、判断の決め手になる行だけを書き写す" +
+    "（店名の行・発行日の行・合計金額の行の3行が基本。判断に迷ったときだけ" +
+    "根拠になる行を足し、多くても" + RECEIPT_RAW_TEXT_MAX_LINES + "行まで）。" +
+    "品目の羅列・住所・電話番号・登録番号は書かない。読めない箇所は ? と書く。\n" +
+    "手順2: その書き写しを根拠に、他の項目を埋める。書き写しに無い情報を創作しないこと。\n\n" +
     "各項目のルール:\n" +
     "・date: 発行日を yyyy-MM-dd で。和暦は西暦へ変換（令和N年 = 2018+N。例: 令和6年→2024年、R8→2026年）。" +
     "『2026年7月15日』『26/07/15』『7/15』等の表記に対応。年の記載が無い場合は " + today + " を基準に" +
@@ -2112,7 +2316,10 @@ function actionAnalyzeReceipt_(body) {
   let memory = buildVendorMemory_(vendorKey_(fields.vendor));
   let retried = false;
 
-  if (memory && memory.mistakes.length) {
+  // 読み直しはAI呼び出しがもう1回増えるので、今回の読み取りが過去の誤読を
+  // 実際に再現したときだけ行う。誤読履歴があるだけで毎回読み直すと、
+  // よく使う店舗ほど解析が遅くなってしまう。
+  if (memory && repeatsKnownMistake_(fields, memory.mistakes)) {
     try {
       const out2 = analyze(buildCorrectionHint_(memory));
       const f2 = out2.fields || out2;

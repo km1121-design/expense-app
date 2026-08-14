@@ -301,7 +301,7 @@ assert.strictEqual(res.learned.applied.length, 0);
 assert.strictEqual(res.learned.retried, false);
 assert.strictEqual(res.fields.vendor, "初見の店");
 
-// (b) 誤読履歴のある店舗 → ヒント付きで読み直し、さらに辞書補正が乗る
+// (b) 過去の誤読を再現した場合のみ、ヒント付きで読み直し、さらに辞書補正が乗る
 g.logCorrection_(
   { vendor: "そば処ふじ", date: "2026-07-02", amount: 1100, category: "会議費", description: "打合せ昼食" },
   { vendor: "そば処ふじ", date: "2026-07-02", amount: 1000, category: "その他", description: "飲食", rawText: "小計 1000 合計 1100" },
@@ -313,19 +313,56 @@ g.logCorrection_(
   "yamada"
 );
 calls.length = 0;
-g.analyzeWithGemini_ = stubAnalyze({
-  date: "2026-07-26", amount: 1200, vendor: "そば処ふじ", category: "その他", description: "飲食",
-});
+// ヒント無しでは過去と同じ誤読（1000）を再現し、ヒント付きなら正しく読めるモデル
+g.analyzeWithGemini_ = (body, hint) => {
+  calls.push(String(hint || ""));
+  return {
+    fields: {
+      date: "2026-07-26", vendor: "そば処ふじ", category: "その他", description: "飲食",
+      amount: hint ? 1100 : 1000,
+    },
+    model: "stub",
+  };
+};
 res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
-assert.strictEqual(calls.length, 2, "誤読履歴があるので1回だけ読み直す");
+assert.strictEqual(calls.length, 2, "過去と同じ誤読を再現したので1回だけ読み直す");
 assert.strictEqual(calls[0], "");
 assert.ok(calls[1].includes("正しくは 1100 だった"), "2回目は誤読事例つき");
 assert.strictEqual(res.learned.retried, true);
 assert.strictEqual(res.learned.applied.join(","), "科目,摘要");
 assert.strictEqual(res.fields.category, "会議費");
 assert.strictEqual(res.fields.description, "打合せ昼食");
+assert.strictEqual(res.fields.amount, 1100, "読み直しで金額が直る");
+console.log("✓ actionAnalyzeReceipt_: 過去の誤読を再現したときだけ読み直し、辞書補正を適用する");
+
+// (c) 誤読履歴のある店舗でも、その誤読を再現していなければ読み直さない
+//     （履歴があるだけで毎回2回呼ぶと、よく使う店舗ほど解析が遅くなるため）
+calls.length = 0;
+g.analyzeWithGemini_ = stubAnalyze({
+  date: "2026-07-26", amount: 1200, vendor: "そば処ふじ", category: "その他", description: "飲食",
+});
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(calls.length, 1, "既知の誤読と違う金額ならAI呼び出しは1回");
+assert.strictEqual(res.learned.retried, false);
 assert.strictEqual(res.fields.amount, 1200, "今回の金額はそのまま");
-console.log("✓ actionAnalyzeReceipt_: 誤読履歴のある店舗のみ読み直し、辞書補正を適用する");
+assert.strictEqual(res.fields.category, "会議費", "辞書補正は読み直し無しでも効く");
+assert.strictEqual(
+  g.repeatsKnownMistake_({ amount: 1000 }, [{ amountWrong: true, aiAmount: 1000 }]),
+  true,
+  "同じ誤読金額なら再現とみなす"
+);
+assert.strictEqual(
+  g.repeatsKnownMistake_({ amount: 1200 }, [{ amountWrong: true, aiAmount: 1000 }]),
+  false
+);
+assert.strictEqual(
+  g.repeatsKnownMistake_({ vendor: "株式会社そば処ふじ" }, [
+    { vendorWrong: true, aiVendor: "そば処ふじ" },
+  ]),
+  true,
+  "店名の再現は表記ゆれを吸収して判定する"
+);
+console.log("✓ 既知の誤読を再現していなければ読み直さない（AI呼び出しは1回）");
 
 /* -------- 11. 読み直しが失敗しても初回結果で応答する -------- */
 calls.length = 0;
@@ -333,12 +370,13 @@ let n2 = 0;
 g.analyzeWithGemini_ = function (body, hint) {
   calls.push(String(hint || ""));
   if (n2++ > 0) throw new Error("503 overloaded");
-  return { fields: { date: "2026-07-27", amount: 1300, vendor: "そば処ふじ", category: "その他", description: "飲食" }, model: "stub" };
+  // 過去と同じ誤読（1000）を再現するので読み直しに進み、その読み直しが失敗する
+  return { fields: { date: "2026-07-27", amount: 1000, vendor: "そば処ふじ", category: "その他", description: "飲食" }, model: "stub" };
 };
 res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
 assert.strictEqual(calls.length, 2);
 assert.strictEqual(res.learned.retried, false);
-assert.strictEqual(res.fields.amount, 1300, "初回結果を採用");
+assert.strictEqual(res.fields.amount, 1000, "初回結果を採用");
 assert.strictEqual(res.fields.category, "会議費", "辞書補正は効いたまま");
 console.log("✓ 読み直しが失敗しても初回結果＋辞書補正で応答する");
 
@@ -405,10 +443,17 @@ const spoofed = g.resolveFareForRecord_(
   { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: false, fareTrips: 1, fareUnit: 99999 }, 510);
 assert.strictEqual(spoofed.unit, 510, "申請側の片道運賃は信用しない");
 assert.strictEqual(spoofed.check, "match");
-// マスタに無い区間は「未照合」
-const unknown = g.resolveFareForRecord_({ fareFrom: "知らない駅A", fareTo: "知らない駅B" }, 300);
+// マスタに無く、申請額からも片道運賃を割り出せない区間は「未照合」
+// （往復×2回＝4で割り切れない＝運賃以外が混ざっているとみなす）
+const unknown = g.resolveFareForRecord_(
+  { fareFrom: "知らない駅A", fareTo: "知らない駅B", fareRound: true, fareTrips: 2 }, 301);
 assert.strictEqual(unknown.check, "unchecked");
 assert.strictEqual(unknown.expected, 0);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter((f) => f.to === "知らない駅B").length,
+  0,
+  "割り切れない申請は運賃マスタへ登録しない"
+);
 // 区間の指定が無ければ照合対象外
 assert.strictEqual(g.resolveFareForRecord_({}, 300).check, "");
 console.log("✓ resolveFareForRecord_: 想定金額をマスタから再計算し、申請額との一致/相違を判定する");
@@ -533,6 +578,72 @@ assert.strictEqual(defaultLookup.ok, true);
 assert.strictEqual(defaultLookup.registered, false);
 assert.strictEqual(defaultLookup.webDisabled, true, "運賃マスタのみの運用として応答する");
 console.log("✓ Web照合は既定で無効で、未登録区間は案内だけを返す");
+
+/* -------- 16.8 申請した区間が運賃マスタへ自動登録される -------- */
+// 未登録の区間で申請すると、申請額から片道運賃を割り戻してマスタへ入る。
+// 登録の元になった申請は「一致」ではなく「新規登録」（確認はまだ）。
+const firstClaim = g.resolveFareForRecord_(
+  { fareFrom: "門前仲町", fareTo: "九段下", fareRound: true, fareTrips: 3 },
+  1200,
+  "山田太郎"
+);
+assert.strictEqual(firstClaim.check, "registered");
+assert.strictEqual(firstClaim.unit, 200, "往復×3回＝6で割り戻す");
+assert.strictEqual(firstClaim.expected, 1200);
+const autoAdded = g
+  .actionListFares_({ token: "" })
+  .items.filter((f) => f.to === "九段下" || f.from === "九段下");
+assert.strictEqual(autoAdded.length, 1, "運賃マスタへ1行だけ入る");
+assert.strictEqual(autoAdded[0].fare, 200);
+assert.strictEqual(
+  autoAdded[0].checkedBy,
+  "申請（山田太郎）",
+  "誰の申請から入った運賃かを残す"
+);
+
+// 2回目以降は登録済みの運賃で照合する（逆方向でも同じ区間として扱う）
+const secondClaim = g.resolveFareForRecord_(
+  { fareFrom: "九段下駅", fareTo: "門前仲町駅", fareRound: false, fareTrips: 1 },
+  200,
+  "鈴木花子"
+);
+assert.strictEqual(secondClaim.check, "match", "2回目からは自動で照合される");
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "門前仲町", fareTo: "九段下", fareRound: false, fareTrips: 1 }, 900, "鈴木花子"
+  ).check,
+  "diff",
+  "登録済みの区間は申請額を上書きせず差額として出す"
+);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter((f) => f.to === "九段下" || f.from === "九段下")[0]
+    .fare,
+  200,
+  "後からの申請でマスタの運賃は書き換わらない"
+);
+
+// 桁の打ち間違いを疑う高額と、金額が無い申請は登録しない
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "沖縄A", fareTo: "沖縄B", fareRound: false, fareTrips: 1 }, 9999999, "山田太郎"
+  ).check,
+  "unchecked",
+  "上限を超える額は運賃マスタへ入れない"
+);
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "無料A", fareTo: "無料B", fareRound: false, fareTrips: 1 }, 0, "山田太郎"
+  ).check,
+  "unchecked",
+  "金額0の申請は運賃マスタへ入れない"
+);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter(
+    (f) => f.from.indexOf("沖縄") === 0 || f.from.indexOf("無料") === 0
+  ).length,
+  0
+);
+console.log("✓ 申請した区間が運賃マスタへ自動登録され、2回目以降は自動で照合される");
 
 /* -------- 17. AIの応答から運賃JSONを取り出す -------- */
 assert.strictEqual(

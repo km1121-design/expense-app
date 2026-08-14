@@ -319,6 +319,31 @@ function updatePendingUI() {
 }
 
 /* ---------- リポジトリ層 ---------- */
+/**
+ * 起動に必要な情報（接続状態・ログイン中のユーザー・申請一覧）をまとめて取る。
+ * 新しいバックエンドは1往復で返す。画面とバックエンドは別々に配信されるため、
+ * バックエンドがまだ古い場合は従来の status → me → 一覧取得へ自動で切り替える。
+ */
+async function fetchBootstrap() {
+  try {
+    return await apiPost({ action: "bootstrap" });
+  } catch (err) {
+    // 旧バックエンドは知らないアクションとして返す。それ以外の失敗は呼び出し元へ
+    if (!/unknown action/i.test(String((err && err.message) || err))) throw err;
+  }
+  const st = await apiPost({ action: "status", token: "" });
+  const out = { ...st, user: null, departments: null, records: null };
+  if (!st.authEnabled || !state.session) return out;
+  try {
+    const me = await apiPost({ action: "me" });
+    out.user = me.user;
+    out.departments = me.departments || null;
+  } catch (err) {
+    if (!(err instanceof AuthError)) throw err;
+  }
+  return out; // records は含めない → 呼び出し元が refreshFromCloud で取りに行く
+}
+
 async function refreshFromCloud() {
   if (!cloudEnabled()) {
     loadCache();
@@ -1008,6 +1033,33 @@ function preprocessForOcr(file) {
   });
 }
 
+/** OCRライブラリ（Tesseract.js）のCDN。読み込みは実際に使うときだけ行う */
+const TESSERACT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+let tesseractLoading = null;
+
+/**
+ * Tesseract.js を必要になった時点で読み込む。
+ *
+ * AIキーが設定されている運用ではOCRは一度も使わない。起動時に読み込むと、
+ * その通信が終わるまでアプリのJSが動かず、起動時間がまるごと延びてしまう。
+ * 2回目以降は同じ Promise を返すので、読み込みは高々1回。
+ */
+function ensureTesseract() {
+  if (typeof Tesseract !== "undefined") return Promise.resolve(true);
+  if (tesseractLoading) return tesseractLoading;
+  tesseractLoading = new Promise((resolve) => {
+    const el = document.createElement("script");
+    el.src = TESSERACT_URL;
+    el.onload = () => resolve(typeof Tesseract !== "undefined");
+    el.onerror = () => {
+      tesseractLoading = null; // 次回また試せるようにする
+      resolve(false);
+    };
+    document.head.appendChild(el);
+  });
+  return tesseractLoading;
+}
+
 /** Tesseract をレシート向け設定（単一ブロック・空白保持）で実行 */
 async function tesseractRecognize(input, onProgress) {
   if (Tesseract.createWorker) {
@@ -1144,14 +1196,16 @@ async function runOcr(file) {
   const rawWrap = $("#ocrRawWrap");
   const rawEl = $("#ocrRaw");
 
-  if (typeof Tesseract === "undefined") {
-    toast("OCRライブラリを読み込めませんでした（ネットワークをご確認ください）");
-    return;
-  }
-
   statusEl.hidden = false;
   rawWrap.hidden = true;
   barFill.style.width = "0%";
+  statusText.textContent = "OCRの準備中…";
+
+  if (!(await ensureTesseract())) {
+    statusEl.hidden = true;
+    toast("OCRライブラリを読み込めませんでした（ネットワークをご確認ください）");
+    return;
+  }
   statusText.textContent = "画像を解析中…";
 
   try {
@@ -1362,21 +1416,31 @@ function renderFareResult() {
   const amount = Number($("#expAmount").value);
   const lines = [`想定金額：${fareBreakdown(f)}`];
   if (f.route) lines.push(`経路：${f.route}`);
-  // 手で登録した運賃は人が確認済みなので、出典が無くても警告しない
+  // 手で登録した運賃と、過去の申請から入った運賃はWeb検索を通っていないので、
+  // 「検索の出典が無い」ことを警告しても意味がない（出どころを書くだけにする）
   const manual = /^手動/.test(f.checkedBy || "");
+  const fromClaim = /^申請/.test(f.checkedBy || "");
+  // 「申請（山田太郎）」から申請者名だけを取り出す（括弧の入れ子を避ける）
+  const claimBy = String(f.checkedBy || "")
+    .replace(/^申請[（(]?/, "")
+    .replace(/[）)]$/, "");
   lines.push(
     manual
       ? `運賃マスタの登録値で照合（${f.checkedBy}）`
+      : fromClaim
+      ? `運賃マスタの登録値で照合（${
+          claimBy ? claimBy + " さんの" : ""
+        }過去の申請額から登録された区間）`
       : f.cached
       ? "運賃マスタの登録値で照合（Web検索なし）"
       : "Web検索で照合し、運賃マスタへ登録しました"
   );
   // AIが答えたのに出典が無い＝検索が使われず記憶で答えた可能性があり、裏付けが弱い
-  if (!manual && !f.source) {
+  if (!manual && !fromClaim && !f.source) {
     lines.push("⚠️ 検索の出典が取れていません。運賃が正しいか必ず確認してください");
   }
 
-  let cls = manual || f.source ? "fare-result is-ok" : "fare-result is-warn";
+  let cls = manual || fromClaim || f.source ? "fare-result is-ok" : "fare-result is-warn";
   if (!amount) {
     lines.push("金額が空のため「金額に反映」で入力できます");
   } else if (amount === f.expected) {
@@ -1878,6 +1942,11 @@ function fareBadge(e) {
   const label = {
     match: ["一致", "is-match", "申請額が想定運賃と一致"],
     diff: ["差額あり", "is-diff", "申請額が想定運賃と違う"],
+    registered: [
+      "新規登録",
+      "is-registered",
+      "この申請額から運賃マスタへ登録した区間（金額の確認は未了）",
+    ],
     unchecked: ["未照合", "is-unchecked", "運賃マスタに区間が無く照合できていない"],
   }[e.fareCheck];
   if (!label) return "";
@@ -2457,14 +2526,27 @@ async function initMode() {
     return;
   }
 
-  // クラウドモード: 認証状態を確認
+  // クラウドモード。
+  // 通信を待つ前に、前回の内容をそのまま描いておく。サーバーの応答が返るまで
+  // 白い画面を見せないための措置で、返ってきた時点で中身を差し替える。
+  loadSession();
+  if (state.session) {
+    state.isAdmin = state.session.user.role === "admin";
+    loadCache();
+    syncAdminUI();
+    applySessionUI();
+    applyDeptUI();
+    hideAuthOverlay();
+    render();
+  }
+
   setSync("syncing");
   try {
-    const st = await apiPost({ action: "status", token: "" });
-    state.authEnabled = !!st.authEnabled;
-    state.autoApprove = !!st.autoApprove;
-    state.aiOcr = !!st.aiOcr;
-    state.features = st.features || {};
+    const boot = await fetchBootstrap();
+    state.authEnabled = !!boot.authEnabled;
+    state.autoApprove = !!boot.autoApprove;
+    state.aiOcr = !!boot.aiOcr;
+    state.features = boot.features || {};
     applyBackendNotice();
 
     if (!state.authEnabled) {
@@ -2474,28 +2556,35 @@ async function initMode() {
       return;
     }
 
-    loadSession();
-    if (state.session) {
-      try {
-        const me = await apiPost({ action: "me" });
-        state.session.user = me.user;
-        saveSession();
-        if (me.departments) state.departments = me.departments;
-        state.isAdmin = me.user.role === "admin";
-        syncAdminUI();
-        applySessionUI();
-        applyDeptUI();
-        hideAuthOverlay();
+    if (state.session && boot.user) {
+      state.session.user = boot.user;
+      saveSession();
+      if (boot.departments) state.departments = boot.departments;
+      state.isAdmin = boot.user.role === "admin";
+      syncAdminUI();
+      applySessionUI();
+      applyDeptUI();
+      hideAuthOverlay();
+      if (boot.records) {
+        // bootstrap が一覧まで返しているので、取得し直さない
+        state.expenses = boot.records.map(normalizeRecord);
+        saveCache();
+        setSync("synced");
+        await flushQueue();
+        render();
+      } else {
         await refreshFromCloud();
-        return;
-      } catch (err) {
-        state.session = null;
-        saveSession();
       }
+      return;
     }
+    // セッションが無い／期限切れ。キャッシュを消してログイン画面へ
+    state.session = null;
+    saveSession();
+    state.expenses = [];
     state.isAdmin = false;
     syncAdminUI();
     applySessionUI();
+    render();
     showAuthOverlay("login");
     setSync("synced");
   } catch (err) {
