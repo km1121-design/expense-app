@@ -835,6 +835,10 @@ body {
   background: var(--accent-soft);
   color: var(--accent-strong);
 }
+.fare-badge.is-registered {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
 .fare-badge.is-unchecked {
   background: var(--surface-2);
   color: var(--muted);

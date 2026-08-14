@@ -405,10 +405,17 @@ const spoofed = g.resolveFareForRecord_(
   { fareFrom: "新井薬師前", fareTo: "武蔵浦和", fareRound: false, fareTrips: 1, fareUnit: 99999 }, 510);
 assert.strictEqual(spoofed.unit, 510, "申請側の片道運賃は信用しない");
 assert.strictEqual(spoofed.check, "match");
-// マスタに無い区間は「未照合」
-const unknown = g.resolveFareForRecord_({ fareFrom: "知らない駅A", fareTo: "知らない駅B" }, 300);
+// マスタに無く、申請額からも片道運賃を割り出せない区間は「未照合」
+// （往復×2回＝4で割り切れない＝運賃以外が混ざっているとみなす）
+const unknown = g.resolveFareForRecord_(
+  { fareFrom: "知らない駅A", fareTo: "知らない駅B", fareRound: true, fareTrips: 2 }, 301);
 assert.strictEqual(unknown.check, "unchecked");
 assert.strictEqual(unknown.expected, 0);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter((f) => f.to === "知らない駅B").length,
+  0,
+  "割り切れない申請は運賃マスタへ登録しない"
+);
 // 区間の指定が無ければ照合対象外
 assert.strictEqual(g.resolveFareForRecord_({}, 300).check, "");
 console.log("✓ resolveFareForRecord_: 想定金額をマスタから再計算し、申請額との一致/相違を判定する");
@@ -533,6 +540,72 @@ assert.strictEqual(defaultLookup.ok, true);
 assert.strictEqual(defaultLookup.registered, false);
 assert.strictEqual(defaultLookup.webDisabled, true, "運賃マスタのみの運用として応答する");
 console.log("✓ Web照合は既定で無効で、未登録区間は案内だけを返す");
+
+/* -------- 16.8 申請した区間が運賃マスタへ自動登録される -------- */
+// 未登録の区間で申請すると、申請額から片道運賃を割り戻してマスタへ入る。
+// 登録の元になった申請は「一致」ではなく「新規登録」（確認はまだ）。
+const firstClaim = g.resolveFareForRecord_(
+  { fareFrom: "門前仲町", fareTo: "九段下", fareRound: true, fareTrips: 3 },
+  1200,
+  "山田太郎"
+);
+assert.strictEqual(firstClaim.check, "registered");
+assert.strictEqual(firstClaim.unit, 200, "往復×3回＝6で割り戻す");
+assert.strictEqual(firstClaim.expected, 1200);
+const autoAdded = g
+  .actionListFares_({ token: "" })
+  .items.filter((f) => f.to === "九段下" || f.from === "九段下");
+assert.strictEqual(autoAdded.length, 1, "運賃マスタへ1行だけ入る");
+assert.strictEqual(autoAdded[0].fare, 200);
+assert.strictEqual(
+  autoAdded[0].checkedBy,
+  "申請（山田太郎）",
+  "誰の申請から入った運賃かを残す"
+);
+
+// 2回目以降は登録済みの運賃で照合する（逆方向でも同じ区間として扱う）
+const secondClaim = g.resolveFareForRecord_(
+  { fareFrom: "九段下駅", fareTo: "門前仲町駅", fareRound: false, fareTrips: 1 },
+  200,
+  "鈴木花子"
+);
+assert.strictEqual(secondClaim.check, "match", "2回目からは自動で照合される");
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "門前仲町", fareTo: "九段下", fareRound: false, fareTrips: 1 }, 900, "鈴木花子"
+  ).check,
+  "diff",
+  "登録済みの区間は申請額を上書きせず差額として出す"
+);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter((f) => f.to === "九段下" || f.from === "九段下")[0]
+    .fare,
+  200,
+  "後からの申請でマスタの運賃は書き換わらない"
+);
+
+// 桁の打ち間違いを疑う高額と、金額が無い申請は登録しない
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "沖縄A", fareTo: "沖縄B", fareRound: false, fareTrips: 1 }, 9999999, "山田太郎"
+  ).check,
+  "unchecked",
+  "上限を超える額は運賃マスタへ入れない"
+);
+assert.strictEqual(
+  g.resolveFareForRecord_(
+    { fareFrom: "無料A", fareTo: "無料B", fareRound: false, fareTrips: 1 }, 0, "山田太郎"
+  ).check,
+  "unchecked",
+  "金額0の申請は運賃マスタへ入れない"
+);
+assert.strictEqual(
+  g.actionListFares_({ token: "" }).items.filter(
+    (f) => f.from.indexOf("沖縄") === 0 || f.from.indexOf("無料") === 0
+  ).length,
+  0
+);
+console.log("✓ 申請した区間が運賃マスタへ自動登録され、2回目以降は自動で照合される");
 
 /* -------- 17. AIの応答から運賃JSONを取り出す -------- */
 assert.strictEqual(

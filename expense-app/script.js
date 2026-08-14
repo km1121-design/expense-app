@@ -1362,21 +1362,31 @@ function renderFareResult() {
   const amount = Number($("#expAmount").value);
   const lines = [`想定金額：${fareBreakdown(f)}`];
   if (f.route) lines.push(`経路：${f.route}`);
-  // 手で登録した運賃は人が確認済みなので、出典が無くても警告しない
+  // 手で登録した運賃と、過去の申請から入った運賃はWeb検索を通っていないので、
+  // 「検索の出典が無い」ことを警告しても意味がない（出どころを書くだけにする）
   const manual = /^手動/.test(f.checkedBy || "");
+  const fromClaim = /^申請/.test(f.checkedBy || "");
+  // 「申請（山田太郎）」から申請者名だけを取り出す（括弧の入れ子を避ける）
+  const claimBy = String(f.checkedBy || "")
+    .replace(/^申請[（(]?/, "")
+    .replace(/[）)]$/, "");
   lines.push(
     manual
       ? `運賃マスタの登録値で照合（${f.checkedBy}）`
+      : fromClaim
+      ? `運賃マスタの登録値で照合（${
+          claimBy ? claimBy + " さんの" : ""
+        }過去の申請額から登録された区間）`
       : f.cached
       ? "運賃マスタの登録値で照合（Web検索なし）"
       : "Web検索で照合し、運賃マスタへ登録しました"
   );
   // AIが答えたのに出典が無い＝検索が使われず記憶で答えた可能性があり、裏付けが弱い
-  if (!manual && !f.source) {
+  if (!manual && !fromClaim && !f.source) {
     lines.push("⚠️ 検索の出典が取れていません。運賃が正しいか必ず確認してください");
   }
 
-  let cls = manual || f.source ? "fare-result is-ok" : "fare-result is-warn";
+  let cls = manual || fromClaim || f.source ? "fare-result is-ok" : "fare-result is-warn";
   if (!amount) {
     lines.push("金額が空のため「金額に反映」で入力できます");
   } else if (amount === f.expected) {
@@ -1878,6 +1888,11 @@ function fareBadge(e) {
   const label = {
     match: ["一致", "is-match", "申請額が想定運賃と一致"],
     diff: ["差額あり", "is-diff", "申請額が想定運賃と違う"],
+    registered: [
+      "新規登録",
+      "is-registered",
+      "この申請額から運賃マスタへ登録した区間（金額の確認は未了）",
+    ],
     unchecked: ["未照合", "is-unchecked", "運賃マスタに区間が無く照合できていない"],
   }[e.fareCheck];
   if (!label) return "";

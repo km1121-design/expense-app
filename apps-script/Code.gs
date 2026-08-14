@@ -887,7 +887,8 @@ function createExpense_(record, user) {
   }
   // 交通費の運賃照合。片道運賃は運賃マスタ（サーバー側の正）から取り直して
   // 想定金額を計算するため、クライアントから送られた金額は信用しない。
-  const fare = resolveFareForRecord_(record, Number(record.amount) || 0);
+  // 未登録の区間は、この申請額から運賃マスタへ登録する（誰が入れたか残す）。
+  const fare = resolveFareForRecord_(record, Number(record.amount) || 0, applicant);
 
   // 自動承認モードでは申請と同時に承認済みにする
   const auto = isAutoApprove_();
@@ -979,6 +980,13 @@ function deleteExpense_(id, user) {
 
 /** 1回の申請で認める回数の上限（打ち間違いで巨額にならないように） */
 const FARE_TRIPS_MAX = 60;
+
+/**
+ * 申請から運賃マスタへ自動登録するときに認める片道運賃の上限。
+ * 桁を打ち間違えた申請がそのままマスタになると、以降の申請が誤った金額で
+ * 「一致」と判定されてしまうため、明らかに運賃ではない額は登録しない。
+ */
+const FARE_UNIT_MAX = 100000;
 
 /** 駅名の照合キー。表記ゆれ（全半角・空白・「駅」の有無）を吸収する */
 function stationKey_(s) {
@@ -1084,7 +1092,8 @@ function unregisteredFare_(from, to, round, trips, justDisabled) {
     source: "",
     message:
       "この区間は運賃マスタに未登録です。「🚉 路線検索で調べる」で運賃を確認して" +
-      "金額を入力してください。管理者が運賃マスタへ登録すると、次回から自動で照合されます。" +
+      "金額を入力してください。この申請の金額から運賃マスタへ登録されるので、" +
+      "次回からは自動で照合されます。" +
       (justDisabled
         ? "（無料枠ではWeb検索による照合が使えないため、以降はマスタのみで照合します）"
         : ""),
@@ -1323,15 +1332,40 @@ function groundingSource_(cand) {
 }
 
 /**
+ * 申請額から片道運賃を割り戻す。運賃マスタへ登録してよい額のときだけ返し、
+ * 登録すべきでないときは 0 を返す。
+ *
+ * 往復・回数で割り切れない金額は、申請額に運賃以外（特急券など）が混ざって
+ * いるか、区間か回数の入力が実態と合っていない。そのまま割ると端数の分だけ
+ * 誤った運賃がマスタに残るため、登録しない。
+ */
+function fareUnitFromAmount_(amount, round, trips) {
+  const total = Math.round(Number(amount) || 0);
+  if (total <= 0) return 0;
+  const n = Math.min(FARE_TRIPS_MAX, Math.max(1, Math.round(Number(trips) || 1)));
+  const divisor = (round ? 2 : 1) * n;
+  if (total % divisor !== 0) return 0;
+  const unit = total / divisor;
+  if (unit <= 0 || unit > FARE_UNIT_MAX) return 0;
+  return unit;
+}
+
+/**
  * 申請に付いてきた区間から、保存する運賃照合の内容を決める。
  * 片道運賃は運賃マスタから取り直すため、申請者側で書き換えられない。
- * マスタに無い区間は「未照合」として区間と回数だけ残す。
- *   match     : 申請額 = 想定金額
- *   diff      : 申請額 ≠ 想定金額（管理者が確認する）
- *   unchecked : 区間はあるがマスタに運賃が無い
- *   ""        : 区間の指定なし（交通費以外など）
+ *
+ * マスタに無い区間は、申請額から片道運賃を割り戻してマスタへ登録する。
+ * 運用しながら区間が貯まっていくようにするためで、以降の同じ区間の申請は
+ * 自動で照合できる。ただし登録の元になった申請そのものは「一致」にしない
+ * （自分の申請額で自分を照合しても確認したことにならない）。マスタ側には
+ * 「申請（申請者名）」と記録されるので、管理者が後から確認・訂正できる。
+ *   match      : 申請額 = 想定金額
+ *   diff       : 申請額 ≠ 想定金額（管理者が確認する）
+ *   registered : この申請額から運賃マスタへ登録した（まだ誰も確認していない）
+ *   unchecked  : 区間はあるが、マスタにも無く申請額からも割り出せない
+ *   ""         : 区間の指定なし（交通費以外など）
  */
-function resolveFareForRecord_(record, amount) {
+function resolveFareForRecord_(record, amount, applicant) {
   const from = String((record && record.fareFrom) || "").trim();
   const to = String((record && record.fareTo) || "").trim();
   const key = fareKey_(from, to);
@@ -1343,7 +1377,34 @@ function resolveFareForRecord_(record, amount) {
   );
   const hit = findFare_(key);
   if (!hit || !hit.fare) {
-    return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    const unit = fareUnitFromAmount_(amount, round, trips);
+    if (!unit) {
+      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    }
+    // マスタへの登録に失敗しても申請そのものは通す（申請を落とさない）。
+    try {
+      saveFare_({
+        key: key,
+        from: from,
+        to: to,
+        fare: unit,
+        route: "",
+        source: "",
+        checkedAt: new Date().toISOString(),
+        checkedBy: "申請（" + (applicant || "不明") + "）",
+      });
+    } catch (err) {
+      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
+    }
+    return {
+      from: from,
+      to: to,
+      round: round,
+      trips: trips,
+      unit: unit,
+      expected: fareTotal_(unit, round, trips),
+      check: "registered",
+    };
   }
   const expected = fareTotal_(hit.fare, round, trips);
   return {
