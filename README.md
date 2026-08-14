@@ -45,6 +45,7 @@ docs/           仕様書
 - 仕様: [`docs/expense-app-spec.md`](docs/expense-app-spec.md)
 - バックエンド構築: [`apps-script/README.md`](apps-script/README.md)
 - アプリ詳細: [`expense-app/README.md`](expense-app/README.md)
+- 変更履歴: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## デプロイ
 
