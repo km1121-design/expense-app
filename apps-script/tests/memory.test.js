@@ -16,17 +16,30 @@ class FakeSheet {
   constructor(name, rows) {
     this.name = name;
     this.rows = rows || [];
+    // 数式は値と別に持つ。"=" で始まる値を書いたら数式にもなる（実物と同じ挙動）
+    this.formulas = [];
   }
   getName() { return this.name; }
   setName(n) { renameSheet(this, n); }
   getLastRow() { return this.rows.length; }
-  getLastColumn() { return this.rows[0] ? this.rows[0].length : 0; }
+  getLastColumn() {
+    return this.rows.reduce((max, r) => Math.max(max, (r || []).length), 0);
+  }
   appendRow(r) { this.rows.push(r.slice()); }
   setFrozenRows() {}
   getDataRange() {
     return this.getRange(1, 1, this.getLastRow(), this.getLastColumn());
   }
-  deleteRow(n) { this.rows.splice(n - 1, 1); }
+  deleteRow(n) { this.rows.splice(n - 1, 1); this.formulas.splice(n - 1, 1); }
+  deleteRows(n, count) {
+    this.rows.splice(n - 1, count);
+    this.formulas.splice(n - 1, count);
+  }
+  /** 行の挿入。実物は参照を自動で追随させるが、ここでは行をずらすだけ。 */
+  insertRowBefore(n) {
+    this.rows.splice(n - 1, 0, []);
+    this.formulas.splice(n - 1, 0, []);
+  }
   getRange(row, col, numRows, numCols) {
     const self = this;
     return {
@@ -43,11 +56,47 @@ class FakeSheet {
       setValues(vals) {
         vals.forEach((line, i) => {
           const target = (self.rows[row - 1 + i] = self.rows[row - 1 + i] || []);
-          line.forEach((v, j) => { target[col - 1 + j] = v; });
+          const fRow = (self.formulas[row - 1 + i] = self.formulas[row - 1 + i] || []);
+          line.forEach((v, j) => {
+            target[col - 1 + j] = v;
+            // "=" で始まる文字列を書くと数式になる
+            fRow[col - 1 + j] = typeof v === "string" && v[0] === "=" ? v : "";
+          });
         });
       },
-      setValue(v) { self.rows[row - 1][col - 1] = v; },
-      getValue() { return self.rows[row - 1][col - 1]; },
+      getFormulas() {
+        const out = [];
+        for (let i = 0; i < numRows; i++) {
+          const src = self.formulas[row - 1 + i] || [];
+          const line = [];
+          for (let j = 0; j < numCols; j++) line.push(src[col - 1 + j] || "");
+          out.push(line);
+        }
+        return out;
+      },
+      setFormulas(vals) {
+        vals.forEach((line, i) => {
+          const target = (self.rows[row - 1 + i] = self.rows[row - 1 + i] || []);
+          const fRow = (self.formulas[row - 1 + i] = self.formulas[row - 1 + i] || []);
+          line.forEach((v, j) => {
+            fRow[col - 1 + j] = v;
+            target[col - 1 + j] = v;
+          });
+        });
+      },
+      getFormula() { return (self.formulas[row - 1] || [])[col - 1] || ""; },
+      setFormula(f) {
+        const target = (self.rows[row - 1] = self.rows[row - 1] || []);
+        const fRow = (self.formulas[row - 1] = self.formulas[row - 1] || []);
+        fRow[col - 1] = f;
+        target[col - 1] = f;
+      },
+      setValue(v) {
+        const target = (self.rows[row - 1] = self.rows[row - 1] || []);
+        target[col - 1] = v;
+      },
+      getValue() { return (self.rows[row - 1] || [])[col - 1]; },
+      setNumberFormat() {},
     };
   }
 }
@@ -87,8 +136,16 @@ const FAKE_SS = {
   getSheetByName: (n) => sheets[n] || null,
   insertSheet: (n) => (sheets[n] = new FakeSheet(n)),
 };
+/** PL管理モデル側のスプレッドシート（別ファイル）。連携のテストで使う。 */
+const plSheets = {};
+const FAKE_PL_SS = {
+  getId: () => "pl-model",
+  getSheetByName: (n) => plSheets[n] || null,
+  insertSheet: (n) => (plSheets[n] = new FakeSheet(n)),
+  getSheets: () => Object.keys(plSheets).map((k) => plSheets[k]),
+};
 sandbox.SpreadsheetApp.getActiveSpreadsheet = () => FAKE_SS;
-sandbox.SpreadsheetApp.openById = () => FAKE_SS;
+sandbox.SpreadsheetApp.openById = (id) => (id === "pl-model" ? FAKE_PL_SS : FAKE_SS);
 sandbox.SpreadsheetApp.create = () => FAKE_SS;
 
 // 旧版（英語タブ・英語見出し）で作られた状態を用意し、自動移行を検証する。
@@ -836,5 +893,302 @@ try {
 assert.strictEqual(attempted.length, 1, "キーが無効ならモデルを試し続けない");
 assert.ok(thrown.indexOf("API_KEY_INVALID") >= 0);
 console.log("✓ 全滅時の案内と、APIキー無効時の即時中断");
+
+/* -------- PL管理モデルへの連携 -------- */
+
+// 連携先の『経費入力テーブル』を実物と同じ形で用意する。
+// 1行目がタイトル・4行目が見出し・データは5行目から。手動入力行が1件ある。
+plSheets["経費入力テーブル"] = new FakeSheet("経費入力テーブル", [
+  ["経費入力テーブル（経費精算アプリ等から自動連携・手動入力）"],
+  [],
+  [],
+  ["日付", "担当者名", "所属事業部", "経費項目", "金額", "備考"],
+  [new Date(2026, 7, 15), "中原聖人", "人材", "広告費", 1200000, "人材広告費(8月分)"],
+]);
+const plRows = plSheets["経費入力テーブル"].rows;
+
+// 連携が無効なうちは、PL側を一切触らない
+assert.strictEqual(g.isPlSyncEnabled_(), false, "PL_SPREADSHEET_ID 未設定なら無効");
+assert.strictEqual(
+  g.safeSyncExpenseToPl_({ id: "x", status: "approved" }).reason,
+  "disabled",
+  "未設定なら何もしない（従来どおりの動作）"
+);
+assert.strictEqual(plRows.length, 5, "無効なうちはPL側の行が増えない");
+
+props["PL_SPREADSHEET_ID"] = "pl-model";
+assert.strictEqual(g.isPlSyncEnabled_(), true);
+assert.ok(
+  g.statusPayload_().features.plSync,
+  "features.plSync で連携の有無をアプリへ伝える"
+);
+console.log("✓ PL_SPREADSHEET_ID 未設定なら連携は完全に無効");
+
+// 対応表は初回に既定値がシードされ、運用側で直せる
+const maps = g.loadPlMappings_();
+assert.strictEqual(maps.department["本部"], "イベント営業", "人材以外はイベント営業へ");
+assert.strictEqual(maps.department["人材"], "人材");
+assert.strictEqual(maps.category["交通費"], "雑費交通費", "PL側の語彙へ変換する");
+assert.strictEqual(maps.category["交際費"], "接待交際費");
+assert.ok(sheets["PL連携マッピング"], "対応表タブが作られる");
+
+// 承認済みの申請が、対応表どおり変換されて追記される
+const rec = {
+  id: "p1", status: "approved", applicant: "入舩雄志", department: "本部",
+  date: "2026-08-05", category: "交通費", vendor: "JR東日本", description: "現場往復",
+  amount: 1200,
+};
+assert.strictEqual(g.syncExpenseToPl_(rec).posted, true);
+const added = plRows[5];
+// vm の中と外では Date のコンストラクタが別なので instanceof では判定できない
+const isDate = (v) => !!v && typeof v.getMonth === "function";
+assert.ok(isDate(added[0]), "日付は文字列ではなく実日付で書く（SUMIFSの条件が日付比較）");
+assert.strictEqual(added[0].getMonth(), 7, "2026-08-05 の月");
+assert.strictEqual(added[2], "イベント営業", "事業部がPL側の語彙になる");
+assert.strictEqual(added[3], "雑費交通費", "科目がPL側の語彙になる");
+assert.strictEqual(added[4], 1200);
+assert.strictEqual(added[5], "JR東日本 / 現場往復", "支払先と摘要を備考にまとめる");
+assert.strictEqual(added[6], "p1", "申請IDを残して以降の更新に備える");
+console.log("✓ 承認済みの申請が対応表どおり変換されてPLへ追記される");
+
+// 同じ申請を何度流しても重複しない（申請IDで upsert する）
+rec.amount = 1600;
+g.syncExpenseToPl_(rec);
+g.syncExpenseToPl_(rec);
+assert.strictEqual(plRows.length, 6, "申請IDが一致する行を書き換えるので増えない");
+assert.strictEqual(plRows[5][4], 1600, "金額の修正が反映される");
+console.log("✓ 同じ申請を何度同期しても重複せず、金額の修正が追随する");
+
+// 手動入力行（申請IDなし）は読み取りも書き換えもしない
+assert.strictEqual(plRows[4][1], "中原聖人", "手動入力行はそのまま残る");
+assert.strictEqual(plRows[4][4], 1200000);
+
+// 対応先の無い科目は「その他経費」へ集めて、PLから漏らさない
+g.syncExpenseToPl_({
+  id: "p2", status: "approved", applicant: "入舩雄志", department: "BAR",
+  date: "2026-08-09", category: "宿泊費", vendor: "ホテル", description: "出張",
+  amount: 9000,
+});
+assert.strictEqual(plRows[6][3], "その他経費", "対応先が無い科目は受け皿へ寄せる");
+console.log("✓ PLに行が無い科目は「その他経費」へ集めて取りこぼさない");
+
+// 対応先の無い事業部は、金額の行き先を決められないので書かずに記録へ残す
+const unmapped = g.syncExpenseToPl_({
+  id: "p3", status: "approved", applicant: "新人", department: "新規事業",
+  date: "2026-08-10", category: "交通費", amount: 500,
+});
+assert.strictEqual(unmapped.posted, false);
+assert.strictEqual(unmapped.reason, "unmapped department");
+assert.strictEqual(plRows.length, 7, "PLには書かない（別事業部のPLを汚さない）");
+assert.strictEqual(g.countPlSkipped_(), 1, "スキップ記録に残して管理画面で警告する");
+assert.ok(
+  String(sheets["PL連携スキップ"].rows[1][6]).indexOf("新規事業") >= 0,
+  "理由に事業部名を入れる"
+);
+console.log("✓ 対応先の無い事業部は黙って捨てず、スキップ記録に残す");
+
+// 却下・差戻しはPLから取り下げる（承認済みだけが利益計算に載る）
+rec.status = "rejected";
+assert.strictEqual(g.syncExpenseToPl_(rec).posted, false);
+assert.strictEqual(g.findPlRow_(plSheets["経費入力テーブル"], "p1"), -1, "行が消える");
+rec.status = "approved";
+g.syncExpenseToPl_(rec);
+assert.ok(g.findPlRow_(plSheets["経費入力テーブル"], "p1") > 0, "再承認で戻る");
+console.log("✓ 却下・差戻しでPLから取り下げ、再承認で戻る");
+
+// 対応表を直せば、以降の同期はその設定に従う
+sheets["PL連携マッピング"].appendRow(["事業部", "新規事業", "人材"]);
+assert.strictEqual(g.syncExpenseToPl_({
+  id: "p3", status: "approved", applicant: "新人", department: "新規事業",
+  date: "2026-08-10", category: "交通費", amount: 500,
+}).posted, true, "対応表に足せば反映される");
+assert.strictEqual(g.countPlSkipped_(), 0, "解消したスキップ記録は消える");
+console.log("✓ 対応表を直せば以降の同期に反映され、警告も解消する");
+
+// 一括同期：アプリ由来の行だけを作り直し、手動入力行は残す
+const manualBefore = plRows.filter((r) => !String(r[6] || "").trim()).length;
+g.syncAllToPl();
+const manualAfter = plRows.filter((r) => !String(r[6] || "").trim());
+assert.strictEqual(manualAfter.length, manualBefore, "手動入力行の数は変わらない");
+assert.ok(
+  manualAfter.some((r) => r[1] === "中原聖人" && r[4] === 1200000),
+  "手動入力の内容も保たれる"
+);
+const ids = plRows.map((r) => String(r[6] || "")).filter((v) => v);
+assert.strictEqual(new Set(ids).size, ids.length, "一括同期しても申請IDは重複しない");
+assert.ok(ids.indexOf("e1") >= 0, "既存の承認済み申請も取り込まれる");
+console.log("✓ 一括同期はアプリ由来の行だけを作り直し、手動入力行に触らない");
+
+// 日付・数式まわりの補助関数（PL側の初期設定で使う正規表現の確認）
+assert.strictEqual(g.toPlDate_("2026-08-05").getDate(), 5);
+assert.strictEqual(g.toPlDate_("なし"), null, "読めない日付は null（誤った月へ集計しない）");
+assert.strictEqual(g.columnLetter_(1), "A");
+assert.strictEqual(g.columnLetter_(14), "N", "合計列まで数えられる");
+const parsed = g.parsePlSumifsArgs_(
+  "SUMIFS('経費入力テーブル'!$E$5:$E$100, '経費入力テーブル'!$C$5:$C$100, \"イベント営業\", " +
+    "'経費入力テーブル'!$D$5:$D$100, \"広告費\", '経費入力テーブル'!$A$5:$A$100, \">=2026-08-01\", " +
+    "'経費入力テーブル'!$A$5:$A$100, \"<=2026-08-31\")"
+);
+// 既存の数式から事業部と期間を取り出し、その他経費行へそのまま引き継ぐ
+assert.strictEqual(parsed.department, "イベント営業");
+assert.strictEqual(parsed.from, ">=2026-08-01");
+assert.strictEqual(parsed.to, "<=2026-08-31");
+assert.strictEqual(g.parsePlSumifsArgs_("SUM(B12:B15)"), null, "SUMIFS以外は対象外");
+assert.strictEqual(
+  g.shiftPlSumRange_("SUM(B12:B15)", 16),
+  "SUM(B12:B16)",
+  "直後に挿入した行を経費合計へ含める"
+);
+assert.strictEqual(
+  g.shiftPlSumRange_("SUM(B12:B15)", 20),
+  "SUM(B12:B15)",
+  "離れた位置の挿入では範囲を動かさない"
+);
+console.log("✓ PL側の初期設定で使う日付変換・数式の書き換えが正しい");
+
+/* -------- PL計算シートへの「その他経費」行の追加 -------- */
+
+// 営業部PLと同じ構造を用意する（12〜15行が経費、16行が経費合計）。
+// 固定人件費のように『経費入力テーブル』を参照しない行は差から引いてはいけない。
+const sumifs = (dept, item, from, to) =>
+  "=SUMIFS('経費入力テーブル'!$E$5:$E$100, '経費入力テーブル'!$C$5:$C$100, \"" + dept +
+  "\", '経費入力テーブル'!$D$5:$D$100, \"" + item +
+  "\", '経費入力テーブル'!$A$5:$A$100, \">=" + from +
+  "\", '経費入力テーブル'!$A$5:$A$100, \"<=" + to + "\")";
+const plCalc = new FakeSheet("営業部PL計算シート");
+plSheets["営業部PL計算シート"] = plCalc;
+plCalc.getRange(1, 1, 1, 1).setValues([["イベント営業事業部 PL & インセンティブ計算シート"]]);
+plCalc.getRange(3, 2, 1, 3).setValues([["8月", "9月", "合計"]]);
+plCalc.getRange(11, 1, 1, 1).setValues([["II. 経費"]]);
+plCalc.getRange(12, 1, 1, 4).setValues([
+  ["  固定人件費（入舩雄志）", 320000, 320000, "=SUM(B12:C12)"],
+]);
+plCalc.getRange(13, 1, 1, 4).setValues([
+  ["  広告費（バイトル等）",
+   sumifs("イベント営業", "広告費", "2026-08-01", "2026-08-31"),
+   sumifs("イベント営業", "広告費", "2026-09-01", "2026-09-30"),
+   "=SUM(B13:C13)"],
+]);
+plCalc.getRange(14, 1, 1, 4).setValues([
+  ["  雑費交通費（実費）",
+   sumifs("イベント営業", "雑費交通費", "2026-08-01", "2026-08-31"),
+   sumifs("イベント営業", "雑費交通費", "2026-09-01", "2026-09-30"),
+   "=SUM(B14:C14)"],
+]);
+plCalc.getRange(15, 1, 1, 4).setValues([
+  ["  接待交際費（実費）",
+   sumifs("イベント営業", "接待交際費", "2026-08-01", "2026-08-31"),
+   sumifs("イベント営業", "接待交際費", "2026-09-01", "2026-09-30"),
+   "=SUM(B15:C15)"],
+]);
+plCalc.getRange(16, 1, 1, 4).setValues([
+  ["  経費合計", "=SUM(B12:B15)", "=SUM(C12:C15)", "=SUM(B16:C16)"],
+]);
+
+const label = g.addPlOtherExpenseRow_(plCalc);
+assert.strictEqual(label, "その他経費（実費）", "追加した行の名前を返す");
+assert.strictEqual(
+  String(plCalc.rows[15][0]).trim(),
+  "その他経費（実費）",
+  "経費合計の直前（16行目）に入る"
+);
+
+const other = plCalc.getRange(16, 2).getFormula();
+assert.ok(
+  other.indexOf('$C$5:$C$2000, "イベント営業"') > 0,
+  "事業部の条件は既存の数式から引き継ぐ: " + other
+);
+assert.ok(other.indexOf('">=2026-08-01"') > 0 && other.indexOf('"<=2026-08-31"') > 0,
+  "その列の月の期間を引き継ぐ");
+assert.ok(other.indexOf('$D$') < 0, "経費項目では絞らない（総額から引く方式）");
+assert.ok(
+  /- B13 - B14 - B15\s*$/.test(other),
+  "個別計上済みの3行だけを引く（固定人件費B12は引かない）: " + other
+);
+assert.ok(
+  other.indexOf("B12") < 0,
+  "『経費入力テーブル』を参照しない固定人件費を引くと、その分が二重に消える"
+);
+const sep = plCalc.getRange(16, 3).getFormula();
+assert.ok(
+  /- C13 - C14 - C15\s*$/.test(sep) && sep.indexOf('">=2026-09-01"') > 0,
+  "9月の列も同じ形で作る: " + sep
+);
+assert.strictEqual(
+  plCalc.getRange(16, 4).getFormula(),
+  "=SUM(B16:C16)",
+  "合計列はその行の月を足す"
+);
+assert.strictEqual(
+  plCalc.getRange(17, 2).getFormula(),
+  "=SUM(B12:B16)",
+  "経費合計が追加した行まで広がる（挿入だけでは広がらない）"
+);
+assert.strictEqual(
+  g.addPlOtherExpenseRow_(plCalc),
+  "",
+  "二重に実行しても行は増えない（冪等）"
+);
+assert.strictEqual(plCalc.rows.length, 17, "行数が変わらない");
+
+// 経費を集計していないシート（ダッシュボード等）は対象外
+const dash = new FakeSheet("ダッシュボード");
+dash.getRange(1, 1, 2, 1).setValues([["個人ダッシュボード"], ["基本給"]]);
+assert.strictEqual(g.addPlOtherExpenseRow_(dash), "", "経費合計が無いシートは触らない");
+console.log("✓ 「その他経費（実費）」行は総額との差で作り、固定費は引かず、冪等");
+
+// 日付列の移行: 文字列の日付だけを実日付へ置き換える（PLが全月 ¥0 だった原因への対処）
+plSheets["経費入力テーブル"].rows.push(
+  ["2026-09-03", "手動太郎", "人材", "広告費", 80000, "文字列で入力された行", ""]
+);
+plSheets["経費入力テーブル"].rows.push(["", "", "", "", "", "", ""]);
+const converted = g.fixPlDateColumn_(FAKE_PL_SS, "経費入力テーブル");
+assert.strictEqual(converted, 1, "文字列の日付1件だけを移行する（空行と実日付は数えない）");
+const migratedRow = plRows.find((r) => r[5] === "文字列で入力された行");
+assert.ok(isDate(migratedRow[0]), "文字列の日付が実日付になる");
+assert.strictEqual(migratedRow[0].getMonth(), 8, "2026-09-03 の月");
+assert.strictEqual(
+  g.fixPlDateColumn_(FAKE_PL_SS, "経費入力テーブル"),
+  0,
+  "2回目は移行するものが無い（冪等）"
+);
+assert.strictEqual(
+  g.fixPlDateColumn_(FAKE_PL_SS, "存在しないシート"),
+  0,
+  "シートが無くても落ちない"
+);
+
+// SUMIFS の範囲拡張: 元は 100 行（実質96件）で打ち止めだった
+const widened = g.widenPlSumifsRanges_(FAKE_PL_SS);
+assert.ok(widened >= 3, "『経費入力テーブル』を参照する数式を広げる: " + widened + "式");
+const adv = plCalc.getRange(13, 2).getFormula();
+assert.ok(adv.indexOf("$E$5:$E$2000") > 0, "範囲が2000行まで広がる: " + adv);
+assert.ok(adv.indexOf("$100") < 0, "100行の指定が残らない");
+assert.ok(adv.indexOf('"広告費"') > 0, "条件そのものは変えない");
+assert.strictEqual(
+  plCalc.getRange(12, 2).getFormula(),
+  "",
+  "『経費入力テーブル』を参照しない行（固定人件費）は触らない"
+);
+assert.strictEqual(g.widenPlSumifsRanges_(FAKE_PL_SS), 0, "2回目は変更なし（冪等）");
+// 数式でないセルを消さないこと。範囲まとめての setFormulas は空文字でセルを
+// クリアするため、見出しや固定費の実数値がPLモデルから消えてしまう。
+assert.strictEqual(
+  plCalc.getRange(12, 2).getValue(),
+  320000,
+  "固定人件費の実数値が残る（数式でないセルを消さない）"
+);
+assert.strictEqual(String(plCalc.getRange(3, 2).getValue()), "8月", "月の見出しが残る");
+assert.strictEqual(
+  String(plCalc.getRange(12, 1).getValue()).trim(),
+  "固定人件費（入舩雄志）",
+  "行の名前が残る"
+);
+assert.strictEqual(
+  plCalc.getRange(17, 3).getFormula(),
+  "=SUM(C12:C16)",
+  "経費合計は全ての月の列で追加行まで広がる"
+);
+console.log("✓ 日付列の実日付への移行とSUMIFSの範囲拡張が、既存の値を壊さず冪等に動く");
 
 console.log("\nすべて成功");
