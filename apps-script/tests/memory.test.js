@@ -13,9 +13,10 @@ const assert = require("assert");
 
 // ---- 最小限の GAS スタブ ----
 /**
- * タイムゾーンの再現。スプレッドシートは「シートのTZで見た日時」を保存し、
- * Apps Script が読み出すときは「スクリプトのTZ」で解釈される。この往復で
- * 日付が1日ずれる事故が実際に起きたため、テストでも往復を再現する。
+ * タイムゾーンの再現。スプレッドシートの日付は**シートのタイムゾーン基準**で
+ * 読み書きされる（読み出しでスクリプトのTZは使われない）。
+ * そのため `new Date(y, m, d)`（スクリプトTZの 0:00）を書くと、シート上では
+ * タイムゾーン差のぶん巻き戻って別の日付になる。実際に1日ずれる事故が起きた。
  */
 const SCRIPT_TZ = "Asia/Tokyo";
 /** vm の中と外では Date が別物なので、シートに入れる日付は中側の Date で作る */
@@ -28,15 +29,10 @@ const shownParts = (d, tz) => {
 };
 const instantFor = (p, tz) =>
   mkDate(Date.UTC(p[0], p[1], p[2], p[3], p[4]) - TZ_OFFSET[tz] * 3600000);
-/** シートへ日付を保存 → 読み出す、の往復 */
-const roundTripDate = (d, sheetTz) => instantFor(shownParts(d, sheetTz), SCRIPT_TZ);
 
-/**
- * シート上での表示（検証用）。
- * シートから読み出した値は「表示どおりの日時をスクリプトTZで解釈した瞬間」なので、
- * 表示を知りたいときはスクリプトTZで見る。
- */
-const displayed = (v) => shownIn(v, SCRIPT_TZ);
+/** シート上での表示（検証用）。表示はシートのタイムゾーン基準。 */
+const SHEET_TZ = "America/Los_Angeles";
+const displayed = (v) => shownIn(v, SHEET_TZ);
 const shownIn = (d, tz) => {
   const p = shownParts(d, tz);
   const z = (n) => String(n).padStart(2, "0");
@@ -52,12 +48,6 @@ class FakeSheet {
   getName() { return this.name; }
   setName(n) { renameSheet(this, n); }
   getParent() { return this.parent || FAKE_SS; }
-  /** 日付を書くと、シートのTZを経由した値になって読み戻される */
-  store(v) {
-    // vm の中と外で Date が別物なので instanceof は使えない
-    const isDateLike = !!v && typeof v.getTime === "function";
-    return this.tz && isDateLike ? roundTripDate(v, this.tz) : v;
-  }
   getLastRow() { return this.rows.length; }
   getLastColumn() {
     return this.rows.reduce((max, r) => Math.max(max, (r || []).length), 0);
@@ -95,7 +85,7 @@ class FakeSheet {
           const target = (self.rows[row - 1 + i] = self.rows[row - 1 + i] || []);
           const fRow = (self.formulas[row - 1 + i] = self.formulas[row - 1 + i] || []);
           line.forEach((v, j) => {
-            target[col - 1 + j] = self.store(v);
+            target[col - 1 + j] = v;
             // "=" で始まる文字列を書くと数式になる
             fRow[col - 1 + j] = typeof v === "string" && v[0] === "=" ? v : "";
           });
@@ -130,7 +120,7 @@ class FakeSheet {
       },
       setValue(v) {
         const target = (self.rows[row - 1] = self.rows[row - 1] || []);
-        target[col - 1] = self.store(v);
+        target[col - 1] = v;
       },
       getValue() { return (self.rows[row - 1] || [])[col - 1]; },
       setNumberFormat() {},
@@ -962,7 +952,7 @@ plSheets["経費入力テーブル"] = plSheet("経費入力テーブル", [
   [],
   [],
   ["日付", "担当者名", "所属事業部", "経費項目", "金額", "備考"],
-  [instantFor([2026, 7, 15, 0, 0], SCRIPT_TZ), "中原聖人", "人材", "広告費", 1200000,
+  [instantFor([2026, 7, 15, 0, 0], SHEET_TZ), "中原聖人", "人材", "広告費", 1200000,
    "人材広告費(8月分)"],
 ]);
 const plRows = plSheets["経費入力テーブル"].rows;
@@ -1293,8 +1283,10 @@ console.log("✓ 月末の申請がシート上でも月末に入る（1日前�
 const shifted = plSheet("ずれ確認", [
   [], [], [],
   ["日付"],
-  [instantFor([2026, 7, 4, 8, 0], SCRIPT_TZ), "旧コードが書いた行（前日 8:00 と表示される）"],
-  [instantFor([2026, 7, 20, 0, 0], SCRIPT_TZ), "人が入力した行（0:00）"],
+  // 旧コードは new Date(2026,7,5) = スクリプトTZの 0:00 を書いた。
+  // シートのTZ(-7)で見ると前日 8:00 になる（実際に起きた状態）
+  [instantFor([2026, 7, 5, 0, 0], SCRIPT_TZ), "旧コードが書いた行"],
+  [instantFor([2026, 7, 20, 0, 0], SHEET_TZ), "人が入力した行"],
   ["", ""],
 ]);
 plSheets["ずれ確認"] = shifted;
