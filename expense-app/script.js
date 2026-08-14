@@ -1784,8 +1784,17 @@ async function submitExpense(evt) {
       // AI解析を使った申請は提案値も送り、手修正の差分をサーバー側で学習させる
       if (state.lastAiFields) record.ai = state.lastAiFields;
       try {
-        await apiPost({ action: "create", record });
-        await refreshFromCloud();
+        const saved = await apiPost({ action: "create", record });
+        // 保存された申請はそのまま返ってくるので、一覧を取り直さない。
+        // 取り直すと往復が2回になり、全期間の申請を毎回ダウンロードすることになる。
+        if (saved.record) {
+          state.expenses.unshift(normalizeRecord(saved.record));
+          saveCache();
+          setSync("synced");
+        } else {
+          await refreshFromCloud(); // 保存結果を返さない古いバックエンド向け
+        }
+        await flushQueue();
         toast(
           state.autoApprove
             ? "申請を保存しました（自動承認済み）"

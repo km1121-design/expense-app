@@ -645,6 +645,64 @@ assert.strictEqual(
 );
 console.log("✓ 申請した区間が運賃マスタへ自動登録され、2回目以降は自動で照合される");
 
+/* -------- 16.9 領収書ファイル名の採番 -------- */
+// 月フォルダの全ファイルを走査すると、その月の申請が増えるほど保存が遅くなる。
+// ドライブ側で「同じ日・同じ申請者」に絞ってから数えていることを確認する。
+function fakeFolder(names) {
+  const queries = [];
+  return {
+    queries: queries,
+    getFiles() {
+      throw new Error("フォルダ全体の走査は行わない（searchFiles で絞ること）");
+    },
+    searchFiles(q) {
+      queries.push(q);
+      // DriveApp の `title contains 'x'` を再現する（部分一致）
+      const m = /^title contains '(.*)'$/.exec(q);
+      const needle = m ? m[1].replace(/\\'/g, "'") : "";
+      const hits = names.filter((n) => n.indexOf(needle) >= 0);
+      let i = 0;
+      return {
+        hasNext: () => i < hits.length,
+        next: () => ({ getName: () => hits[i++] }),
+      };
+    },
+  };
+}
+
+let folder = fakeFolder([
+  "2026-08-14_山田太郎_001.jpg",
+  "2026-08-14_山田太郎_002.jpg",
+  "2026-08-14_鈴木花子_001.jpg", // 別の申請者
+  "2026-08-13_山田太郎_001.jpg", // 別の日
+]);
+assert.strictEqual(
+  g.buildReceiptFileName_(folder, "2026-08-14", "山田太郎", "image/jpeg"),
+  "2026-08-14_山田太郎_003.jpg",
+  "同じ日・同じ申請者の続きから採番する"
+);
+assert.strictEqual(
+  folder.queries[0],
+  "title contains '2026-08-14_山田太郎_'",
+  "ドライブ側で絞り込んでから数える"
+);
+
+folder = fakeFolder([]);
+assert.strictEqual(
+  g.buildReceiptFileName_(folder, "2026-08-14", "山田太郎", "image/png"),
+  "2026-08-14_山田太郎_001.png",
+  "1件目は 001・拡張子は mime に従う"
+);
+
+// 検索語に使えない文字が名前に入っていても、クエリが壊れない
+folder = fakeFolder([]);
+g.buildReceiptFileName_(folder, "2026-08-14", "O'Brien 太郎", "image/jpeg");
+assert.ok(
+  folder.queries[0].indexOf("\\'") > 0,
+  "アポストロフィはエスケープする"
+);
+console.log("✓ buildReceiptFileName_: 同じ日・同じ申請者だけを絞って採番する");
+
 /* -------- 17. AIの応答から運賃JSONを取り出す -------- */
 assert.strictEqual(
   g.parseJsonLoosely_('```json\n{"fare": 480, "route": "JR中央線"}\n```').fare,

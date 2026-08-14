@@ -369,9 +369,13 @@ function buildReceiptFileName_(folder, dateStr, applicant, mime) {
     Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
   const base = date + "_" + sanitizeFileName_(applicant) + "_";
   let count = 0;
-  const it = folder.getFiles();
+  // 月フォルダの全ファイルを走査すると、その月の申請が増えるほど申請の保存が
+  // 遅くなる。同じ日・同じ申請者のファイルだけをドライブ側で絞ってから数える。
+  const it = folder.searchFiles(
+    "title contains '" + base.replace(/'/g, "\\'") + "'"
+  );
   while (it.hasNext()) {
-    if (it.next().getName().indexOf(base) === 0) count++;
+    if (it.next().getName().indexOf(base) === 0) count++; // contains は部分一致なので前方一致で確認する
   }
   const ext = String(mime || "").indexOf("png") >= 0 ? ".png" : ".jpg";
   return base + String(count + 1).padStart(3, "0") + ext;
@@ -541,6 +545,9 @@ function requireUser_(token, adminOnly) {
   // 役割はシートの最新値を正とする（トークン発行後に変更された場合に反映）
   u.role = String(rec.role || "user");
   u.displayName = String(rec.displayName || u.username);
+  // 事業部もここで持たせる。呼び出し側が findUser_ を呼び直すと、1リクエストで
+  // ユーザーシートを2回読むことになるため。
+  u.department = String(rec.department || "");
   if (adminOnly && u.role !== "admin") throw new Error("forbidden");
   return u;
 }
@@ -868,12 +875,11 @@ function actionBootstrap_(body) {
   } catch (err) {
     return out; // 未ログイン・期限切れ。アプリはログイン画面を出す
   }
-  const profile = u.legacy ? null : findUser_(u.username);
   out.user = {
     username: u.username,
     displayName: u.displayName,
     role: u.role,
-    department: String((profile && profile.department) || ""),
+    department: String(u.department || ""), // requireUser_ が読み取り済み
   };
   out.departments = listDepartments_();
   out.records = recordsForUser_(u);
@@ -899,14 +905,13 @@ function doPost(e) {
       // ---- 認証（トークン必要） ----
       case "me": {
         const u = requireUser_(body.token, false);
-        const profile = u.legacy ? null : findUser_(u.username);
         return json_({
           ok: true,
           user: {
             username: u.username,
             displayName: u.displayName,
             role: u.role,
-            department: String((profile && profile.department) || ""),
+            department: String(u.department || ""), // requireUser_ が読み取り済み
           },
           departments: listDepartments_(),
         });
@@ -981,11 +986,9 @@ function createExpense_(record, user) {
     ? String(record.applicantId || record.applicant || "")
     : user.username;
   // 事業部: 申請時に指定があればそれを優先、なければプロフィールの既定値
+  // （requireUser_ が読み取り済みなので、ここでユーザーシートを読み直さない）
   let department = String(record.department || "").trim();
-  if (!user.legacy && !department) {
-    const profile = findUser_(user.username);
-    department = String((profile && profile.department) || "");
-  }
+  if (!user.legacy && !department) department = String(user.department || "");
 
   // 領収書画像: 経費領収書/<事業部>/<yyyy-MM>/日付_申請者_採番 で保存
   let imageUrl = "";
@@ -1168,18 +1171,32 @@ function findFare_(key) {
   return null;
 }
 
-/** 運賃マスタへ登録（同じ区間があれば上書き） */
-function saveFare_(rec) {
-  const sheet = getFaresSheet_();
-  const existing = findFare_(rec.key);
-  const row = FARE_COLUMNS.map(function (c) {
+/** 運賃マスタの1行分（定義順） */
+function fareRow_(rec) {
+  return FARE_COLUMNS.map(function (c) {
     return rec[c[0]] == null ? "" : rec[c[0]];
   });
+}
+
+/** 運賃マスタへ登録（同じ区間があれば上書き） */
+function saveFare_(rec) {
+  const existing = findFare_(rec.key);
   if (existing) {
-    sheet.getRange(existing._row, 1, 1, FARE_COLUMNS.length).setValues([row]);
+    getFaresSheet_()
+      .getRange(existing._row, 1, 1, FARE_COLUMNS.length)
+      .setValues([fareRow_(rec)]);
   } else {
-    sheet.appendRow(row);
+    appendFare_(rec);
   }
+}
+
+/**
+ * 未登録と分かっている区間を追記する。
+ * 呼び出し側が既に findFare_ で不在を確認している場合に使い、
+ * 運賃マスタを2度読まないようにする。
+ */
+function appendFare_(rec) {
+  getFaresSheet_().appendRow(fareRow_(rec));
 }
 
 /**
@@ -1506,8 +1523,9 @@ function resolveFareForRecord_(record, amount, applicant) {
       return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
     }
     // マスタへの登録に失敗しても申請そのものは通す（申請を落とさない）。
+    // 未登録は上の findFare_ で確認済みなので、追記だけ行う（マスタを2度読まない）。
     try {
-      saveFare_({
+      appendFare_({
         key: key,
         from: from,
         to: to,
