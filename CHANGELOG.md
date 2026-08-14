@@ -3,6 +3,26 @@
 このファイルは、まとまった単位のリリースを記録します。
 新しいものを上に追記してください。
 
+## 1.2.2 — 2026-08-14
+
+CIの保守のみ。アプリの動作は変わらない。
+
+- **GitHub Actions を現行のメジャーへ更新**し、Node 20 の非推奨警告を解消した。
+  警告はアクション自身のランタイムについてのもので、1.1.0 で `node-version` を
+  22 へ上げたのとは別の話（そちらはワークフローの各ステップが使う Node）。
+
+  | アクション | 前 | 後 |
+  | --- | --- | --- |
+  | `actions/checkout` | v4 | v7 |
+  | `actions/setup-node` | v4 | v7 |
+  | `actions/configure-pages` | v5 | v6 |
+  | `actions/upload-pages-artifact` | v3 | v5 |
+  | `actions/deploy-pages` | v4 | v5 |
+
+  `upload-pages-artifact` は v4 以降、**隠しファイル（ドットファイル）を既定で
+  含めない**。`expense-app/` に隠しファイルは無いため既定のままとした。
+  今後 `.nojekyll` などを置く場合は `include-hidden-files: true` が必要になる。
+
 ## 1.2.1 — 2026-08-14
 
 申請（保存）の待ち時間を削った。1.2.0 と同じ方針の続きで、機能の変更はない。
