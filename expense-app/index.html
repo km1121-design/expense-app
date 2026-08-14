@@ -631,7 +631,11 @@
     <div class="toast" id="toast" hidden></div>
 
     <!-- レシート画像OCR（端末内で完結） -->
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <!--
+      OCR（Tesseract.js）はAIキーが未設定のときのフォールバックでしか使わない。
+      ここで同期読み込みすると script.js の実行がその分だけ遅れ、起動が丸ごと
+      待たされるため、実際に必要になった時点で script.js が動的に読み込む。
+    -->
     <script src="./script.js"></script>
   </body>
 </html>

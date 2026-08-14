@@ -301,7 +301,7 @@ assert.strictEqual(res.learned.applied.length, 0);
 assert.strictEqual(res.learned.retried, false);
 assert.strictEqual(res.fields.vendor, "初見の店");
 
-// (b) 誤読履歴のある店舗 → ヒント付きで読み直し、さらに辞書補正が乗る
+// (b) 過去の誤読を再現した場合のみ、ヒント付きで読み直し、さらに辞書補正が乗る
 g.logCorrection_(
   { vendor: "そば処ふじ", date: "2026-07-02", amount: 1100, category: "会議費", description: "打合せ昼食" },
   { vendor: "そば処ふじ", date: "2026-07-02", amount: 1000, category: "その他", description: "飲食", rawText: "小計 1000 合計 1100" },
@@ -313,19 +313,56 @@ g.logCorrection_(
   "yamada"
 );
 calls.length = 0;
-g.analyzeWithGemini_ = stubAnalyze({
-  date: "2026-07-26", amount: 1200, vendor: "そば処ふじ", category: "その他", description: "飲食",
-});
+// ヒント無しでは過去と同じ誤読（1000）を再現し、ヒント付きなら正しく読めるモデル
+g.analyzeWithGemini_ = (body, hint) => {
+  calls.push(String(hint || ""));
+  return {
+    fields: {
+      date: "2026-07-26", vendor: "そば処ふじ", category: "その他", description: "飲食",
+      amount: hint ? 1100 : 1000,
+    },
+    model: "stub",
+  };
+};
 res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
-assert.strictEqual(calls.length, 2, "誤読履歴があるので1回だけ読み直す");
+assert.strictEqual(calls.length, 2, "過去と同じ誤読を再現したので1回だけ読み直す");
 assert.strictEqual(calls[0], "");
 assert.ok(calls[1].includes("正しくは 1100 だった"), "2回目は誤読事例つき");
 assert.strictEqual(res.learned.retried, true);
 assert.strictEqual(res.learned.applied.join(","), "科目,摘要");
 assert.strictEqual(res.fields.category, "会議費");
 assert.strictEqual(res.fields.description, "打合せ昼食");
+assert.strictEqual(res.fields.amount, 1100, "読み直しで金額が直る");
+console.log("✓ actionAnalyzeReceipt_: 過去の誤読を再現したときだけ読み直し、辞書補正を適用する");
+
+// (c) 誤読履歴のある店舗でも、その誤読を再現していなければ読み直さない
+//     （履歴があるだけで毎回2回呼ぶと、よく使う店舗ほど解析が遅くなるため）
+calls.length = 0;
+g.analyzeWithGemini_ = stubAnalyze({
+  date: "2026-07-26", amount: 1200, vendor: "そば処ふじ", category: "その他", description: "飲食",
+});
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(calls.length, 1, "既知の誤読と違う金額ならAI呼び出しは1回");
+assert.strictEqual(res.learned.retried, false);
 assert.strictEqual(res.fields.amount, 1200, "今回の金額はそのまま");
-console.log("✓ actionAnalyzeReceipt_: 誤読履歴のある店舗のみ読み直し、辞書補正を適用する");
+assert.strictEqual(res.fields.category, "会議費", "辞書補正は読み直し無しでも効く");
+assert.strictEqual(
+  g.repeatsKnownMistake_({ amount: 1000 }, [{ amountWrong: true, aiAmount: 1000 }]),
+  true,
+  "同じ誤読金額なら再現とみなす"
+);
+assert.strictEqual(
+  g.repeatsKnownMistake_({ amount: 1200 }, [{ amountWrong: true, aiAmount: 1000 }]),
+  false
+);
+assert.strictEqual(
+  g.repeatsKnownMistake_({ vendor: "株式会社そば処ふじ" }, [
+    { vendorWrong: true, aiVendor: "そば処ふじ" },
+  ]),
+  true,
+  "店名の再現は表記ゆれを吸収して判定する"
+);
+console.log("✓ 既知の誤読を再現していなければ読み直さない（AI呼び出しは1回）");
 
 /* -------- 11. 読み直しが失敗しても初回結果で応答する -------- */
 calls.length = 0;
@@ -333,12 +370,13 @@ let n2 = 0;
 g.analyzeWithGemini_ = function (body, hint) {
   calls.push(String(hint || ""));
   if (n2++ > 0) throw new Error("503 overloaded");
-  return { fields: { date: "2026-07-27", amount: 1300, vendor: "そば処ふじ", category: "その他", description: "飲食" }, model: "stub" };
+  // 過去と同じ誤読（1000）を再現するので読み直しに進み、その読み直しが失敗する
+  return { fields: { date: "2026-07-27", amount: 1000, vendor: "そば処ふじ", category: "その他", description: "飲食" }, model: "stub" };
 };
 res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
 assert.strictEqual(calls.length, 2);
 assert.strictEqual(res.learned.retried, false);
-assert.strictEqual(res.fields.amount, 1300, "初回結果を採用");
+assert.strictEqual(res.fields.amount, 1000, "初回結果を採用");
 assert.strictEqual(res.fields.category, "会議費", "辞書補正は効いたまま");
 console.log("✓ 読み直しが失敗しても初回結果＋辞書補正で応答する");
 
