@@ -267,7 +267,7 @@ function getFaresSheet_() {
 /**
  * シート名・見出しの定義の版。ここを変えると次のリクエストで全シートを移行する。
  */
-const SCHEMA_VERSION = "2026-08-ja-1";
+const SCHEMA_VERSION = "2026-08-ja-2";
 
 /**
  * 全シートのタブ名と見出しを現在の定義に揃える。
@@ -295,6 +295,11 @@ function migrateSheets() {
   getDepartmentsSheet_();
   getCorrectionsSheet_();
   getFaresSheet_();
+  // PL連携用のシートは、連携を有効にしたときだけ作る（使わない人には出さない）
+  if (isPlSyncEnabled_()) {
+    getPlMappingSheet_();
+    getPlSkippedSheet_();
+  }
 }
 
 /** 移行の失敗でリクエスト自体を落とさないためのラッパー */
@@ -783,12 +788,12 @@ function findRow_(sheet, id) {
  * 指定した内部キーの列だけを見て、値が一致する行番号を返す（無ければ -1）。
  * シート全体を読み込まずに済むよう、対象の1列だけを取得する。
  */
-function findRowByColumn_(sheet, key, value) {
+function findRowByColumn_(sheet, key, value, columns) {
   const last = sheet.getLastRow();
   if (last < 2) return -1;
   const head = headerKeys_(
     sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
-    EXPENSE_COLUMNS
+    columns || EXPENSE_COLUMNS
   );
   const col = head.indexOf(key);
   if (col < 0) return -1;
@@ -853,6 +858,7 @@ function statusPayload_() {
       vendorMemory: true, // AI解析の学習
       jaSheets: true, // シートの日本語化
       bootstrap: true, // 起動を1往復にまとめられるか
+      plSync: isPlSyncEnabled_(), // PL管理モデルへの連携（プロパティ1回の読み取り）
     },
   };
 }
@@ -883,6 +889,15 @@ function actionBootstrap_(body) {
   };
   out.departments = listDepartments_();
   out.records = recordsForUser_(u);
+  // PLへ反映できなかった申請の件数。管理者にだけ知らせれば足りるので、
+  // 一般ユーザーの起動ではスキップ記録のシートを読まない。
+  if (u.role === "admin" && isPlSyncEnabled_()) {
+    try {
+      out.plSkipped = countPlSkipped_();
+    } catch (err) {
+      // 件数が取れなくても起動は成立させる
+    }
+  }
   return out;
 }
 
@@ -965,6 +980,14 @@ function doPost(e) {
       case "delete": {
         const u = requireUser_(body.token, false);
         return json_(deleteExpense_(body.id, u));
+      }
+      // ---- PL管理モデルへの連携 ----
+      case "syncPl": {
+        requireUser_(body.token, true); // 管理者のみ
+        if (!isPlSyncEnabled_()) {
+          return json_({ ok: false, error: "PL連携が未設定です（PL_SPREADSHEET_ID）" });
+        }
+        return json_({ ok: true, message: syncAllToPl(), skipped: countPlSkipped_() });
       }
       default:
         return json_({ ok: false, error: "unknown action" });
@@ -1058,6 +1081,8 @@ function createExpense_(record, user) {
       // noop
     }
   }
+  // PL管理モデルへの連携（承認済みのみ反映。無効なら何もしない）
+  safeSyncExpenseToPl_(rec);
   return { ok: true, record: rec };
 }
 
@@ -1073,7 +1098,26 @@ function updateExpense_(id, fields, user) {
     const col = HEADERS.indexOf(k);
     if (col >= 0) sheet.getRange(row, col + 1).setValue(fields[k]);
   });
+  // 承認・却下・金額修正をPLへ反映する（却下・差戻しならPLから取り下げる）。
+  // 連携が無効なら読み取りも起きないよう、判定を先に済ませる。
+  if (isPlSyncEnabled_()) safeSyncExpenseToPl_(recordAtRow_(sheet, row));
   return { ok: true };
+}
+
+/** 指定行を1件のレコードとして読む（更新後の値をPLへ渡すために使う）。 */
+function recordAtRow_(sheet, row) {
+  const width = sheet.getLastColumn();
+  const head = headerKeys_(
+    sheet.getRange(1, 1, 1, width).getValues()[0],
+    EXPENSE_COLUMNS
+  );
+  const values = sheet.getRange(row, 1, 1, width).getValues()[0];
+  const rec = {};
+  head.forEach(function (h, j) {
+    rec[h] = normalizeValue_(h, values[j]);
+  });
+  rec.amount = Number(rec.amount) || 0;
+  return rec;
 }
 
 function deleteExpense_(id, user) {
@@ -1100,6 +1144,7 @@ function deleteExpense_(id, user) {
     }
   }
   sheet.deleteRow(row);
+  safeRemoveFromPl_(id); // PLに載っていれば取り下げる
   return { ok: true };
 }
 
@@ -2549,6 +2594,630 @@ function analyzeWithClaude_(body, hint) {
     fields: normalizeReceiptFields_(JSON.parse(text)),
     model: String(data.model || model),
   };
+}
+
+/* ==================== PL管理モデルへの連携 ==================== */
+
+/**
+ * 別スプレッドシート「PL管理プロトタイプ」の『経費入力テーブル』へ、承認済みの
+ * 経費申請を1行ずつ反映する。PL計算シートの SUMIFS がこの表を集計しているため、
+ * ここに書けば各事業部の月次PL・インセンティブへそのまま反映される。
+ *
+ * 連携は PL_SPREADSHEET_ID を設定したときだけ有効。未設定なら一切何もしないので、
+ * 設定しなければ従来どおりの動作になる。
+ *
+ * PL側の表は「アプリからの自動連携」と「手動入力」が混在する設計なので、
+ * G列『申請ID』の有無でどちらの行かを見分ける。
+ * **申請IDが空の行（手動入力）は絶対に書き換えない。**
+ * アプリ由来の行は申請IDで upsert するため、何度流しても重複しない。
+ */
+const PL_EXPENSE_SHEET = "経費入力テーブル";
+const PL_SALES_SHEET = "案件・売上入力テーブル";
+
+/** PL側の表は1行目がタイトル・4行目が見出しで、データは5行目から始まる */
+const PL_HEADER_ROW = 4;
+const PL_FIRST_ROW = 5;
+/**
+ * SUMIFS に持たせる範囲の最終行。元のモデルは 100 行（実質96件）で打ち止めだったため、
+ * setupPlSheets() でこの行まで広げる。申請は貯まり続けるので余裕を持たせる。
+ */
+const PL_LAST_ROW = 2000;
+
+/**
+ * PL側『経費入力テーブル』の列。既存モデルの列順そのもので、読み書きは位置で行う。
+ * 申請ID列だけがアプリ連携のために増える列（元のモデルには無い）。
+ */
+const PL_EXPENSE_COLUMNS = [
+  ["date", "日付"],
+  ["applicant", "担当者名"],
+  ["department", "所属事業部"],
+  ["category", "経費項目"],
+  ["amount", "金額"],
+  ["note", "備考"],
+  ["id", "申請ID"],
+];
+const PL_ID_COLUMN = PL_EXPENSE_COLUMNS.length; // G列
+
+/**
+ * アプリの語彙（事業部・科目）をPL側の語彙へ変換する対応表。
+ * PL側の SUMIFS は "イベント営業" "雑費交通費" のような固定文字列で拾うため、
+ * そのままでは一件も一致しない。対応表はシートに置いて運用側で直せるようにする。
+ */
+const PL_MAPPING_SHEET = "PL連携マッピング";
+const PL_MAPPING_COLUMNS = [
+  ["kind", "種別"],
+  ["appValue", "アプリの値"],
+  ["plValue", "PLの値"],
+];
+const PL_KIND_DEPARTMENT = "事業部";
+const PL_KIND_CATEGORY = "科目";
+/** 対応先が無い科目の受け皿。setupPlSheets() がPL側に同名の行を作る。 */
+const PL_OTHER_CATEGORY = "その他経費";
+const PL_OTHER_ROW_LABEL = "  その他経費（実費）";
+
+/**
+ * 対応表の初期値。事業部はPL計算シートが存在する2つ（イベント営業／人材）しか
+ * 受け皿が無いため、人材以外はイベント営業へ寄せる。実態に合わなければシートを直す。
+ * 科目はPL側に行がある3つへ寄せ、残りは「その他経費」へ集める（落とさない）。
+ */
+const DEFAULT_PL_MAPPINGS = [
+  [PL_KIND_DEPARTMENT, "人材", "人材"],
+  [PL_KIND_DEPARTMENT, "BAR", "イベント営業"],
+  [PL_KIND_DEPARTMENT, "運送", "イベント営業"],
+  [PL_KIND_DEPARTMENT, "本部", "イベント営業"],
+  [PL_KIND_DEPARTMENT, "ARTGRAGE", "イベント営業"],
+  [PL_KIND_DEPARTMENT, "クリニック", "イベント営業"],
+  [PL_KIND_DEPARTMENT, "GoonerHouse", "イベント営業"],
+  [PL_KIND_CATEGORY, "交通費", "雑費交通費"],
+  [PL_KIND_CATEGORY, "交際費", "接待交際費"],
+  [PL_KIND_CATEGORY, "会議費", PL_OTHER_CATEGORY],
+  [PL_KIND_CATEGORY, "消耗品費", PL_OTHER_CATEGORY],
+  [PL_KIND_CATEGORY, "通信費", PL_OTHER_CATEGORY],
+  [PL_KIND_CATEGORY, "宿泊費", PL_OTHER_CATEGORY],
+  [PL_KIND_CATEGORY, "その他", PL_OTHER_CATEGORY],
+];
+
+/**
+ * PLへ反映できなかった申請の記録。事業部の対応先が無いと金額の行き先を決められず、
+ * 黙って捨てると利益が実態より良く見えてしまうため、ここへ残して管理画面で警告する。
+ */
+const PL_SKIPPED_SHEET = "PL連携スキップ";
+const PL_SKIPPED_COLUMNS = [
+  ["recordedAt", "記録日時"],
+  ["id", "申請ID"],
+  ["applicant", "申請者"],
+  ["department", "事業部"],
+  ["category", "科目"],
+  ["amount", "金額"],
+  ["reason", "理由"],
+];
+
+/** 連携先のPLスプレッドシート。PL_SPREADSHEET_ID 未設定なら null（連携無効）。 */
+function getPlSpreadsheet_() {
+  const id = getProp_("PL_SPREADSHEET_ID");
+  if (!id) return null;
+  return SpreadsheetApp.openById(id);
+}
+
+function isPlSyncEnabled_() {
+  return !!getProp_("PL_SPREADSHEET_ID");
+}
+
+function getPlMappingSheet_() {
+  const existed = !!getSpreadsheet_().getSheetByName(PL_MAPPING_SHEET);
+  const sheet = ensureSheet_(PL_MAPPING_SHEET, PL_MAPPING_COLUMNS);
+  if (!existed) {
+    DEFAULT_PL_MAPPINGS.forEach(function (m) {
+      sheet.appendRow(m);
+    });
+  }
+  return sheet;
+}
+
+function getPlSkippedSheet_() {
+  return ensureSheet_(PL_SKIPPED_SHEET, PL_SKIPPED_COLUMNS);
+}
+
+/** 対応表を読み、{department: {アプリ値: PL値}, category: {...}} を返す。 */
+function loadPlMappings_() {
+  const sheet = getPlMappingSheet_();
+  const last = sheet.getLastRow();
+  const maps = { department: {}, category: {} };
+  if (last < 2) return maps;
+  const values = sheet.getRange(2, 1, last - 1, PL_MAPPING_COLUMNS.length).getValues();
+  values.forEach(function (r) {
+    const kind = String(r[0] == null ? "" : r[0]).trim();
+    const appValue = String(r[1] == null ? "" : r[1]).trim();
+    const plValue = String(r[2] == null ? "" : r[2]).trim();
+    if (!appValue || !plValue) return;
+    if (kind === PL_KIND_DEPARTMENT) maps.department[appValue] = plValue;
+    else if (kind === PL_KIND_CATEGORY) maps.category[appValue] = plValue;
+  });
+  return maps;
+}
+
+/**
+ * PL側『経費入力テーブル』。連携が無効、またはシートが無ければ null。
+ * 元のモデルには無い『申請ID』列の見出しだけは、無ければここで補う
+ * （setupPlSheets() を流す前でも連携が成立するようにしておく）。
+ */
+function getPlExpenseSheet_() {
+  const ss = getPlSpreadsheet_();
+  if (!ss) return null;
+  const sheet = ss.getSheetByName(PL_EXPENSE_SHEET);
+  if (!sheet) return null;
+  const label = PL_EXPENSE_COLUMNS[PL_ID_COLUMN - 1][1];
+  const cell = sheet.getRange(PL_HEADER_ROW, PL_ID_COLUMN);
+  if (String(cell.getValue() || "").trim() !== label) cell.setValue(label);
+  return sheet;
+}
+
+/** 申請IDでPL側の行番号を探す（無ければ -1）。申請ID列だけを読む。 */
+function findPlRow_(sheet, id) {
+  const last = sheet.getLastRow();
+  if (last < PL_FIRST_ROW) return -1;
+  const values = sheet
+    .getRange(PL_FIRST_ROW, PL_ID_COLUMN, last - PL_FIRST_ROW + 1, 1)
+    .getValues();
+  const target = String(id);
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || "").trim() === target) return PL_FIRST_ROW + i;
+  }
+  return -1;
+}
+
+/**
+ * "2026-08-05" のような日付文字列を Date にする。
+ * PL側の SUMIFS は ">=2026-08-01" と日付として比較するため、
+ * 文字列のまま書くと一件も集計されない（元のモデルが全月 0 だった原因）。
+ */
+function toPlDate_(value) {
+  if (value instanceof Date) return value;
+  const s = String(value == null ? "" : value).trim();
+  const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+/** PLの1行分の値。列は PL_EXPENSE_COLUMNS の定義順そのもの。 */
+function buildPlRowValues_(rec, plDepartment, plCategory) {
+  const note = [rec.vendor, rec.description]
+    .map(function (v) {
+      return String(v == null ? "" : v).trim();
+    })
+    .filter(function (v) {
+      return v;
+    })
+    .join(" / ");
+  return [
+    toPlDate_(rec.date),
+    String(rec.applicant || ""),
+    plDepartment,
+    plCategory,
+    Number(rec.amount) || 0,
+    note,
+    String(rec.id || ""),
+  ];
+}
+
+/**
+ * 書き込み先の行を決める。申請IDも日付も金額も空の行があればそこを再利用し、
+ * 無ければ最終行の次に足す。PL_LAST_ROW を超える場合は null（SUMIFS の範囲外に
+ * 書いても集計されないため、黙って範囲外へ書かない）。
+ */
+function nextPlRow_(sheet) {
+  const last = sheet.getLastRow();
+  if (last >= PL_FIRST_ROW) {
+    const values = sheet
+      .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, PL_ID_COLUMN)
+      .getValues();
+    for (let i = 0; i < values.length; i++) {
+      const r = values[i];
+      const empty = !String(r[0] || "").trim() && !r[4] && !String(r[6] || "").trim();
+      if (empty) return PL_FIRST_ROW + i;
+    }
+  }
+  const row = Math.max(last + 1, PL_FIRST_ROW);
+  return row > PL_LAST_ROW ? null : row;
+}
+
+function writePlRow_(sheet, row, values) {
+  sheet.getRange(row, 1, 1, values.length).setValues([values]);
+  sheet.getRange(row, 1).setNumberFormat("yyyy-mm-dd");
+}
+
+/** スキップ記録の upsert（同じ申請を何度も積まない）。 */
+function recordPlSkip_(rec, reason) {
+  const sheet = getPlSkippedSheet_();
+  const values = [
+    new Date().toISOString(),
+    String(rec.id || ""),
+    String(rec.applicant || ""),
+    String(rec.department || ""),
+    String(rec.category || ""),
+    Number(rec.amount) || 0,
+    reason,
+  ];
+  const row = findRowByColumn_(sheet, "id", String(rec.id || ""), PL_SKIPPED_COLUMNS);
+  if (row > 0) sheet.getRange(row, 1, 1, values.length).setValues([values]);
+  else sheet.appendRow(values);
+}
+
+function clearPlSkip_(id) {
+  const sheet = getPlSkippedSheet_();
+  const row = findRowByColumn_(sheet, "id", String(id), PL_SKIPPED_COLUMNS);
+  if (row > 0) sheet.deleteRow(row);
+}
+
+function countPlSkipped_() {
+  const sheet = getPlSkippedSheet_();
+  return Math.max(0, sheet.getLastRow() - 1);
+}
+
+/**
+ * 申請1件をPLへ反映する。
+ *
+ * - 承認済み以外（申請中・却下）はPLに載せない。既に載っていれば取り下げる。
+ * - 事業部の対応先が無い場合は書かずにスキップ記録へ残す（金額の行き先を
+ *   勝手に決めてしまうと、別の事業部のPLを汚す）。
+ * - 科目の対応先が無い場合は「その他経費」へ寄せる（経費そのものは落とさない）。
+ */
+function syncExpenseToPl_(rec) {
+  const sheet = getPlExpenseSheet_();
+  if (!sheet) return { ok: false, reason: "disabled" };
+  const id = String(rec.id || "");
+  if (!id) return { ok: false, reason: "no id" };
+  const row = findPlRow_(sheet, id);
+
+  if (String(rec.status || "") !== "approved") {
+    if (row > 0) sheet.deleteRow(row);
+    clearPlSkip_(id);
+    return { ok: true, posted: false, reason: "not approved" };
+  }
+
+  const maps = loadPlMappings_();
+  const department = String(rec.department || "").trim();
+  const plDepartment = maps.department[department];
+  if (!plDepartment) {
+    if (row > 0) sheet.deleteRow(row);
+    recordPlSkip_(
+      rec,
+      "事業部「" + (department || "未設定") + "」のPL対応先が未設定"
+    );
+    return { ok: false, posted: false, reason: "unmapped department" };
+  }
+  const plCategory =
+    maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
+  const values = buildPlRowValues_(rec, plDepartment, plCategory);
+  if (!values[0]) {
+    recordPlSkip_(rec, "利用日が日付として読めない（" + rec.date + "）");
+    return { ok: false, posted: false, reason: "bad date" };
+  }
+
+  if (row > 0) {
+    writePlRow_(sheet, row, values);
+  } else {
+    const target = nextPlRow_(sheet);
+    if (!target) {
+      recordPlSkip_(rec, "PL側の行数上限（" + PL_LAST_ROW + "行）に達した");
+      return { ok: false, posted: false, reason: "out of range" };
+    }
+    writePlRow_(sheet, target, values);
+  }
+  clearPlSkip_(id);
+  return { ok: true, posted: true };
+}
+
+/**
+ * PL連携の失敗で申請そのものを落とさないためのラッパー。
+ * 連携先が一時的に開けなくても、申請の保存・承認は成立させる
+ * （取りこぼしは syncAllToPl() で後から揃えられる）。
+ */
+function safeSyncExpenseToPl_(rec) {
+  try {
+    return syncExpenseToPl_(rec);
+  } catch (err) {
+    return { ok: false, reason: String(err && err.message ? err.message : err) };
+  }
+}
+
+/** 申請IDでPLの行を取り下げる（削除時に使う）。 */
+function safeRemoveFromPl_(id) {
+  try {
+    const sheet = getPlExpenseSheet_();
+    if (!sheet) return;
+    const row = findPlRow_(sheet, String(id));
+    if (row > 0) sheet.deleteRow(row);
+    clearPlSkip_(id);
+  } catch (err) {
+    // 連携先を触れなくても申請の削除は成立させる
+  }
+}
+
+/**
+ * メンテナンス用：既存の全申請をPLへ反映し直す（エディタから手動実行）。
+ * 連携を有効にした直後の取り込みと、一時的な失敗の埋め戻しに使う。
+ *
+ * アプリ由来の行（申請IDあり）をいったん全て取り下げてから、承認済みを
+ * まとめて書き直す。手動入力行（申請IDなし）は読み取りも書き換えもしない。
+ */
+function syncAllToPl() {
+  const sheet = getPlExpenseSheet_();
+  if (!sheet) {
+    const msg =
+      "PL連携が無効です。スクリプトプロパティ PL_SPREADSHEET_ID に" +
+      "PL管理モデルのスプレッドシートIDを設定してください。";
+    Logger.log(msg);
+    return msg;
+  }
+  // 既存のアプリ由来の行を下から削除（手動入力行は申請IDが空なので残る）
+  const last = sheet.getLastRow();
+  if (last >= PL_FIRST_ROW) {
+    const ids = sheet
+      .getRange(PL_FIRST_ROW, PL_ID_COLUMN, last - PL_FIRST_ROW + 1, 1)
+      .getValues();
+    for (let i = ids.length - 1; i >= 0; i--) {
+      if (String(ids[i][0] || "").trim()) sheet.deleteRow(PL_FIRST_ROW + i);
+    }
+  }
+  // 承認済みを対応表で変換して書き出す
+  const maps = loadPlMappings_();
+  const records = rowsToRecords_(getSheet_());
+  const rows = [];
+  const skipped = [];
+  records.forEach(function (rec) {
+    if (String(rec.status || "") !== "approved") return;
+    const department = String(rec.department || "").trim();
+    const plDepartment = maps.department[department];
+    if (!plDepartment) {
+      skipped.push([rec, "事業部「" + (department || "未設定") + "」のPL対応先が未設定"]);
+      return;
+    }
+    const plCategory =
+      maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
+    const values = buildPlRowValues_(rec, plDepartment, plCategory);
+    if (!values[0]) {
+      skipped.push([rec, "利用日が日付として読めない（" + rec.date + "）"]);
+      return;
+    }
+    rows.push(values);
+  });
+
+  const start = Math.max(sheet.getLastRow() + 1, PL_FIRST_ROW);
+  const room = PL_LAST_ROW - start + 1;
+  const writable = rows.slice(0, Math.max(0, room));
+  rows.slice(writable.length).forEach(function (v) {
+    skipped.push([{ id: v[6], applicant: v[1], department: v[2], category: v[3], amount: v[4] },
+      "PL側の行数上限（" + PL_LAST_ROW + "行）に達した"]);
+  });
+  if (writable.length) {
+    sheet.getRange(start, 1, writable.length, PL_ID_COLUMN).setValues(writable);
+    sheet.getRange(start, 1, writable.length, 1).setNumberFormat("yyyy-mm-dd");
+  }
+
+  // スキップ記録は作り直す（解消済みの警告を残さない）
+  const skipSheet = getPlSkippedSheet_();
+  if (skipSheet.getLastRow() > 1) {
+    skipSheet.deleteRows(2, skipSheet.getLastRow() - 1);
+  }
+  skipped.forEach(function (s) {
+    recordPlSkip_(s[0], s[1]);
+  });
+
+  const msg =
+    "PL連携: " + writable.length + "件を反映、" + skipped.length + "件をスキップ";
+  Logger.log(msg);
+  return msg;
+}
+
+/* ---------- PL側スプレッドシートの初期設定（1回だけ実行する） ---------- */
+
+/**
+ * メンテナンス用：PL管理モデル側をアプリ連携に合わせて整える（エディタから手動実行）。
+ * 何度実行しても同じ結果になる（追加済みのものは飛ばす）。
+ *
+ *   1. 日付列を実日付へ移行する（経費・売上の両方）
+ *   2. SUMIFS の範囲を 100 行から PL_LAST_ROW まで広げる
+ *   3. 各PL計算シートへ「その他経費（実費）」行を足し、経費合計に含める
+ *
+ * 1 は元のモデルが全月 0 円だった原因への対処。日付列が文字列なのに SUMIFS が
+ * ">=2026-08-01" と日付比較していたため、条件が一件も一致していなかった。
+ */
+function setupPlSheets() {
+  const ss = getPlSpreadsheet_();
+  if (!ss) {
+    const msg =
+      "PL連携が無効です。スクリプトプロパティ PL_SPREADSHEET_ID に" +
+      "PL管理モデルのスプレッドシートIDを設定してください。";
+    Logger.log(msg);
+    return msg;
+  }
+  const done = [];
+  [PL_EXPENSE_SHEET, PL_SALES_SHEET].forEach(function (name) {
+    const n = fixPlDateColumn_(ss, name);
+    if (n > 0) done.push(name + "の日付を実日付へ移行: " + n + "件");
+  });
+  const widened = widenPlSumifsRanges_(ss);
+  if (widened > 0) done.push("SUMIFS の範囲を拡張: " + widened + "式");
+  getPlExpenseSheet_(); // 申請ID列の見出しを用意する
+  done.push("『" + PL_EXPENSE_COLUMNS[PL_ID_COLUMN - 1][1] + "』列を用意");
+  ss.getSheets().forEach(function (sheet) {
+    const label = addPlOtherExpenseRow_(sheet);
+    if (label) done.push(sheet.getName() + "に「" + label + "」行を追加");
+  });
+  const msg = done.length ? done.join(" / ") : "変更はありませんでした（すでに設定済み）";
+  Logger.log(msg);
+  return msg;
+}
+
+/**
+ * 日付列（A列）の文字列を Date に置き換える。
+ * SUMIFS の日付条件は文字列の日付と一致しないため、これを直さないと
+ * PL計算シートは何を書いても 0 円のままになる。
+ */
+function fixPlDateColumn_(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return 0;
+  const last = sheet.getLastRow();
+  if (last < PL_FIRST_ROW) return 0;
+  const range = sheet.getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1);
+  const values = range.getValues();
+  let changed = 0;
+  const out = values.map(function (r) {
+    const v = r[0];
+    if (v instanceof Date || v === "" || v == null) return [v];
+    const d = toPlDate_(v);
+    if (!d) return [v];
+    changed++;
+    return [d];
+  });
+  if (changed) {
+    range.setValues(out);
+    range.setNumberFormat("yyyy-mm-dd");
+  }
+  return changed;
+}
+
+/** 『経費入力テーブル』を参照する SUMIFS の範囲を PL_LAST_ROW まで広げる。 */
+function widenPlSumifsRanges_(ss) {
+  const pattern = new RegExp(
+    "('" + PL_EXPENSE_SHEET + "'!\\$[A-Z]\\$" + PL_FIRST_ROW + ":\\$[A-Z]\\$)(\\d+)",
+    "g"
+  );
+  let count = 0;
+  ss.getSheets().forEach(function (sheet) {
+    const formulas = sheet.getDataRange().getFormulas();
+    formulas.forEach(function (row, i) {
+      row.forEach(function (f, j) {
+        if (!f || f.indexOf(PL_EXPENSE_SHEET) < 0) return;
+        const next = f.replace(pattern, function (all, head, lastRow) {
+          if (Number(lastRow) >= PL_LAST_ROW) return all;
+          return head + PL_LAST_ROW;
+        });
+        if (next === f) return;
+        // 変更した数式だけを個別に書き戻す。範囲まとめての setFormulas は、
+        // 数式でないセル（見出し・固定人件費の実数値）を空文字で消してしまう。
+        sheet.getRange(i + 1, j + 1).setFormula(next);
+        count++;
+      });
+    });
+  });
+  return count;
+}
+
+/**
+ * PL計算シートへ「その他経費（実費）」行を足し、経費合計に含める。
+ *
+ * 対応する経費項目の行が無い科目（会議費・消耗品費・通信費・宿泊費・その他）を
+ * 受けるための行。個別の科目名で SUMIFS を書くのではなく
+ * 「事業部×月の経費合計 − すでに個別行で拾っている分」の差で出すため、
+ * **将来アプリ側に科目が増えてもPLから漏れない。**
+ *
+ * 経費合計の行が無いシート（ダッシュボード等）は対象外。すでに行があれば何もしない。
+ */
+function addPlOtherExpenseRow_(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 2) return "";
+  const labels = sheet.getRange(1, 1, last, 1).getValues();
+  let totalRow = 0;
+  for (let i = 0; i < labels.length; i++) {
+    const t = String(labels[i][0] == null ? "" : labels[i][0]).trim();
+    if (t === PL_OTHER_ROW_LABEL.trim()) return ""; // すでに追加済み
+    if (!totalRow && t === "経費合計") totalRow = i + 1;
+  }
+  if (!totalRow) return "";
+
+  // 経費合計より上で『経費入力テーブル』から拾っている行＝すでに個別計上済みの行。
+  // 固定人件費や概算家賃のような手置きの行は引かない（差から漏れてしまう）。
+  const lastCol = sheet.getLastColumn();
+  const formulas = sheet.getRange(1, 1, totalRow, lastCol).getFormulas();
+  const itemRows = [];
+  for (let r = 1; r < totalRow; r++) {
+    const f = formulas[r - 1][1]; // B列（最初の月）で判定する
+    if (f && f.indexOf(PL_EXPENSE_SHEET) >= 0) itemRows.push(r);
+  }
+  if (!itemRows.length) return ""; // 経費を集計していないシート
+
+  // 月ごとの条件（事業部・期間）は既存の数式から取り出して、そのまま使い回す。
+  const sample = formulas[itemRows[0] - 1];
+  const totalFormula = sheet.getRange(totalRow, 2).getFormula();
+
+  sheet.insertRowBefore(totalRow);
+  const newRow = totalRow; // 挿入した行。経費合計は1つ下へ動く
+  sheet.getRange(newRow, 1).setValue(PL_OTHER_ROW_LABEL);
+
+  const values = [];
+  for (let c = 2; c <= lastCol; c++) {
+    const src = sample[c - 1];
+    const args = src ? parsePlSumifsArgs_(src) : null;
+    if (!args) {
+      // 合計列（SUM）などは、この行の月セルを足し合わせる
+      values.push(c > 2 ? "=SUM(B" + newRow + ":" + columnLetter_(c - 1) + newRow + ")" : "");
+      continue;
+    }
+    const total =
+      "SUMIFS('" + PL_EXPENSE_SHEET + "'!$E$" + PL_FIRST_ROW + ":$E$" + PL_LAST_ROW +
+      ", '" + PL_EXPENSE_SHEET + "'!$C$" + PL_FIRST_ROW + ":$C$" + PL_LAST_ROW +
+      ', "' + args.department + '"' +
+      ", '" + PL_EXPENSE_SHEET + "'!$A$" + PL_FIRST_ROW + ":$A$" + PL_LAST_ROW +
+      ', "' + args.from + '"' +
+      ", '" + PL_EXPENSE_SHEET + "'!$A$" + PL_FIRST_ROW + ":$A$" + PL_LAST_ROW +
+      ', "' + args.to + '")';
+    const subtract = itemRows
+      .map(function (r) {
+        // 挿入で1つ下へずれた行は番号を繰り下げる
+        return columnLetter_(c) + (r >= newRow ? r + 1 : r);
+      })
+      .join(" - ");
+    values.push("=" + total + (subtract ? " - " + subtract : ""));
+  }
+  sheet.getRange(newRow, 2, 1, values.length).setValues([values]);
+
+  // 経費合計に新しい行を含める。挿入位置が SUM の範囲の「直後」なので、
+  // 行の挿入では範囲が自動で広がらない（範囲の内側に挿した場合だけ広がる）。
+  if (totalFormula) {
+    const totalRowAfter = newRow + 1;
+    for (let c = 2; c <= lastCol; c++) {
+      const cell = sheet.getRange(totalRowAfter, c);
+      const cur = cell.getFormula();
+      if (!cur) continue; // 数式でないセルには書き込まない（実数値を消さない）
+      const next = shiftPlSumRange_(cur, newRow);
+      if (next !== cur) cell.setFormula(next);
+    }
+  }
+  return PL_OTHER_ROW_LABEL.trim();
+}
+
+/** SUM(B12:B15) の終端を、挿入した行を含む位置まで広げる。 */
+function shiftPlSumRange_(formula, insertedRow) {
+  return formula.replace(
+    /(\$?[A-Z]+\$?)(\d+):(\$?[A-Z]+\$?)(\d+)/,
+    function (all, c1, r1, c2, r2) {
+      const end = Number(r2);
+      return c1 + r1 + ":" + c2 + (end + 1 === insertedRow ? end + 1 : end);
+    }
+  );
+}
+
+/** SUMIFS から 事業部の条件と日付の範囲条件を取り出す。 */
+function parsePlSumifsArgs_(formula) {
+  if (!formula || formula.indexOf("SUMIFS") < 0) return null;
+  const dept = formula.match(/\$C\$\d+:\$C\$\d+,\s*"([^"]+)"/);
+  const dates = formula.match(/\$A\$\d+:\$A\$\d+,\s*"(>=[^"]+)"[\s\S]*?\$A\$\d+:\$A\$\d+,\s*"(<=[^"]+)"/);
+  if (!dept || !dates) return null;
+  return { department: dept[1], from: dates[1], to: dates[2] };
+}
+
+/** 1 → "A" の列記号。 */
+function columnLetter_(index) {
+  let n = index;
+  let out = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    out = String.fromCharCode(65 + rem) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
 }
 
 /* ========================= 月次フォルダの自動生成 ========================= */

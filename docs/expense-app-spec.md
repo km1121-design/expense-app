@@ -334,8 +334,33 @@ ARTGRAGE / クリニック / GoonerHouse）
 `aiVendor`〜`aiDescription`→各項目の（AI読取）/ `corrected`→修正された項目 /
 `applicantId`→申請者ID / `rawHead`→書き起こし（先頭）
 
+**PL連携マッピング**（`PL_SPREADSHEET_ID` 設定時のみ作成）:
+`kind`→種別（`事業部` / `科目`）/ `appValue`→アプリの値 / `plValue`→PLの値
+
+**PL連携スキップ**（同上）: `recordedAt`→記録日時 / `id`→申請ID /
+`applicant`→申請者 / `department`→事業部 / `category`→科目 / `amount`→金額 /
+`reason`→理由
+
 - `status`: `pending` / `approved` / `rejected`。`role`: `user` / `admin`。
   （シート上の見出しは日本語だが、値そのものは英語のまま）
+
+### 5.1 PL管理モデルへの連携（オプション）
+
+スクリプトプロパティ `PL_SPREADSHEET_ID` を設定すると、**承認済みの経費申請**を
+別スプレッドシート「PL管理プロトタイプ」の『経費入力テーブル』へ反映する。
+PL計算シートの SUMIFS がそれを集計し、各事業部の月次営業利益と
+インセンティブに載る。未設定なら連携は一切動かない。
+
+- **アプリ由来の行はG列『申請ID』で見分ける。** 申請IDが空の行（手動入力）は
+  読み取りも書き換えもしない。同じ申請は申請IDで上書きするため重複しない。
+- **承認済みだけを載せる。** 却下・差戻し・削除ではPLから取り下げる。
+- 語彙の変換は「PL連携マッピング」シートで管理する（コードに埋め込まない）。
+  対応先の無い科目は「その他経費」へ寄せ、対応先の無い事業部は書かずに
+  「PL連携スキップ」へ残して管理者ダッシュボードに警告を出す。
+- 反映は申請の保存・承認・削除と同じリクエスト内で行い、失敗しても申請自体は
+  成立させる（取りこぼしは `syncAllToPl` / `syncPl` で埋め戻せる）。
+- PL側の初期設定は `setupPlSheets` を1回実行する（日付列の実日付化・SUMIFS の
+  範囲拡張・「その他経費（実費）」行の追加）。手順は `apps-script/README.md`。
 
 ## 6. API（POST は text/plain の JSON。認証系以外は token 必須）
 
@@ -358,6 +383,7 @@ ARTGRAGE / クリニック / GoonerHouse）
 | `listFares` / `upsertFare` / `deleteFare` | admin | 運賃マスタの一覧・上書き・削除 |
 | `analyzeReceipt` | user | AIレシート解析（AIキー設定時のみ。過去の学習を自動適用） |
 | `listVendorMemory` / `deleteVendorMemory` | admin | AI解析の学習データの確認・店舗単位の削除 |
+| `syncPl` | admin | 承認済みの全申請をPL管理モデルへ入れ直す（`PL_SPREADSHEET_ID` 設定時のみ） |
 | GET `?token=` | user/admin | JSON取得（userは自分の分のみ） |
 
 分析ツール向け: スクリプトプロパティ `SHARED_TOKEN` を設定すると、

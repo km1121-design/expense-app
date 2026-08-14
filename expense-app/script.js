@@ -48,6 +48,7 @@ const state = {
   lastFare: null, // 直前の運賃照合結果（申請時にサーバーへ区間を送る）
   lastError: null, // 直前の通信エラー（同期バッジのクリックで確認できる）
   features: {}, // バックエンド（Apps Script）が対応している機能
+  plSkipped: 0, // PL管理モデルへ反映できていない申請の件数（管理者向けの警告）
 };
 
 const cloudEnabled = () => !!state.config.endpoint;
@@ -1274,6 +1275,45 @@ function applyBackendNotice() {
     " が使えません。最新の <code>Code.gs</code> を貼り付けて再デプロイしてください" +
     "（デプロイ → デプロイを管理 → ✏️ → 新バージョン）。";
   el.hidden = false;
+}
+
+/**
+ * PL管理モデルへ反映できなかった経費の件数を管理者に知らせる。
+ * 事業部の対応先が対応表に無い経費は、金額の行き先を決められないためPLに載らない。
+ * 黙って落とすとその事業部の利益が実態より良く見えてしまうので、必ず気づけるようにする。
+ */
+function applyPlNotice() {
+  const el = $("#plNotice");
+  if (!el) return;
+  const count = Number(state.plSkipped || 0);
+  if (!state.isAdmin || !state.features.plSync || !count) {
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML =
+    "⚠️ <strong>" +
+    count +
+    "件の経費がPL管理モデルへ反映されていません。</strong>" +
+    "「PL連携スキップ」シートで理由を確認し、「PL連携マッピング」シートへ" +
+    "事業部の対応先を追加してから再同期してください。 " +
+    '<button type="button" class="btn btn--sm" id="plSyncNow">今すぐ再同期</button>';
+  el.hidden = false;
+  $("#plSyncNow").addEventListener("click", syncPlNow);
+}
+
+/** 対応表を直したあとの再同期。承認済みの全件をPLへ入れ直す。 */
+async function syncPlNow() {
+  const btn = $("#plSyncNow");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiPost({ action: "syncPl" });
+    state.plSkipped = Number(res.skipped || 0);
+    toast(res.message || "PLへ再同期しました");
+    applyPlNotice();
+  } catch (err) {
+    toast("再同期に失敗しました: " + ((err && err.message) || err));
+    if (btn) btn.disabled = false;
+  }
 }
 
 /**
@@ -2570,6 +2610,8 @@ async function initMode() {
       saveSession();
       if (boot.departments) state.departments = boot.departments;
       state.isAdmin = boot.user.role === "admin";
+      state.plSkipped = Number(boot.plSkipped || 0);
+      applyPlNotice();
       syncAdminUI();
       applySessionUI();
       applyDeptUI();
