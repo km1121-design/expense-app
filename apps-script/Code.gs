@@ -2766,21 +2766,72 @@ function findPlRow_(sheet, id) {
   return -1;
 }
 
+/** その瞬間を指定タイムゾーンで見た「見かけの日時」を UTC ミリ秒として返す。 */
+function tzShownMs_(instant, tz) {
+  const p = Utilities.formatDate(instant, tz, "yyyy-MM-dd-HH-mm")
+    .split("-")
+    .map(Number);
+  return Date.UTC(p[0], p[1] - 1, p[2], p[3], p[4]);
+}
+
 /**
- * "2026-08-05" のような日付文字列を Date にする。
- * PL側の SUMIFS は ">=2026-08-01" と日付として比較するため、
- * 文字列のまま書くと一件も集計されない（元のモデルが全月 0 だった原因）。
+ * 指定タイムゾーンで「その日の 0:00」になる Date を返す。
+ *
+ * `new Date(y, m, d)` はスクリプトのタイムゾーンでの 0:00 なので、
+ * スプレッドシートのタイムゾーンが違うと**シート上では別の日付になる**。
+ * 実際に起きた例: スクリプトが Asia/Tokyo(+9)、PLモデルが
+ * America/Los_Angeles(-7) で 16時間巻き戻り、全ての日付が1日前になった。
+ * 日付がずれると月初・月末の SUMIFS が外れ、その月の経費が消える。
  */
-function toPlDate_(value) {
-  if (value instanceof Date) return value;
-  const s = String(value == null ? "" : value).trim();
-  const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (!m) return null;
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+function dateInTimeZone_(y, m, d, tz) {
+  const want = Date.UTC(y, m - 1, d);
+  let t = want;
+  // 見かけの日時と目的の日時の差を当てて補正する（夏時間の境界のため2回まで）
+  for (let i = 0; i < 2; i++) {
+    const diff = want - tzShownMs_(new Date(t), tz);
+    if (!diff) break;
+    t += diff;
+  }
+  return new Date(t);
+}
+
+/**
+ * 日付を、PLシートのタイムゾーンで 0:00 になる Date にする。
+ *
+ * PL側の SUMIFS は ">=2026-08-01" と日付として比較するため、文字列のまま
+ * 書くと一件も集計されない（元のモデルが全月 0 だった原因）。
+ * `tz` を省略した場合はスクリプトのタイムゾーンでの 0:00（テスト用）。
+ */
+function toPlDate_(value, tz) {
+  let y;
+  let m;
+  let d;
+  if (value instanceof Date) {
+    // シート上の表示日を取り出す（スクリプトTZで読むと表示どおりの日付になる）
+    const p = Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd")
+      .split("-")
+      .map(Number);
+    y = p[0];
+    m = p[1];
+    d = p[2];
+  } else {
+    const s = String(value == null ? "" : value).trim();
+    const mt = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (!mt) return null;
+    y = Number(mt[1]);
+    m = Number(mt[2]);
+    d = Number(mt[3]);
+  }
+  return tz ? dateInTimeZone_(y, m, d, tz) : new Date(y, m - 1, d);
+}
+
+/** PLシートのタイムゾーン。日付を書くたびに必要なので、シートから直接取る。 */
+function plTimeZone_(sheet) {
+  return sheet.getParent().getSpreadsheetTimeZone();
 }
 
 /** PLの1行分の値。列は PL_EXPENSE_COLUMNS の定義順そのもの。 */
-function buildPlRowValues_(rec, plDepartment, plCategory) {
+function buildPlRowValues_(rec, plDepartment, plCategory, tz) {
   const note = [rec.vendor, rec.description]
     .map(function (v) {
       return String(v == null ? "" : v).trim();
@@ -2790,7 +2841,7 @@ function buildPlRowValues_(rec, plDepartment, plCategory) {
     })
     .join(" / ");
   return [
-    toPlDate_(rec.date),
+    toPlDate_(rec.date, tz),
     String(rec.applicant || ""),
     plDepartment,
     plCategory,
@@ -2888,7 +2939,7 @@ function syncExpenseToPl_(rec) {
   }
   const plCategory =
     maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
-  const values = buildPlRowValues_(rec, plDepartment, plCategory);
+  const values = buildPlRowValues_(rec, plDepartment, plCategory, plTimeZone_(sheet));
   if (!values[0]) {
     recordPlSkip_(rec, "利用日が日付として読めない（" + rec.date + "）");
     return { ok: false, posted: false, reason: "bad date" };
@@ -2961,6 +3012,7 @@ function syncAllToPl() {
     }
   }
   // 承認済みを対応表で変換して書き出す
+  const tz = plTimeZone_(sheet);
   const maps = loadPlMappings_();
   const records = rowsToRecords_(getSheet_());
   const rows = [];
@@ -2975,7 +3027,7 @@ function syncAllToPl() {
     }
     const plCategory =
       maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
-    const values = buildPlRowValues_(rec, plDepartment, plCategory);
+    const values = buildPlRowValues_(rec, plDepartment, plCategory, tz);
     if (!values[0]) {
       skipped.push([rec, "利用日が日付として読めない（" + rec.date + "）"]);
       return;
@@ -3033,6 +3085,12 @@ function setupPlSheets() {
     return msg;
   }
   const done = [];
+  // ずれた日付の復元 → 文字列日付の移行 の順に流す（復元は時刻を目印にするため、
+  // 時刻を落とす移行より先に実行しないと目印が消える）
+  [PL_EXPENSE_SHEET, PL_SALES_SHEET].forEach(function (name) {
+    const n = repairPlShiftedDates_(ss, name);
+    if (n > 0) done.push(name + "のずれた日付を復元: " + n + "件");
+  });
   [PL_EXPENSE_SHEET, PL_SALES_SHEET].forEach(function (name) {
     const n = fixPlDateColumn_(ss, name);
     if (n > 0) done.push(name + "の日付を実日付へ移行: " + n + "件");
@@ -3045,6 +3103,9 @@ function setupPlSheets() {
     const label = addPlOtherExpenseRow_(sheet);
     if (label) done.push(sheet.getName() + "に「" + label + "」行を追加");
   });
+  // 月末の条件を半開区間へ（その他経費の行を作ったあとに変換する）
+  const halfOpen = usePlHalfOpenRanges_(ss);
+  if (halfOpen > 0) done.push("月末の条件を「<翌月1日」へ変更: " + halfOpen + "式");
   const msg = done.length ? done.join(" / ") : "変更はありませんでした（すでに設定済み）";
   Logger.log(msg);
   return msg;
@@ -3060,22 +3121,117 @@ function fixPlDateColumn_(ss, sheetName) {
   if (!sheet) return 0;
   const last = sheet.getLastRow();
   if (last < PL_FIRST_ROW) return 0;
-  const range = sheet.getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1);
-  const values = range.getValues();
+  const tz = ss.getSpreadsheetTimeZone();
+  const scriptTz = Session.getScriptTimeZone();
+  const values = sheet
+    .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1)
+    .getValues();
   let changed = 0;
-  const out = values.map(function (r) {
+  values.forEach(function (r, i) {
     const v = r[0];
-    if (v instanceof Date || v === "" || v == null) return [v];
-    const d = toPlDate_(v);
-    if (!d) return [v];
+    if (v === "" || v == null) return;
+    // すでに 0:00 の日付は書き換えない。
+    // シートから読んだ Date と、これから書く Date は同じ日付でも値が一致しない
+    // （読みはスクリプトTZ基準・書きはシートTZ基準）ため、時刻の表示で判定する。
+    if (v instanceof Date && Utilities.formatDate(v, scriptTz, "HH-mm") === "00-00") {
+      return;
+    }
+    const d = toPlDate_(v, tz);
+    if (!d) return;
+    writePlDateCell_(sheet, PL_FIRST_ROW + i, d);
     changed++;
-    return [d];
   });
-  if (changed) {
-    range.setValues(out);
-    range.setNumberFormat("yyyy-mm-dd");
-  }
   return changed;
+}
+
+/**
+ * 日付セルを1つだけ書き換える。
+ *
+ * 範囲まとめての setValues を使ってはいけない。**読んだ日付をそのまま書き戻すと
+ * 日付がずれる**（読みはスクリプトTZ基準・書きはシートTZ基準のため）ので、
+ * 書き換える必要のあるセルだけを個別に更新する。
+ */
+function writePlDateCell_(sheet, row, date) {
+  const cell = sheet.getRange(row, 1);
+  cell.setValue(date);
+  cell.setNumberFormat("yyyy-mm-dd");
+}
+
+/**
+ * タイムゾーンのずれで日付が1日前になってしまった行を復元する。
+ *
+ * 対象は**時刻が 0:00 でない日付セルだけ**。人がシートに入力した日付は 0:00 に
+ * なるため触らない。ずれた値だけが時刻を持っている（スクリプトTZの 0:00 を
+ * シートTZで見た時刻）ので、それを目印にできる。
+ *
+ * ずれ幅はスクリプトとシートのタイムゾーン差そのものなので、その分を戻して
+ * 本来の日付を復元し、シートのTZで 0:00 に書き直す。
+ * 2回目以降は対象が無くなるため、何度実行しても同じ結果になる。
+ */
+function repairPlShiftedDates_(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return 0;
+  const last = sheet.getLastRow();
+  if (last < PL_FIRST_ROW) return 0;
+  const tz = ss.getSpreadsheetTimeZone();
+  const scriptTz = Session.getScriptTimeZone();
+  const values = sheet
+    .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1)
+    .getValues();
+  let changed = 0;
+  values.forEach(function (r, i) {
+    const v = r[0];
+    if (!(v instanceof Date)) return;
+    // 0:00 に見えている＝人が入力した日付。ずれていないので触らない
+    if (Utilities.formatDate(v, scriptTz, "HH-mm") === "00-00") return;
+    const drift = tzShownMs_(v, scriptTz) - tzShownMs_(v, tz);
+    if (!drift) return; // 同じタイムゾーンならずれていない
+    const p = Utilities.formatDate(new Date(v.getTime() + drift), scriptTz, "yyyy-MM-dd")
+      .split("-")
+      .map(Number);
+    writePlDateCell_(sheet, PL_FIRST_ROW + i, dateInTimeZone_(p[0], p[1], p[2], tz));
+    changed++;
+  });
+  return changed;
+}
+
+/**
+ * 月末の条件を「<=月末」から「<翌月1日」へ変える。
+ *
+ * 日付セルに時刻が残っていると `"<=2026-08-31"` は 8/31 の経費を落とす。
+ * 8月にも9月にも入らないため、その経費はPLから消える。半開区間にしておけば
+ * 時刻が入っていても取りこぼさない。
+ */
+function usePlHalfOpenRanges_(ss) {
+  let count = 0;
+  ss.getSheets().forEach(function (sheet) {
+    const formulas = sheet.getDataRange().getFormulas();
+    formulas.forEach(function (row, i) {
+      row.forEach(function (f, j) {
+        if (!f) return;
+        if (f.indexOf(PL_EXPENSE_SHEET) < 0 && f.indexOf(PL_SALES_SHEET) < 0) return;
+        const next = f.replace(
+          /"<=(\d{4})-(\d{2})-(\d{2})"/g,
+          function (all, y, m, d) {
+            const nd = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d) + 1));
+            return (
+              '"<' +
+              nd.getUTCFullYear() +
+              "-" +
+              ("0" + (nd.getUTCMonth() + 1)).slice(-2) +
+              "-" +
+              ("0" + nd.getUTCDate()).slice(-2) +
+              '"'
+            );
+          }
+        );
+        if (next === f) return;
+        sheet.getRange(i + 1, j + 1).setFormula(next);
+        count++;
+      });
+    });
+  });
+  return count;
 }
 
 /** 『経費入力テーブル』を参照する SUMIFS の範囲を PL_LAST_ROW まで広げる。 */
@@ -3203,7 +3359,10 @@ function shiftPlSumRange_(formula, insertedRow) {
 function parsePlSumifsArgs_(formula) {
   if (!formula || formula.indexOf("SUMIFS") < 0) return null;
   const dept = formula.match(/\$C\$\d+:\$C\$\d+,\s*"([^"]+)"/);
-  const dates = formula.match(/\$A\$\d+:\$A\$\d+,\s*"(>=[^"]+)"[\s\S]*?\$A\$\d+:\$A\$\d+,\s*"(<=[^"]+)"/);
+  // 月末の条件は "<=月末" と "<翌月1日" のどちらの形でも受ける
+  const dates = formula.match(
+    /\$A\$\d+:\$A\$\d+,\s*"(>=[^"]+)"[\s\S]*?\$A\$\d+:\$A\$\d+,\s*"(<=?[^"]+)"/
+  );
   if (!dept || !dates) return null;
   return { department: dept[1], from: dates[1], to: dates[2] };
 }
