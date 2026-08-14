@@ -2807,8 +2807,8 @@ function toPlDate_(value, tz) {
   let m;
   let d;
   if (value instanceof Date) {
-    // シート上の表示日を取り出す（スクリプトTZで読むと表示どおりの日付になる）
-    const p = Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd")
+    // シート上の表示日を取り出す（表示はシートのタイムゾーン基準）
+    const p = Utilities.formatDate(value, tz || Session.getScriptTimeZone(), "yyyy-MM-dd")
       .split("-")
       .map(Number);
     y = p[0];
@@ -3122,7 +3122,6 @@ function fixPlDateColumn_(ss, sheetName) {
   const last = sheet.getLastRow();
   if (last < PL_FIRST_ROW) return 0;
   const tz = ss.getSpreadsheetTimeZone();
-  const scriptTz = Session.getScriptTimeZone();
   const values = sheet
     .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1)
     .getValues();
@@ -3131,9 +3130,9 @@ function fixPlDateColumn_(ss, sheetName) {
     const v = r[0];
     if (v === "" || v == null) return;
     // すでに 0:00 の日付は書き換えない。
-    // シートから読んだ Date と、これから書く Date は同じ日付でも値が一致しない
-    // （読みはスクリプトTZ基準・書きはシートTZ基準）ため、時刻の表示で判定する。
-    if (v instanceof Date && Utilities.formatDate(v, scriptTz, "HH-mm") === "00-00") {
+    // **判定はシートのタイムゾーンで行う**（読み書きともシート基準で解釈される）。
+    // スクリプトのタイムゾーンで見ると、ずれた値がちょうど 0:00 に見えてしまう。
+    if (v instanceof Date && Utilities.formatDate(v, tz, "HH-mm") === "00-00") {
       return;
     }
     const d = toPlDate_(v, tz);
@@ -3146,10 +3145,7 @@ function fixPlDateColumn_(ss, sheetName) {
 
 /**
  * 日付セルを1つだけ書き換える。
- *
- * 範囲まとめての setValues を使ってはいけない。**読んだ日付をそのまま書き戻すと
- * 日付がずれる**（読みはスクリプトTZ基準・書きはシートTZ基準のため）ので、
- * 書き換える必要のあるセルだけを個別に更新する。
+ * 範囲まとめての setValues は、直す必要のないセルまで書き戻してしまうため使わない。
  */
 function writePlDateCell_(sheet, row, date) {
   const cell = sheet.getRange(row, 1);
@@ -3160,12 +3156,16 @@ function writePlDateCell_(sheet, row, date) {
 /**
  * タイムゾーンのずれで日付が1日前になってしまった行を復元する。
  *
- * 対象は**時刻が 0:00 でない日付セルだけ**。人がシートに入力した日付は 0:00 に
- * なるため触らない。ずれた値だけが時刻を持っている（スクリプトTZの 0:00 を
- * シートTZで見た時刻）ので、それを目印にできる。
+ * 見分け方は「**シートのタイムゾーンでの時刻が 0:00 でない**」こと。人がシートへ
+ * 入力した日付は 0:00 になるので触らない。旧コードは「スクリプトTZの 0:00」を
+ * 書いていたため、シートのTZでは時刻が付いて見える（+9 と -7 なら前日 8:00）。
  *
- * ずれ幅はスクリプトとシートのタイムゾーン差そのものなので、その分を戻して
- * 本来の日付を復元し、シートのTZで 0:00 に書き直す。
+ * 復元は簡単で、**スクリプトのタイムゾーンで読み直せば本来の日付が出る**
+ * （旧コードがスクリプトTZの 0:00 として書いた値そのものだから）。それを
+ * シートのタイムゾーンの 0:00 として書き直す。
+ *
+ * 念のため「スクリプトTZで 0:00 になる」ことも確かめ、旧コード由来でない
+ * 時刻付きの値（人が時刻まで入れた場合）は触らない。
  * 2回目以降は対象が無くなるため、何度実行しても同じ結果になる。
  */
 function repairPlShiftedDates_(ss, sheetName) {
@@ -3182,11 +3182,11 @@ function repairPlShiftedDates_(ss, sheetName) {
   values.forEach(function (r, i) {
     const v = r[0];
     if (!(v instanceof Date)) return;
-    // 0:00 に見えている＝人が入力した日付。ずれていないので触らない
-    if (Utilities.formatDate(v, scriptTz, "HH-mm") === "00-00") return;
-    const drift = tzShownMs_(v, scriptTz) - tzShownMs_(v, tz);
-    if (!drift) return; // 同じタイムゾーンならずれていない
-    const p = Utilities.formatDate(new Date(v.getTime() + drift), scriptTz, "yyyy-MM-dd")
+    // シートのTZで 0:00 ＝ 日付として正しく入っている（人が入力した行）
+    if (Utilities.formatDate(v, tz, "HH-mm") === "00-00") return;
+    // 旧コードが書いた値は「スクリプトTZの 0:00」。その形でなければ触らない
+    if (Utilities.formatDate(v, scriptTz, "HH-mm") !== "00-00") return;
+    const p = Utilities.formatDate(v, scriptTz, "yyyy-MM-dd")
       .split("-")
       .map(Number);
     writePlDateCell_(sheet, PL_FIRST_ROW + i, dateInTimeZone_(p[0], p[1], p[2], tz));
