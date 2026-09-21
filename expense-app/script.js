@@ -2505,6 +2505,37 @@ function exportCsv() {
  * タブ / モード切替 / 設定
  * ========================================================================= */
 
+/**
+ * マスタ系カードを「画面に入るまで読みに行かない」ようにする。
+ *
+ * 管理タブを開いた瞬間に3本まとめて投げると、Apps Script は同じ利用者の実行を
+ * 直列化するため、そのぶんタブの切り替えが待たされる。これらのカードはどれも
+ * 画面下にあり、普段は開いても見られないことが多い。
+ * 一度読んだら監視を外す（「再読込」ボタンは従来どおり効く）。
+ */
+const lazyCardLoaded = new WeakSet();
+function observeLazyCard(el, load) {
+  if (!el || lazyCardLoaded.has(el)) return;
+  // 対応していない環境では従来どおり即読み込む（機能を落とさない）
+  if (typeof IntersectionObserver !== "function") {
+    lazyCardLoaded.add(el);
+    load();
+    return;
+  }
+  const io = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((e) => {
+        if (!e.isIntersecting || lazyCardLoaded.has(el)) return;
+        lazyCardLoaded.add(el);
+        io.disconnect();
+        load();
+      });
+    },
+    { rootMargin: "300px" } // 見え始める少し手前で読み始める
+  );
+  io.observe(el);
+}
+
 function setTab(tab) {
   if (tab === "admin" && !state.isAdmin) tab = "apply";
   state.activeTab = tab;
@@ -2513,9 +2544,9 @@ function setTab(tab) {
     p.classList.toggle("is-active", p.dataset.panel === tab)
   );
   if (tab === "admin" && cloudEnabled() && state.isAdmin && state.authEnabled) {
-    loadUsers();
-    loadVendorMemory();
-    loadFares();
+    observeLazyCard($("#userMgmtCard"), loadUsers);
+    observeLazyCard($("#memoryCard"), loadVendorMemory);
+    observeLazyCard($("#fareMgmtCard"), loadFares);
   }
 }
 
