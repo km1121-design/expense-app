@@ -470,6 +470,93 @@ assert.strictEqual(
 );
 console.log("✓ 既知の誤読を再現していなければ読み直さない（AI呼び出しは1回）");
 
+/* -------- 10.5 必須項目が取れなかったときだけ丁寧に読み直す（段階的エスカレーション） -------- */
+// 1回目は速度優先の短い書き起こしで読む。金額・日付が欠けたときだけ、行数を
+// 増やして（設定があれば上位プロバイダで）読み直す。大半の申請は1回で終わる。
+assert.strictEqual(g.needsEscalation_({ amount: 1200, date: "2026-08-01" }), false);
+assert.strictEqual(g.needsEscalation_({ amount: 0, date: "2026-08-01" }), true, "金額0は読めていない");
+assert.strictEqual(g.needsEscalation_({ amount: 1200, date: "" }), true, "日付なしは読めていない");
+assert.strictEqual(g.needsEscalation_(null), true);
+
+// (a) 読めていれば読み直さない（1回で終わる）
+let seen = [];
+const recordingStub = (byCall) => (b, hint, opts) => {
+  seen.push({ hint: String(hint || ""), lines: (opts || {}).lines, provider: (opts || {}).provider, model: (opts || {}).model });
+  return { fields: Object.assign({}, byCall(seen.length)), model: "stub" };
+};
+g.analyzeWithGemini_ = recordingStub(() => ({
+  date: "2026-08-01", amount: 980, vendor: "読めた店", category: "その他", description: "飲食",
+}));
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(seen.length, 1, "読めていれば1回で終わる");
+assert.strictEqual(res.escalated, false);
+assert.strictEqual(seen[0].lines, 12, "1回目は速度優先の行数");
+
+// (b) 金額が取れなければ、行数を増やして読み直す（プロバイダ未設定なので同じ無料枠のまま）
+seen = [];
+g.analyzeWithGemini_ = recordingStub((n) =>
+  n === 1
+    ? { date: "", amount: 0, vendor: "", category: "その他", description: "" }
+    : { date: "2026-08-02", amount: 3300, vendor: "難しい店", category: "会議費", description: "打合せ" }
+);
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(seen.length, 2, "読めなければ1回だけ読み直す");
+assert.strictEqual(seen[1].lines, 24, "読み直しは根拠を厚くする");
+assert.strictEqual(seen[1].provider, "", "プロバイダ未設定なら同じプロバイダのまま（追加課金なし）");
+assert.strictEqual(res.escalated, true);
+assert.strictEqual(res.fields.amount, 3300, "読み直しの結果を採用する");
+
+// (c) 読み直しても取れなければ、1回目の結果でそのまま応答する（エラーにしない）
+seen = [];
+g.analyzeWithGemini_ = recordingStub(() => ({
+  date: "", amount: 0, vendor: "", category: "その他", description: "",
+}));
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(seen.length, 2);
+assert.strictEqual(res.escalated, false, "読み直しでも取れなければ採用しない");
+assert.strictEqual(res.ok, true, "読めなくてもエラーにしない（手入力で申請できる）");
+
+// (d) 読み直しが例外で落ちても、1回目の結果で応答する
+seen = [];
+g.analyzeWithGemini_ = (b, hint, opts) => {
+  seen.push(opts || {});
+  if (seen.length > 1) throw new Error("503 overloaded");
+  return { fields: { date: "2026-08-03", amount: 0, vendor: "店", category: "その他", description: "" }, model: "stub" };
+};
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(res.ok, true);
+assert.strictEqual(res.escalated, false);
+
+// (e) OCR_ESCALATE_PROVIDER を設定すると、読み直しだけそちらへ回る
+props.ANTHROPIC_API_KEY = "dummy-claude";
+props.OCR_ESCALATE_PROVIDER = "claude";
+props.OCR_ESCALATE_MODEL = "claude-haiku-4-5";
+seen = [];
+let claudeCalls = 0;
+g.analyzeWithGemini_ = recordingStub(() => ({
+  date: "", amount: 0, vendor: "", category: "その他", description: "",
+}));
+g.analyzeWithClaude_ = (b, hint, opts) => {
+  claudeCalls++;
+  seen.push({ lines: (opts || {}).lines, provider: "claude", model: (opts || {}).model });
+  return { fields: { date: "2026-08-04", amount: 5400, vendor: "手書きの店", category: "その他", description: "" }, model: "claude-haiku-4-5" };
+};
+res = g.actionAnalyzeReceipt_({ token: "", imageBase64: "x" });
+assert.strictEqual(seen.length, 2, "1回目は無料枠、2回目だけ上位へ");
+assert.strictEqual(claudeCalls, 1, "上位プロバイダは読めなかったときだけ呼ぶ");
+assert.strictEqual(seen[1].model, "claude-haiku-4-5", "読み直し用モデルを使う");
+assert.strictEqual(res.fields.amount, 5400);
+assert.strictEqual(res.escalated, true);
+
+// (f) キーが無ければ、設定されていても上位へは回さない（同じプロバイダで読み直す）
+delete props.ANTHROPIC_API_KEY;
+assert.strictEqual(g.resolveEscalation_().provider, "", "キーが無ければ上位へ回さない");
+delete props.OCR_ESCALATE_PROVIDER;
+delete props.OCR_ESCALATE_MODEL;
+assert.strictEqual(g.resolveEscalation_().provider, "", "未設定が既定（課金しない）");
+props.ANTHROPIC_API_KEY = "dummy-claude";
+console.log("✓ 必須項目が取れないときだけ読み直し、設定があれば上位プロバイダへ回す");
+
 /* -------- 11. 読み直しが失敗しても初回結果で応答する -------- */
 calls.length = 0;
 let n2 = 0;

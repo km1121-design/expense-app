@@ -23,8 +23,12 @@
  *   FARE_MODEL        : 運賃照合に使うモデル（未設定なら現行の flash 系を順に試す）
  *   GEMINI_MODEL      : Geminiのモデル（未設定なら現行の flash 系を順に試す）
  *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効
- *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-4-8。安価なら claude-haiku-4-5）
+ *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-5。安価なら claude-haiku-4-5）
  *   OCR_PROVIDER      : 併用時の優先プロバイダ "gemini"/"claude"（未指定なら gemini 優先）
+ *   OCR_ESCALATE_PROVIDER : 1回目で金額・日付が取れなかったときだけ読み直すプロバイダ
+ *                       "gemini"/"claude"。**未設定なら読み直さない**（既定で無効）。
+ *                       有料モデルを指定すると、読めなかった分だけ課金が発生する
+ *   OCR_ESCALATE_MODEL    : 読み直しに使うモデル（未指定ならそのプロバイダの既定）
  *
  * 認証モード:
  *   users シートが空の間は「オープンモード」（認証なし・従来互換）。
@@ -152,10 +156,15 @@ const CORRECTION_HINT_MAX = 3;
 const DESCRIPTION_MIN_HITS = 2;
 /**
  * レシートの書き起こし（raw_text）に許す行数の上限。
- * AI解析の応答時間は出力の長さでほぼ決まるため、根拠として必要な最小限に絞る。
- * 読み取り精度が落ちるようなら増やす（増やすほど解析は遅くなる）。
+ *
+ * AI解析の応答時間は出力の長さでほぼ決まるので、精度と速度はこの数字で
+ * 正面から綱引きする。通常の読み取りは速度寄りに抑え、必須項目が取れなかった
+ * ときだけ `RECEIPT_RAW_TEXT_RETRY_LINES` で丁寧に読み直す（大半の申請は
+ * 1回目で終わるため、平均の待ち時間を増やさずに読み取れる範囲を広げられる）。
  */
-const RECEIPT_RAW_TEXT_MAX_LINES = 6;
+const RECEIPT_RAW_TEXT_MAX_LINES = 12;
+/** 読み直し時の上限。難しいレシートはここで根拠を厚くする */
+const RECEIPT_RAW_TEXT_RETRY_LINES = 24;
 
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
 
@@ -2075,8 +2084,9 @@ function todayStr_() {
  * レシート解析プロンプト（今日の日付を埋め込む）。
  * hint には過去の誤読事例（buildCorrectionHint_）を渡せる。
  */
-function buildReceiptPrompt_(hint) {
+function buildReceiptPrompt_(hint, maxLines) {
   const today = todayStr_();
+  const lines = Math.max(3, Math.round(Number(maxLines) || RECEIPT_RAW_TEXT_MAX_LINES));
   return (
     "あなたは日本の経費精算の担当者です。添付はレシートまたは領収書の写真です。\n" +
     "今日の日付は " + today + " です（この日付より未来の発行日はありえません）。\n\n" +
@@ -2084,10 +2094,10 @@ function buildReceiptPrompt_(hint) {
     "文字の向きを判断し、必要なら頭の中で回転させて正しく読んでください。\n\n" +
     "手順を必ず守ってください:\n" +
     // raw_text は精度のための「根拠」だが、応答時間は出力の長さでほぼ決まる。
-    // 全文を書き写させると解析が目に見えて遅くなるため、判断の決め手になる行だけに絞る。
-    "手順1: まず raw_text に、判断の決め手になる行だけを書き写す" +
-    "（店名の行・発行日の行・合計金額の行の3行が基本。判断に迷ったときだけ" +
-    "根拠になる行を足し、多くても" + RECEIPT_RAW_TEXT_MAX_LINES + "行まで）。" +
+    // 全文を書き写させると解析が目に見えて遅くなるため、根拠になる行だけに絞る。
+    "手順1: まず raw_text に、判断の根拠になる行を書き写す" +
+    "（店名の行・発行日の行・合計金額の行は必ず。読みにくい・紛らわしいときは" +
+    "周辺の行も足してよく、多くても" + lines + "行まで）。" +
     "品目の羅列・住所・電話番号・登録番号は書かない。読めない箇所は ? と書く。\n" +
     "手順2: その書き写しを根拠に、他の項目を埋める。書き写しに無い情報を創作しないこと。\n\n" +
     "各項目のルール:\n" +
@@ -2368,21 +2378,47 @@ function actionAnalyzeReceipt_(body) {
   if (!provider) {
     throw new Error("AI解析は未設定です（GEMINI_API_KEY または ANTHROPIC_API_KEY を設定してください）");
   }
-  const analyze = function (hint) {
-    return provider === "gemini"
-      ? analyzeWithGemini_(body, hint)
-      : analyzeWithClaude_(body, hint);
+  const analyze = function (hint, opts) {
+    const o = opts || {};
+    return o.provider === "claude" || (!o.provider && provider === "claude")
+      ? analyzeWithClaude_(body, hint, o)
+      : analyzeWithGemini_(body, hint, o);
   };
 
-  let out = analyze("");
+  let out = analyze("", { lines: RECEIPT_RAW_TEXT_MAX_LINES });
   let fields = out.fields || out;
+  let escalated = false;
+
+  // 1回目で必須項目（金額・日付）が取れなかったときだけ、丁寧な設定で読み直す。
+  // 読み直し先が設定されていればそちらへ回す（上位モデルなど）。未設定なら
+  // 同じプロバイダで行数だけ増やして読み直すので、追加の課金は発生しない。
+  if (needsEscalation_(fields)) {
+    try {
+      const esc = resolveEscalation_();
+      const out2 = analyze("", {
+        lines: RECEIPT_RAW_TEXT_RETRY_LINES,
+        provider: esc.provider,
+        model: esc.model,
+      });
+      const f2 = out2.fields || out2;
+      if (f2 && (f2.amount || f2.date)) {
+        out = out2;
+        fields = f2;
+        escalated = true;
+      }
+    } catch (err) {
+      // 読み直しに失敗しても、1回目の結果で処理を続ける（申請は進められる）
+    }
+  }
+
   let memory = buildVendorMemory_(vendorKey_(fields.vendor));
   let retried = false;
 
   // 読み直しはAI呼び出しがもう1回増えるので、今回の読み取りが過去の誤読を
   // 実際に再現したときだけ行う。誤読履歴があるだけで毎回読み直すと、
   // よく使う店舗ほど解析が遅くなってしまう。
-  if (memory && repeatsKnownMistake_(fields, memory.mistakes)) {
+  // 既にエスカレーションで読み直しているときは、これ以上呼び出しを増やさない。
+  if (!escalated && memory && repeatsKnownMistake_(fields, memory.mistakes)) {
     try {
       const out2 = analyze(buildCorrectionHint_(memory));
       const f2 = out2.fields || out2;
@@ -2410,7 +2446,31 @@ function actionAnalyzeReceipt_(body) {
       count: memory ? memory.count : 0,
       retried: retried,
     },
+    escalated: escalated,
   };
+}
+
+/**
+ * 1回目の読み取りで「申請に必要な項目」が欠けているか。
+ * 金額と日付は申請の必須項目なので、どちらかが空なら読めていないとみなす。
+ */
+function needsEscalation_(fields) {
+  if (!fields) return true;
+  return !(Math.round(Number(fields.amount) || 0) > 0) || !String(fields.date || "");
+}
+
+/**
+ * 読み直し先の設定。`OCR_ESCALATE_PROVIDER` が未設定なら空を返し、
+ * 呼び出し側は同じプロバイダのまま行数だけ増やして読み直す（追加課金なし）。
+ * 指定されていてもそのプロバイダのキーが無ければ、同じく空として扱う。
+ */
+function resolveEscalation_() {
+  const provider = String(getProp_("OCR_ESCALATE_PROVIDER") || "").toLowerCase();
+  const ok =
+    (provider === "claude" && !!getProp_("ANTHROPIC_API_KEY")) ||
+    (provider === "gemini" && !!getProp_("GEMINI_API_KEY"));
+  if (!ok) return { provider: "", model: "" };
+  return { provider: provider, model: String(getProp_("OCR_ESCALATE_MODEL") || "").trim() };
 }
 
 /**
@@ -2419,20 +2479,21 @@ function actionAnalyzeReceipt_(body) {
  * 全滅した場合はこのキーで使えるモデルを調べて追い試ししてから、
  * 全モデルの失敗理由と使えるモデル一覧をまとめて投げる（＝原因が画面に出る）。
  */
-function analyzeWithGemini_(body, hint) {
+function analyzeWithGemini_(body, hint, opts) {
+  const o = opts || {};
   // 1巡目で全滅した場合は少し待って再挑戦（503は一時的な混雑が多い）
   return tryGeminiModels_(
     "AI解析",
     getProp_("GEMINI_API_KEY"),
-    getProp_("GEMINI_MODEL"),
+    o.model || getProp_("GEMINI_MODEL"),
     function (model) {
-      return callGemini_(body, model, hint);
+      return callGemini_(body, model, hint, o.lines);
     },
     2
   );
 }
 
-function callGemini_(body, model, hint) {
+function callGemini_(body, model, hint, maxLines) {
   const apiKey = getProp_("GEMINI_API_KEY");
   // raw_text を先に書き起こさせることで抽出の根拠を作り、精度を上げる
   const schema = {
@@ -2461,7 +2522,7 @@ function callGemini_(body, model, hint) {
               data: String(body.imageBase64),
             },
           },
-          { text: buildReceiptPrompt_(hint) },
+          { text: buildReceiptPrompt_(hint, maxLines) },
         ],
       },
     ],
@@ -2528,9 +2589,10 @@ function callGemini_(body, model, hint) {
 }
 
 /** Claude で解析。モデルは OCR_MODEL で変更可（既定 claude-opus-4-8） */
-function analyzeWithClaude_(body, hint) {
+function analyzeWithClaude_(body, hint, opts) {
+  const o = opts || {};
   const apiKey = getProp_("ANTHROPIC_API_KEY");
-  const model = getProp_("OCR_MODEL") || "claude-opus-4-8";
+  const model = o.model || getProp_("OCR_MODEL") || "claude-opus-5";
   const schema = {
     type: "object",
     properties: {
@@ -2560,7 +2622,7 @@ function analyzeWithClaude_(body, hint) {
               data: String(body.imageBase64),
             },
           },
-          { type: "text", text: buildReceiptPrompt_(hint) },
+          { type: "text", text: buildReceiptPrompt_(hint, o.lines) },
         ],
       },
     ],
