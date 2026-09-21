@@ -801,105 +801,8 @@ async function handleUserTableClick(e) {
 }
 
 /* =========================================================================
- * 画像解析（OCR）— レシートから金額・日付・店名を推定
+ * レシート画像の解析（AI）と、送信前の画像処理
  * ========================================================================= */
-
-function parseAmount(str) {
-  const normalized = str
-    .replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0))
-    .replace(/[，,]/g, "")
-    .replace(/[^\d]/g, "");
-  return normalized ? parseInt(normalized, 10) : NaN;
-}
-
-function extractAmount(text) {
-  const lines = text.split(/\r?\n/);
-  // 合計金額と誤認しやすい行は除外
-  const negative = /(預り|預かり|お釣|釣り?銭|現金|クレジット|カード|ポイント|残高|値引|割引|チャージ)/;
-  const strong = /(合\s*計|総額|ご?請求)/; // 最優先
-  const medium = /(税込|お?支払)/;
-  const weak = /計/; // 小計なども含むため弱い
-  const candidates = [];
-  for (const line of lines) {
-    if (negative.test(line)) continue;
-    const hasMoneyMark = /[¥￥]|円/.test(line);
-    let weight = 0;
-    if (strong.test(line)) weight = 3;
-    else if (medium.test(line)) weight = 2;
-    else if (weak.test(line)) weight = 1;
-    if (!hasMoneyMark && !weight) continue;
-    const nums = line.match(/[¥￥]?\s*[\d０-９][\d０-９,，]*/g) || [];
-    for (const raw of nums) {
-      const v = parseAmount(raw);
-      if (!isNaN(v) && v >= 10 && v <= 100000000) {
-        candidates.push({ v, weight: weight || 1 });
-      }
-    }
-  }
-  if (!candidates.length) return null;
-  // 最も強いキーワード群の中の最大値を採用
-  const top = Math.max(...candidates.map((c) => c.weight));
-  const pool = candidates.filter((c) => c.weight === top);
-  return pool.reduce((m, c) => Math.max(m, c.v), 0);
-}
-
-function extractDate(text) {
-  const t = text.replace(/[０-９]/g, (d) =>
-    String.fromCharCode(d.charCodeAt(0) - 0xfee0)
-  );
-  const patterns = [
-    /(\d{4})\s*[年\/\.\-]\s*(\d{1,2})\s*[月\/\.\-]\s*(\d{1,2})/,
-    /(\d{2})\s*[\/\.\-]\s*(\d{1,2})\s*[\/\.\-]\s*(\d{1,2})/,
-  ];
-  for (const re of patterns) {
-    const m = t.match(re);
-    if (m) {
-      let [, y, mo, d] = m;
-      if (y.length === 2) y = "20" + y;
-      const yy = Number(y), mm = Number(mo), dd = Number(d);
-      if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
-        return `${yy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * OCRの文字化けらしさを判定。誤った店名で埋めるより空にする方が安全。
- * 判定: 単語が細かく分断されている／記号や長音記号が多い／日本語らしい塊が無い。
- */
-function looksGarbled(s) {
-  const v = String(s || "").trim();
-  if (v.length < 2) return true;
-  const tokens = v.split(/\s+/);
-  const shortTokens = tokens.filter((t) => t.length === 1).length;
-  if (tokens.length >= 3 && shortTokens >= 2) return true; // 1文字トークンが散在
-  if ((v.match(/[ー－~ｰ]/g) || []).length >= 3) return true; // 長音記号の連発
-  if ((v.match(/[^\p{L}\p{N}\s()（）・\-＆&']/gu) || []).length >= 3) return true; // 記号過多
-  // 3文字以上つながった日本語/英数の塊が1つも無ければ文字化けとみなす
-  if (!/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}A-Za-z0-9]{3,}/u.test(v)) {
-    return true;
-  }
-  return false;
-}
-
-function extractVendor(text) {
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length >= 2);
-  for (const line of lines.slice(0, 5)) {
-    if (/^[\d\s¥￥,.\-\/:]+$/.test(line)) continue;
-    if (/(領\s*収\s*書|レシート|receipt)/i.test(line)) continue;
-    if (/(様|御中)\s*$/.test(line)) continue; // 宛名は店名ではない
-    if (/^T\d{6,}/.test(line)) continue; // インボイス登録番号
-    const v = line.slice(0, 40);
-    if (looksGarbled(v)) continue; // 文字化けは採用しない
-    return v;
-  }
-  return null;
-}
 
 /** 画像を縮小して dataURL を返す */
 function scaleImage(file, maxSize, quality) {
@@ -964,125 +867,6 @@ async function prepareImageVariants(file) {
   const ai = imgToDataUrl(img, 1600, 0.85);
   URL.revokeObjectURL(url);
   return { thumb, aiBase64: ai.split(",")[1] };
-}
-
-/**
- * OCR前処理: 適正解像度へ拡大 → グレースケール → 大津の二値化。
- * レシートの薄い印字・低解像度写真での認識精度を上げる。
- */
-function preprocessForOcr(file) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      const target = 1600;
-      const maxDim = Math.max(img.width, img.height);
-      const scale = Math.min(2.5, Math.max(1, target / maxDim)); // 小さい画像は拡大
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext("2d");
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      try {
-        const im = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = im.data;
-        // グレースケール + ヒストグラム
-        const hist = new Array(256).fill(0);
-        for (let i = 0; i < d.length; i += 4) {
-          const g = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-          d[i] = d[i + 1] = d[i + 2] = g;
-          hist[g]++;
-        }
-        // 大津の方法で二値化しきい値を求める
-        const total = d.length / 4;
-        let sum = 0;
-        for (let t = 0; t < 256; t++) sum += t * hist[t];
-        let sumB = 0, wB = 0, maxVar = 0, threshold = 127;
-        for (let t = 0; t < 256; t++) {
-          wB += hist[t];
-          if (!wB) continue;
-          const wF = total - wB;
-          if (!wF) break;
-          sumB += t * hist[t];
-          const mB = sumB / wB;
-          const mF = (sum - sumB) / wF;
-          const v = wB * wF * (mB - mF) * (mB - mF);
-          if (v > maxVar) {
-            maxVar = v;
-            threshold = t;
-          }
-        }
-        for (let i = 0; i < d.length; i += 4) {
-          const v = d[i] > threshold ? 255 : 0;
-          d[i] = d[i + 1] = d[i + 2] = v;
-        }
-        ctx.putImageData(im, 0, 0);
-      } catch (err) {
-        // 前処理に失敗しても拡大済みキャンバスをそのまま使う
-        console.warn("preprocess failed", err);
-      }
-      resolve(canvas);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve(null);
-    };
-    img.src = url;
-  });
-}
-
-/** OCRライブラリ（Tesseract.js）のCDN。読み込みは実際に使うときだけ行う */
-const TESSERACT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
-let tesseractLoading = null;
-
-/**
- * Tesseract.js を必要になった時点で読み込む。
- *
- * AIキーが設定されている運用ではOCRは一度も使わない。起動時に読み込むと、
- * その通信が終わるまでアプリのJSが動かず、起動時間がまるごと延びてしまう。
- * 2回目以降は同じ Promise を返すので、読み込みは高々1回。
- */
-function ensureTesseract() {
-  if (typeof Tesseract !== "undefined") return Promise.resolve(true);
-  if (tesseractLoading) return tesseractLoading;
-  tesseractLoading = new Promise((resolve) => {
-    const el = document.createElement("script");
-    el.src = TESSERACT_URL;
-    el.onload = () => resolve(typeof Tesseract !== "undefined");
-    el.onerror = () => {
-      tesseractLoading = null; // 次回また試せるようにする
-      resolve(false);
-    };
-    document.head.appendChild(el);
-  });
-  return tesseractLoading;
-}
-
-/** Tesseract をレシート向け設定（単一ブロック・空白保持）で実行 */
-async function tesseractRecognize(input, onProgress) {
-  if (Tesseract.createWorker) {
-    let worker;
-    try {
-      worker = await Tesseract.createWorker("jpn+eng", 1, { logger: onProgress });
-      await worker.setParameters({
-        tessedit_pageseg_mode: "6", // 単一の均一テキストブロックとして解析
-        preserve_interword_spaces: "1",
-      });
-      const { data } = await worker.recognize(input);
-      return data.text || "";
-    } catch (err) {
-      console.warn("worker OCR failed, falling back", err);
-    } finally {
-      if (worker) {
-        try { await worker.terminate(); } catch { /* noop */ }
-      }
-    }
-  }
-  const { data } = await Tesseract.recognize(input, "jpn+eng", { logger: onProgress });
-  return data.text || "";
 }
 
 /**
@@ -1171,84 +955,24 @@ async function runAiAnalyze(file) {
       msg += ` ／ 過去の修正から${learned.applied.join("・")}を自動補正しました`;
     }
     statusText.textContent = msg;
-    return true;
   } catch (err) {
     if (err instanceof AuthError) {
-      handleAuthError();
-      return true; // ログイン画面へ誘導済み。OCRへは進まない
+      handleAuthError(); // ログイン画面へ誘導済み
+      return;
     }
     console.error(err);
-    // 失敗理由を画面に残す（OCRのメッセージで上書きされないよう別要素に表示）
+    // 失敗理由を画面に残す（案内の文言で上書きされないよう別要素に表示）
     const errEl = $("#ocrError");
     const raw = err.message || "不明";
     // 一時的な混雑（503等）は待って再試行すれば通ることが多い
     const busy = /503|high demand|overloaded|UNAVAILABLE|quota|RESOURCE_EXHAUSTED|429/i.test(raw);
     errEl.textContent = busy
-      ? "AIが一時的に混雑して解析できませんでした。数十秒待って「⟳ もう一度AI解析」を押すと成功することが多いです。以下は端末内OCRの結果（精度が低い）なので必ず確認してください。／ 詳細: " +
+      ? "AIが一時的に混雑して解析できませんでした。数十秒待って「⟳ もう一度AI解析」を押すと成功することが多いです。／ 詳細: " +
         raw
-      : "AI解析に失敗したため端末内OCRで解析します。原因: " + raw;
+      : "AI解析に失敗しました。原因: " + raw;
     errEl.hidden = false;
-    statusText.textContent = "端末内OCRで解析します…";
-    return false;
-  }
-}
-
-async function runOcr(file) {
-  const statusEl = $("#ocrStatus");
-  const barFill = $("#ocrBarFill");
-  const statusText = $("#ocrStatusText");
-  const rawWrap = $("#ocrRawWrap");
-  const rawEl = $("#ocrRaw");
-
-  statusEl.hidden = false;
-  rawWrap.hidden = true;
-  barFill.style.width = "0%";
-  statusText.textContent = "OCRの準備中…";
-
-  if (!(await ensureTesseract())) {
-    statusEl.hidden = true;
-    toast("OCRライブラリを読み込めませんでした（ネットワークをご確認ください）");
-    return;
-  }
-  statusText.textContent = "画像を解析中…";
-
-  try {
-    statusText.textContent = "画像を前処理中…";
-    const canvas = await preprocessForOcr(file);
-    const input = canvas || file;
-
-    const text = await tesseractRecognize(input, (m) => {
-      if (m.status === "recognizing text") {
-        const pct = Math.round(m.progress * 100);
-        barFill.style.width = pct + "%";
-        statusText.textContent = `文字を認識中… ${pct}%`;
-      }
-    });
-    rawEl.textContent = text.trim() || "(テキストを検出できませんでした)";
-    rawWrap.hidden = false;
-
-    const amount = extractAmount(text);
-    const date = extractDate(text);
-    const vendor = extractVendor(text);
-    const filled = [];
-    if (amount != null) {
-      $("#expAmount").value = amount;
-      filled.push("金額");
-    }
-    if (date) {
-      $("#expDate").value = date;
-      filled.push("日付");
-    }
-    if (vendor) {
-      $("#expVendor").value = vendor;
-      filled.push("店名");
-    }
-    statusText.textContent = filled.length
-      ? `端末内OCRで解析：${filled.join("・")}を自動入力しました。精度が低い場合があるため必ず確認・修正してください`
-      : "端末内OCRで解析：自動抽出できた項目はありません。手入力してください。";
-  } catch (err) {
-    console.error(err);
-    statusText.textContent = "解析に失敗しました。手入力してください。";
+    statusText.textContent =
+      "自動入力できませんでした。手入力してください（画像はこのまま申請に添付できます）。";
   }
 }
 
@@ -1672,15 +1396,30 @@ async function handleImageFile(file) {
   await analyzeCurrentImage();
 }
 
-/** 現在の画像を解析（AI → 端末内OCR の順でフォールバック） */
+/**
+ * 現在の画像を解析する。
+ * 自動入力はAI解析だけで行う。使えない・失敗した場合は手入力へ案内する
+ * （読み取れなくても、画像を添付したまま申請そのものは進められる）。
+ */
 async function analyzeCurrentImage() {
   const file = state.lastImageFile;
   if (!file) return;
   if (cloudEnabled() && state.session && state.aiOcr) {
-    const done = await runAiAnalyze(file);
-    if (done) return;
+    await runAiAnalyze(file);
+    return;
   }
-  runOcr(file);
+  showAnalyzeUnavailable();
+}
+
+/** AI解析が使えない設定のときの案内（画像は添付したまま申請できる） */
+function showAnalyzeUnavailable() {
+  $("#ocrStatus").hidden = false;
+  $("#ocrBarFill").style.width = "0%";
+  $("#ocrRawWrap").hidden = true;
+  $("#ocrError").hidden = true;
+  $("#ocrStatusText").textContent =
+    "自動入力は使えない設定です。金額・日付などは手入力してください" +
+    "（画像はこのまま申請に添付できます）。";
 }
 
 /** 画像を時計回りに90度回転し、再解析する（倒れた写真の精度対策） */
