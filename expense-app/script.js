@@ -1161,6 +1161,9 @@ async function runAiAnalyze(file) {
       msg += ` ／ ${missing.join("・")}は読み取れませんでした（手入力してください）`;
     }
     const learned = data.learned || {};
+    if (data.escalated) {
+      msg += " ／ 1回目で読み取れなかったため、より丁寧に読み直しました";
+    }
     if (learned.retried) {
       msg += " ／ この店舗の過去の誤読を踏まえて読み直しました";
     }
