@@ -424,16 +424,11 @@ function applySessionUI() {
   const fareBtn = $("#fareLookupBtn");
   const fareReady = cloud && !!state.session && !!state.features.fare;
   fareBtn.disabled = !fareReady;
-  // Web照合を使わない運用（運賃マスタのみ）では、ボタンの文言を実態に合わせる
-  const masterOnly = state.features.fareWeb === false;
-  fareBtn.textContent = masterOnly ? "🔎 運賃マスタと照合" : "🔎 Webで運賃を照合";
   fareBtn.title = !cloud || !state.session
     ? "運賃の照合はクラウド連携（ログイン）が必要です。区間と回数は入力できます。"
     : !state.features.fare
     ? "Apps Script のコードが古い版です。最新の Code.gs を貼り付けて再デプロイしてください。"
-    : masterOnly
-    ? "運賃マスタに登録済みの区間と突き合わせます（未登録なら路線検索で調べてください）"
-    : "出発駅・到着駅から運賃を調べて申請額と突き合わせます";
+    : "運賃マスタに登録済みの区間と突き合わせます（未登録なら路線検索で調べてください）";
   if (cloud && state.session) {
     $("#sessionName").textContent = state.session.user.displayName;
     const roleEl = $("#sessionRole");
@@ -1157,8 +1152,6 @@ async function lookupFare() {
       result.className = "fare-result is-warn";
       result.textContent = data.message || "この区間は運賃マスタに未登録です。";
       $("#fareApplyBtn").hidden = true;
-      if (data.justDisabled) state.features.fareWeb = false;
-      applySessionUI(); // 照合ボタンの表示を切り替える
       return;
     }
     state.lastFare = data;
@@ -1327,37 +1320,6 @@ async function handleFareAdd(evt) {
   }
 }
 
-/** 区間をまとめて登録する（初期設定用） */
-async function handleFareBulk() {
-  const text = $("#fareBulkText").value.trim();
-  const out = $("#fareBulkResult");
-  if (!text) {
-    toast("登録する内容を入力してください");
-    return;
-  }
-  const btn = $("#fareBulkBtn");
-  btn.disabled = true;
-  try {
-    const data = await apiPost({ action: "bulkUpsertFares", text });
-    renderFares(data.items || []);
-    const errors = data.errors || [];
-    out.hidden = false;
-    out.className = errors.length ? "fare-result is-warn" : "fare-result is-ok";
-    out.innerHTML =
-      `<span>${data.added} 件を登録しました。</span>` +
-      errors.map((e) => `<span>⚠️ ${escapeHtml(e)}</span>`).join("");
-    // 登録できた行だけ消し、直せなかった行は残して修正できるようにする
-    if (!errors.length) $("#fareBulkText").value = "";
-    toast(`運賃マスタへ ${data.added} 件を登録しました`);
-  } catch (err) {
-    if (err instanceof AuthError) return handleAuthError();
-    out.hidden = false;
-    out.className = "fare-result is-error";
-    out.textContent = "登録に失敗しました：" + (err.message || "不明なエラー");
-  } finally {
-    btn.disabled = false;
-  }
-}
 
 async function deleteFare(key, label) {
   if (
@@ -2505,7 +2467,6 @@ function init() {
   // 運賃マスタ（管理者）
   $("#fareReloadBtn").addEventListener("click", loadFares);
   $("#fareAddForm").addEventListener("submit", handleFareAdd);
-  $("#fareBulkBtn").addEventListener("click", handleFareBulk);
   $("#fareTable").addEventListener("click", (e) => {
     const del = e.target.closest("[data-fare-del]");
     if (del) deleteFare(del.dataset.fareDel, del.dataset.label);
