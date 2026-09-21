@@ -595,29 +595,24 @@ assert.strictEqual(g.fareTotal_(220, false, 0), 220, "回数0は1回として扱
 assert.strictEqual(g.fareTotal_(100, false, 999), 100 * val("FARE_TRIPS_MAX"), "回数は上限で止める");
 console.log("✓ fareTotal_: 往復と回数を掛けた想定金額を出し、回数は1〜上限に収める");
 
-/* -------- 14. Webで調べた運賃が運賃マスタへ蓄積され、2回目は検索しない -------- */
+/* -------- 14. 運賃マスタに登録された区間は即答する -------- */
 props.GEMINI_API_KEY = "dummy";
-props.FARE_WEB_LOOKUP = "true"; // Web照合の既定は無効なので、この節では明示的に有効化する
-let searchCalls = 0;
-g.searchFareOnWeb_ = function (from, to) {
-  searchCalls++;
-  return { fare: 510, route: "西武新宿線→JR埼京線 池袋乗換", source: "https://example.test/fare" };
-};
+g.actionUpsertFare_({
+  token: "", from: "新井薬師前", to: "武蔵浦和", fare: 510,
+  route: "西武新宿線→JR埼京線 池袋乗換",
+});
 const first = g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", round: true, trips: 2 });
-assert.strictEqual(searchCalls, 1);
-assert.strictEqual(first.cached, false);
+assert.strictEqual(first.registered, true);
 assert.strictEqual(first.unit, 510);
 assert.strictEqual(first.expected, 510 * 2 * 2, "往復×2回");
-assert.strictEqual(first.source, "https://example.test/fare");
 
-// 2回目は同じ区間（しかも逆方向・「駅」付き）でもマスタから即答する
+// 同じ区間なら逆方向・「駅」付きでも同じ運賃で答える
 const second = g.actionLookupFare_({ token: "", from: "武蔵浦和駅", to: "新井薬師前駅", round: false, trips: 1 });
-assert.strictEqual(searchCalls, 1, "2回目はWeb検索しない");
 assert.strictEqual(second.cached, true);
 assert.strictEqual(second.unit, 510);
 assert.strictEqual(second.expected, 510);
 assert.strictEqual(sheets["運賃マスタ"].getLastRow(), 2, "同じ区間は1行にまとまる");
-console.log("✓ actionLookupFare_: 初回はWebで照合し、以降は運賃マスタから即答（逆方向も同一視）");
+console.log("✓ actionLookupFare_: 運賃マスタから即答し、逆方向も同一区間として扱う");
 
 /* -------- 15. 申請時の照合判定はサーバー側で計算する -------- */
 // 申請額が想定と一致
@@ -675,19 +670,14 @@ assert.ok(threw.indexOf("別々の駅名") > 0, "同一駅の登録は弾く");
 
 g.actionDeleteFare_({ token: "", key: listed[0].key });
 assert.strictEqual(g.actionListFares_({ token: "" }).items.length, 0);
-searchCalls = 0;
-g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", round: false, trips: 1 });
-assert.strictEqual(searchCalls, 1, "削除後は再びWebで調べ直す");
+assert.strictEqual(
+  g.actionLookupFare_({ token: "", from: "新井薬師前", to: "武蔵浦和", round: false, trips: 1 }).registered,
+  false,
+  "削除後は未登録として返る"
+);
 console.log("✓ 運賃マスタ: 管理者が上書き・削除でき、削除後は再照合される");
 
-/* -------- 16.5 運賃マスタのみの運用（Web照合を使わない） -------- */
-props.FARE_WEB_LOOKUP = "false";
-let webCalls = 0;
-g.searchFareOnWeb_ = function () {
-  webCalls++;
-  throw new Error("呼ばれてはいけない");
-};
-// 未登録の区間はエラーにせず、次の行動を伝える応答を返す
+/* -------- 16.5 未登録の区間はエラーにせず案内を返す -------- */
 const notRegistered = g.actionLookupFare_({
   token: "", from: "池袋", to: "大宮", round: true, trips: 1,
 });
@@ -695,7 +685,6 @@ assert.strictEqual(notRegistered.ok, true, "未登録でもエラーにしない
 assert.strictEqual(notRegistered.registered, false);
 assert.strictEqual(notRegistered.expected, 0);
 assert.ok(notRegistered.message.indexOf("路線検索") > 0, "調べ方を案内する");
-assert.strictEqual(webCalls, 0, "Web照合は呼ばない");
 
 // 手で登録すれば、以降はマスタの値で照合できる
 g.actionUpsertFare_({ token: "", from: "池袋", to: "大宮", fare: 480 });
@@ -705,72 +694,7 @@ const registered = g.actionLookupFare_({
 assert.strictEqual(registered.registered, true);
 assert.strictEqual(registered.unit, 480);
 assert.strictEqual(registered.expected, 480 * 2 * 2, "往復×2回");
-assert.strictEqual(webCalls, 0, "登録済みならWeb照合は不要");
-console.log("✓ 運賃マスタのみの運用: 未登録は案内を返し、手登録すれば以降は照合できる");
-
-/* -------- 16.6 区間のまとめて登録 -------- */
-const bulk = g.actionBulkUpsertFares_({
-  token: "",
-  text: [
-    "新宿, 渋谷, 170, JR山手線",
-    "\t品川\t東京\t180", // タブ区切りも受ける
-    "上野，秋葉原，150", // 全角カンマも受ける
-    "", // 空行は無視
-    "駅名だけ", // 到着駅が無い
-    "浜松町, 浜松町, 150", // 同じ駅
-    "新橋, 有楽町, 0", // 運賃が0
-  ].join("\n"),
-});
-assert.strictEqual(bulk.added, 3, "読めた行だけ登録する");
-assert.strictEqual(bulk.errors.length, 3, "読めない行は理由を返す");
-assert.ok(bulk.errors[0].indexOf("5行目") === 0, "何行目かを示す");
-assert.ok(bulk.errors[2].indexOf("1円以上") > 0, "運賃が0の行は理由が分かる");
-assert.strictEqual(
-  g.actionLookupFare_({ token: "", from: "品川", to: "東京", round: false, trips: 1 }).unit,
-  180,
-  "タブ区切りの行も登録されている"
-);
-assert.strictEqual(
-  g.actionLookupFare_({ token: "", from: "上野", to: "秋葉原", round: false, trips: 1 }).unit,
-  150,
-  "全角カンマの行も登録されている"
-);
-const listed2 = g.actionListFares_({ token: "" }).items;
-const bulkAdded = listed2.filter((f) => ["渋谷", "東京", "秋葉原"].indexOf(f.to) >= 0);
-assert.strictEqual(bulkAdded.length, 3);
-assert.ok(
-  bulkAdded.every((f) => f.checkedBy.indexOf("手動") === 0),
-  "一括登録も手動として記録される"
-);
-delete props.FARE_WEB_LOOKUP;
-console.log("✓ actionBulkUpsertFares_: カンマ/タブ/全角に対応し、読めない行は理由を返す");
-
-/* -------- 16.7 Web照合は既定で無効（無料枠では割当が無いため） -------- */
-assert.strictEqual(
-  g.isFareWebEnabled_(),
-  false,
-  "プロパティ未設定なら無効（無料枠で必ず失敗する経路に入らない）"
-);
-props.FARE_WEB_LOOKUP = "false";
-assert.strictEqual(g.isFareWebEnabled_(), false, "false でも無効");
-props.FARE_WEB_LOOKUP = "true";
-assert.strictEqual(g.isFareWebEnabled_(), true, "true のときだけ有効");
-delete props.FARE_WEB_LOOKUP;
-
-// 未設定のまま未登録区間を引いても、Web照合は呼ばれず案内だけを返す
-let webCallsDefault = 0;
-g.searchFareOnWeb_ = function () {
-  webCallsDefault++;
-  throw new Error("既定では呼ばれてはいけない");
-};
-const defaultLookup = g.actionLookupFare_({
-  token: "", from: "横浜", to: "川崎", round: false, trips: 1,
-});
-assert.strictEqual(webCallsDefault, 0, "既定ではWeb照合を呼ばない");
-assert.strictEqual(defaultLookup.ok, true);
-assert.strictEqual(defaultLookup.registered, false);
-assert.strictEqual(defaultLookup.webDisabled, true, "運賃マスタのみの運用として応答する");
-console.log("✓ Web照合は既定で無効で、未登録区間は案内だけを返す");
+console.log("✓ 未登録は案内を返し、手登録すれば以降は照合できる");
 
 /* -------- 16.8 申請した区間が運賃マスタへ自動登録される -------- */
 // 未登録の区間で申請すると、申請額から片道運賃を割り戻してマスタへ入る。
@@ -895,27 +819,6 @@ assert.ok(
   "アポストロフィはエスケープする"
 );
 console.log("✓ buildReceiptFileName_: 同じ日・同じ申請者だけを絞って採番する");
-
-/* -------- 17. AIの応答から運賃JSONを取り出す -------- */
-assert.strictEqual(
-  g.parseJsonLoosely_('```json\n{"fare": 480, "route": "JR中央線"}\n```').fare,
-  480,
-  "コードフェンス付きでも読める"
-);
-assert.strictEqual(
-  g.parseJsonLoosely_('調べました。{"fare": 300, "route": "都営大江戸線"} 以上です').fare,
-  300,
-  "前後に説明が付いていても読める"
-);
-assert.strictEqual(g.parseJsonLoosely_("運賃は分かりませんでした"), null);
-assert.strictEqual(
-  g.groundingSource_({ groundingMetadata: { groundingChunks: [
-    { web: { uri: "https://transit.example.test/1", title: "運賃案内" } }] } }),
-  "https://transit.example.test/1",
-  "検索の出典URLを拾える"
-);
-assert.strictEqual(g.groundingSource_({}), "", "出典が無ければ空文字");
-console.log("✓ AI応答のJSON抽出と出典URLの取得");
 
 /* -------- 18. モデル候補の組み立てと、全滅時のエラー内容 -------- */
 assert.strictEqual(

@@ -18,9 +18,7 @@
  *                     自動作成・自動保存して以降再利用）
  *   AUTH_SECRET     : セッショントークン署名鍵（初回に自動生成・自動保存）
  *   SHARED_TOKEN    : 分析ツール用の読み取りトークン（設定時、doGet ?token= で全件取得可）
- *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）と
- *                       交通費の運賃Web照合（Google検索グラウンディング）が有効
- *   FARE_MODEL        : 運賃照合に使うモデル（未設定なら現行の flash 系を順に試す）
+ *   GEMINI_API_KEY    : 設定するとレシートのAI解析（Gemini vision・無料枠可）が有効
  *   GEMINI_MODEL      : Geminiのモデル（未設定なら現行の flash 系を順に試す）
  *   ANTHROPIC_API_KEY : 設定するとレシートのAI解析（Claude vision）が有効
  *   OCR_MODEL         : Claudeのモデル（既定: claude-opus-5。安価なら claude-haiku-4-5）
@@ -862,7 +860,6 @@ function statusPayload_() {
     version: SCHEMA_VERSION,
     features: {
       fare: true, // 交通費の運賃照合
-      fareWeb: isFareWebEnabled_(), // 運賃のWeb照合が使える設定か
       receiptImage: true, // 領収書画像のアプリ経由取得
       vendorMemory: true, // AI解析の学習
       jaSheets: true, // シートの日本語化
@@ -962,8 +959,6 @@ function doPost(e) {
         return json_(actionListFares_(body));
       case "upsertFare":
         return json_(actionUpsertFare_(body));
-      case "bulkUpsertFares":
-        return json_(actionBulkUpsertFares_(body));
       case "deleteFare":
         return json_(actionDeleteFare_(body));
       // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
@@ -1253,30 +1248,15 @@ function appendFare_(rec) {
   getFaresSheet_().appendRow(fareRow_(rec));
 }
 
-/**
- * 運賃のWeb照合（Gemini＋Google検索）を使うか。**既定は無効**。
- *
- * Google検索グラウンディングは Gemini API の無料枠では割当が0（limit: 0）で
- * 使えない。既定を有効にすると必ず一度失敗してから自動停止することになるため、
- * 使える環境でだけ明示的に有効化する形にしている。
- *
- * 有効にするには、スクリプトプロパティ `FARE_WEB_LOOKUP` に `"true"` を設定する
- * （課金を有効にした場合）。失敗を検知したときは "false" が保存される。
- */
-function isFareWebEnabled_() {
-  return getProp_("FARE_WEB_LOOKUP") === "true";
-}
 
 /**
  * 運賃マスタに未登録の区間を返す（エラーにしない）。
  * 申請自体は金額を手入力すれば進められるため、次の行動を伝えるだけにする。
  */
-function unregisteredFare_(from, to, round, trips, justDisabled) {
+function unregisteredFare_(from, to, round, trips) {
   return {
     ok: true,
     registered: false,
-    webDisabled: !isFareWebEnabled_(),
-    justDisabled: !!justDisabled,
     from: from,
     to: to,
     round: round,
@@ -1288,10 +1268,7 @@ function unregisteredFare_(from, to, round, trips, justDisabled) {
     message:
       "この区間は運賃マスタに未登録です。「🚉 路線検索で調べる」で運賃を確認して" +
       "金額を入力してください。この申請の金額から運賃マスタへ登録されるので、" +
-      "次回からは自動で照合されます。" +
-      (justDisabled
-        ? "（無料枠ではWeb検索による照合が使えないため、以降はマスタのみで照合します）"
-        : ""),
+      "次回からは自動で照合されます。",
   };
 }
 
@@ -1320,48 +1297,15 @@ function actionLookupFare_(body) {
     Math.max(1, Math.round(Number(body.trips) || 1))
   );
 
-  let hit = findFare_(key);
-  const cached = !!hit;
-  if (!hit) {
-    // Web照合を使わない運用（運賃マスタのみ）では、未登録をそのまま返す。
-    // 申請者は路線検索で調べて金額を手入力し、管理者が区間を登録すれば
-    // 次回から自動で照合される。
-    if (!isFareWebEnabled_()) {
-      return unregisteredFare_(from, to, round, trips, false);
-    }
-    let found;
-    try {
-      found = searchFareOnWeb_(from, to);
-    } catch (err) {
-      // limit: 0 は無料枠にそのリクエストの割当が無い状態。何度試しても同じなので、
-      // 以降はWeb照合を止めて運賃マスタのみの運用に切り替える。
-      if (/limit:\s*0/.test(String((err && err.message) || err))) {
-        PropertiesService.getScriptProperties().setProperty(
-          "FARE_WEB_LOOKUP",
-          "false"
-        );
-        return unregisteredFare_(from, to, round, trips, true);
-      }
-      throw err;
-    }
-    hit = {
-      key: key,
-      from: from,
-      to: to,
-      fare: found.fare,
-      route: found.route,
-      source: found.source,
-      checkedAt: new Date().toISOString(),
-      // 出典が取れなかった＝Google検索が使われず、AIの記憶で答えた可能性がある。
-      // 運賃マスタに残るので、後から確認・訂正できるよう印を付けておく。
-      checkedBy: found.source ? "web" : "web（出典なし・要確認）",
-    };
-    saveFare_(hit);
-  }
+  const hit = findFare_(key);
+  // 運賃マスタに無い区間は、エラーにせず「未登録」として返す。申請者は路線検索で
+  // 調べて金額を手入力すればよく、その申請額から運賃マスタへ登録される。
+  if (!hit) return unregisteredFare_(from, to, round, trips);
+
   return {
     ok: true,
     registered: true,
-    cached: cached,
+    cached: true,
     from: String(hit.from || from),
     to: String(hit.to || to),
     unit: hit.fare,
@@ -1374,58 +1318,6 @@ function actionLookupFare_(body) {
   };
 }
 
-/**
- * Gemini の Google 検索グラウンディングで片道運賃を調べる。
- * 構造化出力（responseSchema）は検索ツールと併用できないため、
- * JSONで答えるよう指示し、本文から取り出す。出典は groundingMetadata から拾う。
- */
-function searchFareOnWeb_(from, to) {
-  const apiKey = getProp_("GEMINI_API_KEY");
-  if (!apiKey) {
-    throw new Error(
-      "運賃のWeb照合には GEMINI_API_KEY の設定が必要です（管理者に設定を依頼してください）"
-    );
-  }
-  const prompt =
-    "日本の鉄道運賃を調べてください。\n" +
-    "区間: 「" + from + "」から「" + to + "」\n\n" +
-    "検索して、次の条件の運賃を答えてください:\n" +
-    "・大人1名の通常運賃（定期券・往復割引なし）\n" +
-    "・ICカード利用時の片道運賃（IC運賃が無い場合は切符運賃）\n" +
-    "・最も一般的・最短で案内される経路（乗換を含んでよい）\n\n" +
-    "回答は次のJSONのみを出力してください（前後に説明を書かない）:\n" +
-    '{"fare": 片道運賃の整数（円）, "route": "経路（例: 西武新宿線→JR埼京線 池袋乗換）", ' +
-    '"note": "補足（乗換や運賃の種別など30文字以内）"}\n\n' +
-    "運賃が確認できない場合は fare を 0 にしてください。推測で数字を書かないこと。";
-
-  // モデル未提供・混雑時は次の候補へ。Web アプリの応答時間に収めるため
-  // 思考は最小にする（運賃の照合は推論よりも検索結果の読み取りが主）。
-  const cand = tryGeminiModels_(
-    "運賃照合",
-    apiKey,
-    getProp_("FARE_MODEL"),
-    function (model) {
-      return callFareSearch_(apiKey, model, prompt);
-    }
-  );
-
-  let out = "";
-  (cand.content.parts || []).forEach(function (p) {
-    if (p.text) out += p.text;
-  });
-
-  const parsed = parseJsonLoosely_(out);
-  const fare = Math.max(0, Math.round(Number(parsed && parsed.fare) || 0));
-  if (!fare) {
-    throw new Error(
-      "運賃を確認できませんでした。駅名を正式名称で入力するか、金額を手入力してください。"
-    );
-  }
-  let route = String((parsed && parsed.route) || "").slice(0, 80);
-  const note = String((parsed && parsed.note) || "").slice(0, 40);
-  if (note) route = route ? route + "（" + note + "）" : note;
-  return { fare: fare, route: route, source: groundingSource_(cand) };
-}
 
 /**
  * Gemini を1回呼び、候補（candidate）を返す。
@@ -1498,33 +1390,7 @@ function callFareSearch_(apiKey, model, prompt) {
   return cand;
 }
 
-/** ```json フェンスや前後の説明が付いていても JSON を取り出す */
-function parseJsonLoosely_(text) {
-  const s = String(text || "");
-  try {
-    return JSON.parse(s);
-  } catch (err) {
-    // 続けて本文中のオブジェクトを探す
-  }
-  const m = s.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[0]);
-  } catch (err) {
-    return null;
-  }
-}
 
-/** グラウンディング（検索）で参照されたURLを1つ返す。無ければ空文字 */
-function groundingSource_(cand) {
-  const meta = cand.groundingMetadata || cand.grounding_metadata;
-  const chunks = (meta && (meta.groundingChunks || meta.grounding_chunks)) || [];
-  for (let i = 0; i < chunks.length; i++) {
-    const web = chunks[i].web || chunks[i].Web;
-    if (web && web.uri) return String(web.uri).slice(0, 400);
-  }
-  return "";
-}
 
 /**
  * 申請額から片道運賃を割り戻す。運賃マスタへ登録してよい額のときだけ返し、
@@ -1658,54 +1524,6 @@ function actionUpsertFare_(body) {
   return { ok: true, items: actionListFares_(body).items };
 }
 
-/**
- * 管理者向け: 区間をまとめて登録する（初期設定を一気に済ませるため）。
- * 1行に「出発駅, 到着駅, 片道運賃[, 経路]」。区切りはカンマ・タブ・全角カンマ。
- * 読めない行は理由を付けて返し、読めた行だけ登録する（途中で止めない）。
- */
-function actionBulkUpsertFares_(body) {
-  const u = requireUser_(body.token, true);
-  const lines = String(body.text || "").split(/\r?\n/);
-  const by = "手動（" + (u.displayName || u.username || "管理者") + "）";
-  let added = 0;
-  const errors = [];
-  lines.forEach(function (line, i) {
-    const raw = String(line || "").trim();
-    if (!raw) return;
-    const cols = raw.split(/[,\t、，]/).map(function (c) {
-      return c.trim();
-    });
-    const from = cols[0] || "";
-    const to = cols[1] || "";
-    const fare = Math.round(Number(String(cols[2] || "").replace(/[^\d.-]/g, "")));
-    const key = fareKey_(from, to);
-    if (!key) {
-      errors.push(i + 1 + "行目: 出発駅と到着駅を別々の駅名で指定してください（" + raw + "）");
-      return;
-    }
-    if (!fare || fare <= 0) {
-      errors.push(i + 1 + "行目: 片道運賃を1円以上の数値で指定してください（" + raw + "）");
-      return;
-    }
-    saveFare_({
-      key: key,
-      from: from,
-      to: to,
-      fare: fare,
-      route: cols[3] || "",
-      source: "",
-      checkedAt: new Date().toISOString(),
-      checkedBy: by,
-    });
-    added++;
-  });
-  return {
-    ok: true,
-    added: added,
-    errors: errors,
-    items: actionListFares_(body).items,
-  };
-}
 
 /** 管理者向け: 運賃マスタから区間を削除（次回は再びWebで調べ直す） */
 function actionDeleteFare_(body) {
