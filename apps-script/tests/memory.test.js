@@ -1320,6 +1320,7 @@ assert.strictEqual(g.usePlHalfOpenRanges_(FAKE_PL_SS), 0, "2回目は変更な�
 console.log("✓ 月末の条件が「<翌月1日」になり、月をまたぐ繰り上げも正しい");
 
 /* -------- 利用コードでのログイン（軽量版） -------- */
+let bossPassword = "adminpass";
 {
   const nodeCrypto = require("crypto");
   // 認証まわりで使う Utilities を node の crypto で再現する
@@ -1395,8 +1396,24 @@ console.log("✓ 月末の条件が「<翌月1日」になり、月をまたぐ�
   // 管理者は自分も含めて発行でき、名前なしの新規作成は弾く
   assert.throws(() => g.actionIssueAccessCode_({ token: adminToken, user: {} }), /名前/);
   const adminCode = g.actionIssueAccessCode_({ token: adminToken, user: { username: "boss" } });
+  bossPassword = adminCode.code.replace("-", ""); // 自分に発行したのでパスワードはコードに変わる
   assert.strictEqual(g.actionLoginCode_({ code: adminCode.code }).user.role, "admin");
 }
 console.log("✓ 利用コード: 管理者が発行・再発行し、コードだけでログインでき、無効化・古いコードは弾く");
+
+/* -------- 利用者の事業部は複数持てる -------- */
+{
+  assert.deepStrictEqual(Array.from(g.splitDepartments_("人材, BAR、人材,")), ["人材", "BAR"], "区切り・空白・重複を吸収");
+  assert.deepStrictEqual(Array.from(g.splitDepartments_(["BAR", " 本部 ", ""])), ["BAR", "本部"], "配列も受け取る");
+  assert.strictEqual(g.joinDepartments_(""), "");
+  const adminToken = g.actionLogin_({ username: "boss", password: bossPassword }).token;
+  const r = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "兼務", department: ["人材", "BAR"] } });
+  const usersSheet = sheets["ユーザー"];
+  const row = usersSheet.rows.find((x) => x[0] === r.username);
+  assert.strictEqual(row[7], "人材,BAR", "シートにはカンマ区切りで入る");
+  g.actionUpsertUser_({ token: adminToken, user: { username: r.username, department: ["BAR", "本部"] } });
+  assert.strictEqual(row[7], "BAR,本部", "管理者が事業部を変えられる");
+}
+console.log("✓ 利用者の事業部: 複数を正規の形で保存し、管理者が変えられる");
 
 console.log("\nすべて成功");

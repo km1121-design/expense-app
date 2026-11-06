@@ -88,6 +88,23 @@ input, select {
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .item.is-inactive .item__title { color: var(--muted); }
 
+fieldset.checks { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.checks legend { font-size: 13px; color: var(--muted); margin-bottom: 6px; padding: 0; }
+.checkList { display: flex; flex-wrap: wrap; gap: 8px; }
+.checkList label {
+  flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 14px;
+  border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer;
+}
+.checkList label:has(input:checked) { background: #eef2ff; border-color: var(--accent); }
+.checkList input { padding: 0; margin: 0; }
+.editDepts { width: 100%; display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+.item.is-editing { flex-wrap: wrap; }
+.chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.chips li { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 6px 4px 12px; }
+.chips .link { padding: 0 4px; }
+.btn--sm { padding: 8px 14px; }
+#addDeptForm input { flex: 1; }
+
 .toast {
   position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
   background: #111827; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px;

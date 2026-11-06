@@ -27,6 +27,7 @@ const state = {
   analyzing: 0, // 解析の世代番号（古い解析結果で上書きしないため）
   loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）
   users: [], // アカウント画面の利用者一覧（管理者のみ）
+  editing: "", // 事業部を編集中の利用者（username）
 };
 
 const $ = (s) => document.querySelector(s);
@@ -154,14 +155,37 @@ function switchTab(name) {
   if (name === "accounts") loadUsers();
 }
 
-function fillDepartments() {
-  const mine = (state.session && state.session.user.department) || "";
-  const list = state.departments.slice();
-  if (mine && !list.includes(mine)) list.unshift(mine);
-  $("#fDept").innerHTML =
-    '<option value="">（未設定）</option>' + list.map((d) => `<option>${esc(d)}</option>`).join("");
-  $("#fDept").value = mine;
+/** 利用者の事業部は複数持てる（シートには「人材,BAR」で入っている） */
+function splitDepts(v) {
+  return [...new Set(String(v || "").split(/[,、]/).map((d) => d.trim()).filter(Boolean))];
 }
+
+/** 申請の事業部: 自分に割り当てられた事業部から選ぶ（未割り当てなら全事業部） */
+function fillDepartments() {
+  const mine = splitDepts(state.session && state.session.user.department);
+  const list = mine.length ? mine : state.departments;
+  $("#fDept").innerHTML =
+    (mine.length ? "" : '<option value="">（未設定）</option>') +
+    list.map((d) => `<option>${esc(d)}</option>`).join("");
+  $("#fDept").value = mine[0] || "";
+}
+
+/** 事業部のチェックボックス群。マスタから消えた事業部も、付いていれば外せるように出す */
+function deptChecks(name, selected) {
+  const all = [...state.departments, ...selected.filter((d) => !state.departments.includes(d))];
+  return (
+    '<div class="checkList">' +
+    all
+      .map(
+        (d) =>
+          `<label><input type="checkbox" name="${name}" value="${esc(d)}"${selected.includes(d) ? " checked" : ""} />${esc(d)}</label>`
+      )
+      .join("") +
+    "</div>"
+  );
+}
+const checkedValues = (root, name) =>
+  [...root.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value);
 
 /* ---------- 起動・同期 ---------- */
 async function sync() {
@@ -489,8 +513,7 @@ async function onReload() {
 
 /* ---------- アカウント（管理者のみ） ---------- */
 async function loadUsers() {
-  $("#uDept").innerHTML =
-    '<option value="">（未設定）</option>' + state.departments.map((d) => `<option>${esc(d)}</option>`).join("");
+  renderDepartments();
   if (!state.users.length) $("#userRows").innerHTML = '<li class="empty">読み込み中…</li>';
   try {
     const data = await api({ action: "listUsers" });
@@ -516,23 +539,32 @@ function renderUsers() {
   $("#userRows").innerHTML = list.length
     ? list
         .map((u) => {
-          const meta = [u.department || "事業部未設定", u.role === "admin" ? "管理者" : "一般", !u.active && "無効"]
+          const depts = splitDepts(u.department);
+          const meta = [depts.join("・") || "事業部未設定", u.role === "admin" ? "管理者" : "一般", !u.active && "無効"]
             .filter(Boolean)
             .map(esc)
             .join("・");
           const self = u.username === me;
+          const editing = state.editing === u.username;
           return (
-            `<li class="item${u.active ? "" : " is-inactive"}">` +
+            `<li class="item${u.active ? "" : " is-inactive"}${editing ? " is-editing" : ""}">` +
             `<div class="item__main"><div class="item__title">${esc(u.displayName)}${self ? "<small>（自分）</small>" : ""}</div>` +
             `<div class="item__meta">${meta}</div></div>` +
             `<div class="item__side"><div class="acts">` +
+            `<button type="button" class="link" data-edit="${esc(u.username)}">事業部</button>` +
             (u.active ? `<button type="button" class="link" data-issue="${esc(u.username)}">コード再発行</button>` : "") +
             (self
               ? ""
               : `<button type="button" class="link${u.active ? " danger" : ""}" data-active="${esc(u.username)}">${
                   u.active ? "無効化" : "有効化"
                 }</button>`) +
-            `</div></div></li>`
+            `</div></div>` +
+            (editing
+              ? `<div class="editDepts">${deptChecks("edit", depts)}<div class="row">` +
+                `<button type="button" class="btn btn--sm" data-save="${esc(u.username)}">保存</button>` +
+                `<button type="button" class="link" data-cancel="1">やめる</button></div></div>`
+              : "") +
+            `</li>`
           );
         })
         .join("")
@@ -564,9 +596,10 @@ async function onAddUser(e) {
   try {
     const data = await api({
       action: "issueAccessCode",
-      user: { displayName: name, department: $("#uDept").value, role: $("#uRole").value },
+      user: { displayName: name, department: checkedValues($("#uDepts"), "add"), role: $("#uRole").value },
     });
     $("#addUserForm").reset();
+    renderDepartments();
     showIssued(name, data.code);
     loadUsers();
   } catch (err) {
@@ -578,6 +611,32 @@ async function onAddUser(e) {
 }
 
 async function onUserRowsClick(e) {
+  const t = e.target.dataset;
+  if (t.edit || t.cancel) {
+    state.editing = t.edit && state.editing !== t.edit ? t.edit : "";
+    return renderUsers();
+  }
+  if (t.save) {
+    const depts = checkedValues(e.target.closest(".item"), "edit");
+    e.target.disabled = true;
+    try {
+      await api({ action: "upsertUser", user: { username: t.save, department: depts } });
+      state.editing = "";
+      toast("事業部を変更しました");
+      // 自分の事業部を変えたら申請フォームの選択肢にも反映する
+      if (t.save === state.session.user.username) {
+        state.session.user.department = depts.join(",");
+        writeJson(SESSION_KEY, state.session);
+        fillDepartments();
+      }
+      await loadUsers();
+    } catch (err) {
+      e.target.disabled = false;
+      if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+      toast("変更できませんでした: " + err.message);
+    }
+    return;
+  }
   const issue = e.target.dataset.issue;
   const active = e.target.dataset.active;
   const u = state.users.find((x) => x.username === (issue || active));
@@ -606,6 +665,48 @@ async function onUserRowsClick(e) {
   }
 }
 
+/* 事業部マスタ（追加・削除）。追加・削除の応答に最新の一覧が入っている */
+function renderDepartments() {
+  const keep = checkedValues($("#uDepts"), "add");
+  $("#uDepts").innerHTML = state.departments.length
+    ? deptChecks("add", keep)
+    : '<p class="note">先に下の「事業部」で事業部を追加してください</p>';
+  $("#deptRows").innerHTML = state.departments.length
+    ? state.departments
+        .map((d) => `<li>${esc(d)}<button type="button" class="link danger" data-deldept="${esc(d)}" title="削除">✕</button></li>`)
+        .join("")
+    : '<li class="empty">事業部がありません</li>';
+}
+
+async function updateDepartments(payload, done) {
+  try {
+    const data = await api(payload);
+    state.departments = data.departments || [];
+    renderDepartments();
+    renderUsers();
+    fillDepartments();
+    toast(done);
+    return true;
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("できませんでした: " + err.message);
+    return false;
+  }
+}
+
+async function onAddDept(e) {
+  e.preventDefault();
+  const name = $("#deptName").value.trim();
+  if (!name) return;
+  if (await updateDepartments({ action: "addDepartment", name }, `「${name}」を追加しました`)) $("#deptName").value = "";
+}
+
+async function onDeptRowsClick(e) {
+  const name = e.target.dataset.deldept;
+  if (!name || !confirm(`事業部「${name}」を削除しますか？\n過去の申請や利用者に付いている事業部名はそのまま残ります。`)) return;
+  await updateDepartments({ action: "deleteDepartment", name }, `「${name}」を削除しました`);
+}
+
 async function onCopyInvite() {
   try {
     await navigator.clipboard.writeText(inviteText());
@@ -623,6 +724,8 @@ $("#loginModeBtn").addEventListener("click", toggleLoginMode);
 $("#addUserForm").addEventListener("submit", onAddUser);
 $("#userRows").addEventListener("click", onUserRowsClick);
 $("#copyInviteBtn").addEventListener("click", onCopyInvite);
+$("#addDeptForm").addEventListener("submit", onAddDept);
+$("#deptRows").addEventListener("click", onDeptRowsClick);
 $("#closeIssuedBtn").addEventListener("click", () => ($("#issued").hidden = true));
 $("#photo").addEventListener("change", onPhoto);
 $("#applyForm").addEventListener("submit", onSubmit);

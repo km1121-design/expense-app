@@ -10,7 +10,7 @@ Web App で、データはスプレッドシート、領収書画像は Google �
 
 ```
 expense-app/     アプリ本体（index.html / script.js / style.css。バニラJS・ビルドなし）
-  lite/          軽量版（申請・月別一覧・アカウント管理。バックエンドは通常版と共通）
+  lite/          軽量版（申請・月別一覧・アカウントと事業部の管理。バックエンドは通常版と共通）
 apps-script/
   Code.gs        バックエンド全体（doGet / doPost。これ1ファイル）
   tests/         Code.gs の回帰テスト（Google のサービスをスタブして実行）
@@ -178,6 +178,16 @@ Apps Script は全スクリプトファイルを**同じスコープへ結合す
 - コード形式（8桁）でない入力は照合しない。パスワードだけでログインできると、
   ID無しで総当たりされる対象が弱いパスワードにまで広がるため。
 
+### 利用者の事業部はカンマ区切りで複数持てる
+
+ユーザーシートの『事業部』列は `人材,BAR` のように複数入る。
+
+- 読むときは必ず `splitDepartments_`（軽量版は `splitDepts`）で分ける。
+  文字列のまま事業部として使うと、申請に `人材,BAR` という事業部が付いてしまう。
+- 書くときは `joinDepartments_` で正規の形にそろえる（空・重複を除く）。
+- 申請に付く事業部は常に1つ。複数持つ人は申請時に選ぶ（既定は先頭）。
+- 通常版の画面は複数を扱えず、管理画面で編集すると1つに戻る。
+
 ### フロントの `normalizeRecord` はホワイトリスト
 
 `script.js` の `normalizeRecord` に無いフィールドは**黙って捨てられる**。
@@ -247,7 +257,8 @@ CORS のプリフライトを避けるため、JSON を `text/plain` で送っ�
 
 - **軽量版（`expense-app/lite/`）への移行を検討中。** 通常版と並行稼働している。
   軽量版はバックエンドの `bootstrap` / `login` / `loginCode` / `analyzeReceipt` /
-  `create` / `delete` / `listUsers` / `upsertUser` / `issueAccessCode` だけを使う。
+  `create` / `delete` / `listUsers` / `upsertUser` / `issueAccessCode` /
+  `addDepartment` / `deleteDepartment` だけを使う。
   **これらの応答形式を変えると軽量版が壊れる。**
   切り替えが決まったら、使わなくなった機能（運賃照合・AI学習・PL連携・
   承認・事業部マスタ）と通常版の画面を削る。

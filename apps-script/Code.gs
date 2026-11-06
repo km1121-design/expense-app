@@ -622,6 +622,24 @@ function listDepartments_() {
     });
 }
 
+/**
+ * 利用者の事業部は複数持てる。シートには「人材,BAR」のようにカンマ区切りで入れる
+ * （人がシートを直すときの「、」も受け付ける）。配列でも文字列でも受け取り、
+ * 空・重複を除いた正規の形へそろえる。
+ */
+function splitDepartments_(v) {
+  const list = Array.isArray(v) ? v : String(v == null ? "" : v).split(/[,、]/);
+  const out = [];
+  list.forEach(function (d) {
+    const t = String(d == null ? "" : d).trim();
+    if (t && out.indexOf(t) < 0) out.push(t);
+  });
+  return out;
+}
+function joinDepartments_(v) {
+  return splitDepartments_(v).join(",");
+}
+
 function actionAddDepartment_(body) {
   requireUser_(body.token, true);
   const name = String(body.name || "").trim();
@@ -715,7 +733,7 @@ function actionUpsertUser_(body) {
   const u = body.user || {};
   const existing = findUser_(u.username);
   if (!existing) {
-    createUserRow_(u.username, u.displayName, u.password, u.role, u.department);
+    createUserRow_(u.username, u.displayName, u.password, u.role, joinDepartments_(u.department));
     return { ok: true, created: true };
   }
   const sheet = getUsersSheet_();
@@ -723,7 +741,7 @@ function actionUpsertUser_(body) {
     sheet.getRange(existing._row, USER_HEADERS.indexOf(col) + 1).setValue(val);
   };
   if (u.displayName != null) set("displayName", u.displayName);
-  if (u.department != null) set("department", u.department);
+  if (u.department != null) set("department", joinDepartments_(u.department));
   if (u.role != null) set("role", u.role === "admin" ? "admin" : "user");
   if (u.active != null) {
     // 自分自身の無効化・降格による締め出しを防止
@@ -840,7 +858,7 @@ function actionIssueAccessCode_(body) {
       u.role === "admin" ? "admin" : "user",
       true,
       new Date().toISOString(),
-      String(u.department || ""),
+      joinDepartments_(u.department),
     ]);
   } else {
     const rec = users.filter(function (x) { return String(x.username) === username; })[0];
@@ -1127,7 +1145,8 @@ function createExpense_(record, user) {
   // 事業部: 申請時に指定があればそれを優先、なければプロフィールの既定値
   // （requireUser_ が読み取り済みなので、ここでユーザーシートを読み直さない）
   let department = String(record.department || "").trim();
-  if (!user.legacy && !department) department = String(user.department || "");
+  // 利用者が複数の事業部に属している場合は先頭を既定にする（「人材,BAR」をそのまま入れない）
+  if (!user.legacy && !department) department = splitDepartments_(user.department)[0] || "";
 
   // 領収書画像: 経費領収書/<事業部>/<yyyy-MM>/日付_申請者_採番 で保存
   let imageUrl = "";

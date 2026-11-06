@@ -91,10 +91,11 @@
       <section data-panel="accounts" hidden>
         <form class="card" id="addUserForm">
           <h2>利用者を追加</h2>
-          <div class="grid">
-            <label>名前<input id="uName" maxlength="40" required /></label>
-            <label>事業部<select id="uDept"></select></label>
-          </div>
+          <label>名前<input id="uName" maxlength="40" required /></label>
+          <fieldset class="checks">
+            <legend>事業部（複数選べます）</legend>
+            <div id="uDepts"></div>
+          </fieldset>
           <label>権限
             <select id="uRole">
               <option value="user">一般（自分の申請だけ見られる）</option>
@@ -118,6 +119,17 @@
         <div class="card">
           <h2>利用者一覧</h2>
           <ul class="list" id="userRows"></ul>
+        </div>
+
+        <!-- 事業部マスタ。申請と利用者の事業部はここから選ぶ -->
+        <div class="card">
+          <h2>事業部</h2>
+          <ul class="chips" id="deptRows"></ul>
+          <form class="row" id="addDeptForm">
+            <input id="deptName" maxlength="40" placeholder="新しい事業部名" required />
+            <button class="btn btn--sm" type="submit">追加</button>
+          </form>
+          <p class="note">削除しても、過去の申請や利用者に付いている事業部名はそのまま残ります。</p>
         </div>
       </section>
     </main>
