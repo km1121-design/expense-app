@@ -25,6 +25,8 @@ const state = {
   records: [],
   image: null, // { base64, mime } 申請時にドライブへ保存する画像
   analyzing: 0, // 解析の世代番号（古い解析結果で上書きしないため）
+  loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）
+  users: [], // アカウント画面の利用者一覧（管理者のみ）
 };
 
 const $ = (s) => document.querySelector(s);
@@ -125,6 +127,12 @@ function showLogin(message) {
   $("#endpointRow").hidden = !!state.endpoint && !message;
   $("#endpoint").value = state.endpoint;
   $("#endpoint").required = true;
+  const byCode = state.loginMode === "code";
+  $("#codeRow").hidden = !byCode;
+  $("#pwRows").hidden = byCode;
+  $("#loginCode").required = byCode;
+  $("#loginId").required = $("#loginPw").required = !byCode;
+  $("#loginModeBtn").textContent = byCode ? "IDとパスワードでログイン（管理者）" : "利用コードでログイン";
   $("#loginErr").textContent = message || "";
 }
 
@@ -134,6 +142,8 @@ function showApp() {
   $("#appView").hidden = false;
   $("#userBox").hidden = false;
   $("#userName").textContent = `${u.displayName}${isAdmin() ? "（管理者）" : ""}`;
+  $("#accountsTab").hidden = !isAdmin();
+  if (!isAdmin() && !$('[data-panel="accounts"]').hidden) switchTab("apply");
   fillDepartments();
   render();
 }
@@ -141,6 +151,7 @@ function showApp() {
 function switchTab(name) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("is-active", b.dataset.tab === name));
   document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = p.dataset.panel !== name));
+  if (name === "accounts") loadUsers();
 }
 
 function fillDepartments() {
@@ -183,6 +194,27 @@ async function start() {
   $("#fDate").value = today();
   $("#month").value = today().slice(0, 7);
 
+  // 案内リンク（…/lite/#api=<URL>&code=<利用コード>）から開いたとき。
+  // URLの # 以降はサーバーへ送られない。履歴に残さないよう読んだらすぐ消す。
+  const invite = new URLSearchParams(location.hash.slice(1));
+  if (invite.get("api") || invite.get("code")) {
+    history.replaceState(null, "", location.pathname + location.search);
+    if (invite.get("api")) {
+      state.endpoint = invite.get("api");
+      writeJson(CONFIG_KEY, { ...(readJson(CONFIG_KEY, {}) || {}), endpoint: state.endpoint });
+    }
+    if (invite.get("code") && state.endpoint) {
+      // 別の人のログインが残っていても、案内されたコードで入り直す
+      state.session = null;
+      writeJson(SESSION_KEY, null);
+      writeJson(CACHE_KEY, null);
+      state.loginMode = "code";
+      showLogin("");
+      $("#loginCode").value = invite.get("code");
+      return login();
+    }
+  }
+
   if (!state.endpoint || !state.session) return showLogin("");
 
   // 通信の前に前回の一覧を描く（白い画面を見せない）
@@ -201,30 +233,49 @@ async function start() {
 }
 
 /* ---------- ログイン ---------- */
-async function onLogin(e) {
+function onLogin(e) {
   e.preventDefault();
-  const btn = e.submitter || $("#loginForm .btn");
   if (!$("#endpointRow").hidden) {
     state.endpoint = $("#endpoint").value.trim();
     writeJson(CONFIG_KEY, { ...(readJson(CONFIG_KEY, {}) || {}), endpoint: state.endpoint });
   }
+  return login();
+}
+
+async function login() {
+  const btn = $("#loginForm .btn");
   btn.disabled = true;
   $("#loginErr").textContent = "";
   try {
-    const data = await api({ action: "login", username: $("#loginId").value.trim(), password: $("#loginPw").value });
+    const data =
+      state.loginMode === "code"
+        ? await api({ action: "loginCode", code: $("#loginCode").value })
+        : await api({ action: "login", username: $("#loginId").value.trim(), password: $("#loginPw").value });
     state.session = { token: data.token, user: data.user };
     writeJson(SESSION_KEY, state.session);
     $("#loginPw").value = "";
+    $("#loginCode").value = "";
     await sync();
   } catch (err) {
-    showLogin(err.message);
+    showLogin(
+      /unknown action/.test(err.message)
+        ? "サーバーが利用コードに未対応です（バックエンドの更新待ち）。管理者はIDとパスワードでログインできます"
+        : err.message
+    );
   } finally {
     btn.disabled = false;
   }
 }
 
+function toggleLoginMode() {
+  state.loginMode = state.loginMode === "code" ? "password" : "code";
+  showLogin("");
+}
+
 function logout() {
   state.session = null;
+  state.users = [];
+  $("#issued").hidden = true;
   state.records = [];
   writeJson(SESSION_KEY, null);
   writeJson(CACHE_KEY, null);
@@ -436,9 +487,143 @@ async function onReload() {
   }
 }
 
+/* ---------- アカウント（管理者のみ） ---------- */
+async function loadUsers() {
+  $("#uDept").innerHTML =
+    '<option value="">（未設定）</option>' + state.departments.map((d) => `<option>${esc(d)}</option>`).join("");
+  if (!state.users.length) $("#userRows").innerHTML = '<li class="empty">読み込み中…</li>';
+  try {
+    const data = await api({ action: "listUsers" });
+    state.users = data.users || [];
+    renderUsers();
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    $("#userRows").innerHTML = `<li class="empty">読み込めませんでした: ${esc(err.message)}</li>`;
+  }
+}
+
+function renderUsers() {
+  const me = state.session.user.username;
+  // 有効な人を先に、その中は事業部・名前順
+  const list = state.users
+    .slice()
+    .sort(
+      (a, b) =>
+        (b.active ? 1 : 0) - (a.active ? 1 : 0) ||
+        String(a.department).localeCompare(String(b.department), "ja") ||
+        String(a.displayName).localeCompare(String(b.displayName), "ja")
+    );
+  $("#userRows").innerHTML = list.length
+    ? list
+        .map((u) => {
+          const meta = [u.department || "事業部未設定", u.role === "admin" ? "管理者" : "一般", !u.active && "無効"]
+            .filter(Boolean)
+            .map(esc)
+            .join("・");
+          const self = u.username === me;
+          return (
+            `<li class="item${u.active ? "" : " is-inactive"}">` +
+            `<div class="item__main"><div class="item__title">${esc(u.displayName)}${self ? "<small>（自分）</small>" : ""}</div>` +
+            `<div class="item__meta">${meta}</div></div>` +
+            `<div class="item__side"><div class="acts">` +
+            (u.active ? `<button type="button" class="link" data-issue="${esc(u.username)}">コード再発行</button>` : "") +
+            (self
+              ? ""
+              : `<button type="button" class="link${u.active ? " danger" : ""}" data-active="${esc(u.username)}">${
+                  u.active ? "無効化" : "有効化"
+                }</button>`) +
+            `</div></div></li>`
+          );
+        })
+        .join("")
+    : '<li class="empty">利用者がいません</li>';
+}
+
+function showIssued(name, code) {
+  $("#issuedTitle").textContent = `${name}さんの利用コード`;
+  $("#issuedCode").textContent = code;
+  $("#issued").dataset.name = name;
+  $("#issued").hidden = false;
+  $("#issued").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+/** 利用者へ送る案内文。リンクを開けば接続先の設定もコードの入力も要らない */
+function inviteText() {
+  const name = $("#issued").dataset.name;
+  const code = $("#issuedCode").textContent;
+  const link =
+    location.origin + location.pathname + "#api=" + encodeURIComponent(state.endpoint) + "&code=" + encodeURIComponent(code);
+  return `${name}さん\n経費申請アプリの利用コードです: ${code}\n次のリンクを開くとログインできます。\n${link}`;
+}
+
+async function onAddUser(e) {
+  e.preventDefault();
+  const btn = e.target.querySelector(".btn");
+  const name = $("#uName").value.trim();
+  btn.disabled = true;
+  try {
+    const data = await api({
+      action: "issueAccessCode",
+      user: { displayName: name, department: $("#uDept").value, role: $("#uRole").value },
+    });
+    $("#addUserForm").reset();
+    showIssued(name, data.code);
+    loadUsers();
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("追加できませんでした: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function onUserRowsClick(e) {
+  const issue = e.target.dataset.issue;
+  const active = e.target.dataset.active;
+  const u = state.users.find((x) => x.username === (issue || active));
+  if (!u) return;
+  const self = u.username === state.session.user.username;
+  try {
+    if (issue) {
+      const warn = self
+        ? "自分のコードを発行し直すと、通常版でのパスワードもこのコードに変わります。続けますか？"
+        : `${u.displayName}さんのコードを発行し直しますか？\n今のコードは使えなくなります。`;
+      if (!confirm(warn)) return;
+      e.target.disabled = true;
+      const data = await api({ action: "issueAccessCode", user: { username: u.username } });
+      showIssued(u.displayName, data.code);
+    } else {
+      if (!confirm(`${u.displayName}さんを${u.active ? "無効化" : "有効化"}しますか？`)) return;
+      e.target.disabled = true;
+      await api({ action: "upsertUser", user: { username: u.username, active: !u.active } });
+      toast(u.active ? "無効化しました（ログインできなくなります）" : "有効化しました");
+      await loadUsers();
+    }
+  } catch (err) {
+    e.target.disabled = false;
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("操作できませんでした: " + err.message);
+  }
+}
+
+async function onCopyInvite() {
+  try {
+    await navigator.clipboard.writeText(inviteText());
+    toast("案内文をコピーしました。LINEやメールで本人に送ってください");
+  } catch {
+    // クリップボードが使えない環境では選択できる形で出す
+    prompt("この案内文をコピーして本人に送ってください", inviteText());
+  }
+}
+
 /* ---------- イベント ---------- */
 $("#loginForm").addEventListener("submit", onLogin);
 $("#logoutBtn").addEventListener("click", logout);
+$("#loginModeBtn").addEventListener("click", toggleLoginMode);
+$("#addUserForm").addEventListener("submit", onAddUser);
+$("#userRows").addEventListener("click", onUserRowsClick);
+$("#copyInviteBtn").addEventListener("click", onCopyInvite);
+$("#closeIssuedBtn").addEventListener("click", () => ($("#issued").hidden = true));
 $("#photo").addEventListener("change", onPhoto);
 $("#applyForm").addEventListener("submit", onSubmit);
 $("#month").addEventListener("change", render);

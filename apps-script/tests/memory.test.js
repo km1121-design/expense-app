@@ -1319,4 +1319,84 @@ assert.strictEqual(
 assert.strictEqual(g.usePlHalfOpenRanges_(FAKE_PL_SS), 0, "2回目は変更なし（冪等）");
 console.log("✓ 月末の条件が「<翌月1日」になり、月をまたぐ繰り上げも正しい");
 
+/* -------- 利用コードでのログイン（軽量版） -------- */
+{
+  const nodeCrypto = require("crypto");
+  // 認証まわりで使う Utilities を node の crypto で再現する
+  sandbox.Utilities.getUuid = () => nodeCrypto.randomUUID();
+  sandbox.Utilities.DigestAlgorithm = { SHA_256: "sha256" };
+  sandbox.Utilities.Charset = { UTF_8: "utf8" };
+  sandbox.Utilities.computeDigest = (alg, text) =>
+    Array.from(nodeCrypto.createHash("sha256").update(String(text), "utf8").digest()).map((b) => (b > 127 ? b - 256 : b));
+  sandbox.Utilities.computeHmacSha256Signature = (text, key) =>
+    nodeCrypto.createHmac("sha256", key).update(text).digest();
+  sandbox.Utilities.base64EncodeWebSafe = (data) => Buffer.from(data).toString("base64url");
+  sandbox.Utilities.base64DecodeWebSafe = (s) => Buffer.from(s, "base64url");
+  sandbox.Utilities.newBlob = (bytes) => ({ getDataAsString: () => Buffer.from(bytes).toString("utf8") });
+  let slept = 0;
+  sandbox.Utilities.sleep = () => { slept++; };
+
+  const usersSheet = sheets["ユーザー"];
+  usersSheet.rows.length = 1; // 見出しだけにする
+  const salt0 = "s0";
+  usersSheet.appendRow(["boss", "管理者", g.hashPassword_("adminpass", salt0), salt0, "admin", true, "", "本部"]);
+  const adminToken = g.actionLogin_({ username: "boss", password: "adminpass" }).token;
+
+  // コードの形: 8桁・紛らわしい文字なし
+  for (let i = 0; i < 50; i++) {
+    assert.ok(/^[2-9A-HJ-NP-Z]{8}$/.test(g.generateAccessCode_()), "コードの文字種と桁数");
+  }
+  assert.strictEqual(g.normalizeAccessCode_(" abcd-efgh "), "ABCDEFGH", "小文字・ハイフン・空白を吸収");
+
+  // 一般ユーザーは発行できない
+  const issued = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "山田", department: "人材" } });
+  assert.ok(/^[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/.test(issued.code), "表示用は ABCD-EFGH: " + issued.code);
+  const row = usersSheet.rows[usersSheet.rows.length - 1];
+  assert.strictEqual(row[0], issued.username, "ユーザーIDは自動で振られる");
+  assert.ok(/^u[2-9a-hj-np-z]{6}$/.test(row[0]), "ユーザーIDの形: " + row[0]);
+  assert.strictEqual(row[1], "山田");
+  assert.strictEqual(row[4], "user");
+  assert.strictEqual(row[7], "人材");
+  assert.ok(String(row[2]).indexOf(issued.code.replace("-", "")) < 0, "コードはそのまま保存しない");
+  const userToken = g.actionLoginCode_({ code: issued.code.replace("-", "") }).token;
+  assert.throws(
+    () => g.actionIssueAccessCode_({ token: userToken, user: { displayName: "勝手に" } }),
+    /forbidden/,
+    "一般ユーザーは発行できない"
+  );
+
+  // コードだけでログインでき、入力のゆれを吸収する
+  const login = g.actionLoginCode_({ code: issued.code.toLowerCase() });
+  assert.strictEqual(login.user.username, issued.username);
+  assert.strictEqual(login.user.displayName, "山田");
+  assert.ok(login.token, "トークンが出る");
+  // 通常版の ID+パスワードでも、コードがパスワードとして通る
+  assert.ok(g.actionLogin_({ username: issued.username, password: issued.code.replace("-", "") }).token);
+
+  // 違うコードは弾き、遅らせる
+  assert.throws(() => g.actionLoginCode_({ code: "2222-2222" }), /利用コードが違います/);
+  assert.throws(() => g.actionLoginCode_({ code: "adminpass" }), /利用コードが違います/, "コードの形でない入力は照合しない");
+  assert.strictEqual(slept, 2, "失敗のたびに待つ");
+
+  // 再発行すると前のコードは使えない
+  const again = g.actionIssueAccessCode_({ token: adminToken, user: { username: issued.username } });
+  assert.notStrictEqual(again.code, issued.code);
+  assert.throws(() => g.actionLoginCode_({ code: issued.code }), /利用コードが違います/, "古いコードは無効");
+  assert.strictEqual(g.actionLoginCode_({ code: again.code }).user.username, issued.username);
+  assert.throws(
+    () => g.actionIssueAccessCode_({ token: adminToken, user: { username: "nobody" } }),
+    /見つかりません/
+  );
+
+  // 無効化した利用者はコードが合っていても入れない
+  g.actionUpsertUser_({ token: adminToken, user: { username: issued.username, active: false } });
+  assert.throws(() => g.actionLoginCode_({ code: again.code }), /無効化/);
+
+  // 管理者は自分も含めて発行でき、名前なしの新規作成は弾く
+  assert.throws(() => g.actionIssueAccessCode_({ token: adminToken, user: {} }), /名前/);
+  const adminCode = g.actionIssueAccessCode_({ token: adminToken, user: { username: "boss" } });
+  assert.strictEqual(g.actionLoginCode_({ code: adminCode.code }).user.role, "admin");
+}
+console.log("✓ 利用コード: 管理者が発行・再発行し、コードだけでログインでき、無効化・古いコードは弾く");
+
 console.log("\nすべて成功");

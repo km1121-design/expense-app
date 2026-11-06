@@ -23,9 +23,17 @@
           WebアプリURL（…/exec）
           <input id="endpoint" type="url" placeholder="https://script.google.com/macros/s/…/exec" />
         </label>
-        <label>ユーザーID<input id="loginId" autocomplete="username" required /></label>
-        <label>パスワード<input id="loginPw" type="password" autocomplete="current-password" required /></label>
+        <!-- 通常は利用コードだけ。IDとパスワードは管理者の最初のログイン用 -->
+        <label id="codeRow">利用コード
+          <input id="loginCode" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false"
+                 placeholder="ABCD-EFGH" maxlength="12" />
+        </label>
+        <div id="pwRows" hidden>
+          <label>ユーザーID<input id="loginId" autocomplete="username" /></label>
+          <label>パスワード<input id="loginPw" type="password" autocomplete="current-password" /></label>
+        </div>
         <button class="btn" type="submit">ログイン</button>
+        <button type="button" class="link" id="loginModeBtn">IDとパスワードでログイン（管理者）</button>
         <p class="err" id="loginErr"></p>
       </form>
     </main>
@@ -34,6 +42,7 @@
       <nav class="tabs">
         <button type="button" class="tab is-active" data-tab="apply">申請</button>
         <button type="button" class="tab" data-tab="list">一覧</button>
+        <button type="button" class="tab" data-tab="accounts" id="accountsTab" hidden>アカウント</button>
       </nav>
 
       <!-- 申請 -->
@@ -75,6 +84,40 @@
           </div>
           <p class="total" id="total"></p>
           <ul class="list" id="rows"></ul>
+        </div>
+      </section>
+
+      <!-- アカウント（管理者のみ） -->
+      <section data-panel="accounts" hidden>
+        <form class="card" id="addUserForm">
+          <h2>利用者を追加</h2>
+          <div class="grid">
+            <label>名前<input id="uName" maxlength="40" required /></label>
+            <label>事業部<select id="uDept"></select></label>
+          </div>
+          <label>権限
+            <select id="uRole">
+              <option value="user">一般（自分の申請だけ見られる）</option>
+              <option value="admin">管理者（全員分を見られる・利用者を管理できる）</option>
+            </select>
+          </label>
+          <button class="btn" type="submit">追加して利用コードを発行</button>
+        </form>
+
+        <!-- 発行したコード。保存はハッシュだけなので、ここを閉じると二度と表示できない -->
+        <div class="card issued" id="issued" hidden>
+          <h2 id="issuedTitle"></h2>
+          <p class="code" id="issuedCode"></p>
+          <p class="note">この画面を離れると再表示できません。忘れたときは「コード再発行」で発行し直してください。</p>
+          <div class="row">
+            <button type="button" class="btn" id="copyInviteBtn">案内文をコピー</button>
+            <button type="button" class="link" id="closeIssuedBtn">閉じる</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>利用者一覧</h2>
+          <ul class="list" id="userRows"></ul>
         </div>
       </section>
     </main>

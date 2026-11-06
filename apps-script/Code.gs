@@ -744,6 +744,113 @@ function actionUpsertUser_(body) {
   return { ok: true, updated: true };
 }
 
+/* ==================== 利用コードでのログイン（軽量版） ==================== */
+
+/**
+ * 利用コード: 管理者が発行し、利用者はこれだけでログインする（IDもパスワードも不要）。
+ *
+ * - コードはパスワードと同じ列（パスワードハッシュ・ソルト）にハッシュで保存する。
+ *   シートを見てもコードは分からないので、忘れたら再発行する。
+ *   通常版の「IDとパスワード」でログインするときは、コードがパスワードとして通る。
+ * - 紛らわしい文字（0/O・1/I）を除いた32文字から8桁。約40ビットで、
+ *   総当たりは1回あたり数秒かかる Apps Script では現実的でない。
+ */
+const ACCESS_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const ACCESS_CODE_LENGTH = 8;
+
+/** 入力のゆれ（小文字・ハイフン・空白）を吸収する */
+function normalizeAccessCode_(code) {
+  return String(code || "")
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "");
+}
+
+/** 新しいコードを作る。乱数は Utilities.getUuid（暗号論的乱数）から取る */
+function generateAccessCode_() {
+  const hex = Utilities.getUuid().replace(/[^0-9a-f]/gi, "");
+  let out = "";
+  for (let i = 0; out.length < ACCESS_CODE_LENGTH; i += 2) {
+    // 256 は 32 で割り切れるので、1バイトを32で割った余りに偏りは出ない
+    out += ACCESS_CODE_ALPHABET[parseInt(hex.substr(i, 2), 16) % ACCESS_CODE_ALPHABET.length];
+  }
+  return out;
+}
+
+/** 表示用（ABCD-EFGH） */
+function formatAccessCode_(code) {
+  return code.slice(0, 4) + "-" + code.slice(4);
+}
+
+/** コードに一致する利用者（無ければ null）。利用者数ぶんハッシュを計算する */
+function findUserByAccessCode_(code, users) {
+  const list = users || readUsers_();
+  for (let i = 0; i < list.length; i++) {
+    if (hashPassword_(code, String(list[i].salt)) === String(list[i].passwordHash)) {
+      return list[i];
+    }
+  }
+  return null;
+}
+
+function actionLoginCode_(body) {
+  if (!usersExist_()) throw new Error("初期設定（管理者作成）が必要です");
+  const code = normalizeAccessCode_(body.code);
+  const rec = code.length === ACCESS_CODE_LENGTH ? findUserByAccessCode_(code) : null;
+  if (!rec) {
+    Utilities.sleep(1000); // 総当たりを遅らせる
+    throw new Error("利用コードが違います");
+  }
+  if (rec.active === false || String(rec.active) === "false") {
+    throw new Error("このアカウントは無効化されています");
+  }
+  const user = publicUser_(rec);
+  return { ok: true, token: issueToken_(user), user: user, departments: listDepartments_() };
+}
+
+/**
+ * 利用コードの発行（管理者のみ）。
+ *   username なし → 利用者を新規作成してコードを発行（ユーザーIDは自動で振る）
+ *   username あり → その利用者のコードを再発行（前のコードは使えなくなる）
+ * コードは応答でしか返さない（保存はハッシュのみ）。
+ */
+function actionIssueAccessCode_(body) {
+  requireUser_(body.token, true);
+  const u = body.user || {};
+  const users = readUsers_();
+  // 他人とコードが重なると、ログイン時にどちらか一方にしか入れなくなるので避ける
+  let code;
+  do {
+    code = generateAccessCode_();
+  } while (findUserByAccessCode_(code, users));
+
+  const sheet = getUsersSheet_();
+  const salt = Utilities.getUuid();
+  let username = String(u.username || "").trim();
+  if (!username) {
+    const displayName = String(u.displayName || "").trim();
+    if (!displayName) throw new Error("名前を入力してください");
+    do {
+      username = "u" + generateAccessCode_().toLowerCase().slice(0, 6);
+    } while (users.some(function (x) { return String(x.username) === username; }));
+    sheet.appendRow([
+      username,
+      displayName,
+      hashPassword_(code, salt),
+      salt,
+      u.role === "admin" ? "admin" : "user",
+      true,
+      new Date().toISOString(),
+      String(u.department || ""),
+    ]);
+  } else {
+    const rec = users.filter(function (x) { return String(x.username) === username; })[0];
+    if (!rec) throw new Error("利用者が見つかりません");
+    sheet.getRange(rec._row, USER_HEADERS.indexOf("passwordHash") + 1).setValue(hashPassword_(code, salt));
+    sheet.getRange(rec._row, USER_HEADERS.indexOf("salt") + 1).setValue(salt);
+  }
+  return { ok: true, username: username, code: formatAccessCode_(code) };
+}
+
 /* ========================= 応答ユーティリティ ========================= */
 
 function json_(obj) {
@@ -923,6 +1030,9 @@ function doPost(e) {
         return json_(actionSetup_(body));
       case "login":
         return json_(actionLogin_(body));
+      // 利用コードだけでログイン（軽量版）
+      case "loginCode":
+        return json_(actionLoginCode_(body));
       // ---- 認証（トークン必要） ----
       case "me": {
         const u = requireUser_(body.token, false);
@@ -943,6 +1053,8 @@ function doPost(e) {
         return json_(actionListUsers_(body));
       case "upsertUser":
         return json_(actionUpsertUser_(body));
+      case "issueAccessCode":
+        return json_(actionIssueAccessCode_(body));
       // ---- 事業部マスタ ----
       case "listDepartments": {
         requireUser_(body.token, false);
