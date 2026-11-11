@@ -178,6 +178,35 @@ Apps Script は全スクリプトファイルを**同じスコープへ結合す
 - コード形式（8桁）でない入力は照合しない。パスワードだけでログインできると、
   ID無しで総当たりされる対象が弱いパスワードにまで広がるため。
 
+### ログインのトークンは「世代」で失効させる
+
+トークンは30日有効で、起動時に残りが半分を切ると `bootstrap` が新しいものを返す。
+
+- トークンの `s` はソルト由来の世代（`tokenVersion_`）。パスワード・利用コードを
+  書き換えるとソルトが変わり、古いトークンは `requireUser_` で弾かれる。
+  **ソルトを書き換える処理を足したら、本人に返すトークンを作り直すこと**
+  （でないと本人が締め出される。`changePassword`・自分への `issueAccessCode`・自分への `upsertUser` のパスワード変更が該当）。
+- **画面は `token` を返す応答を受け取って差し替える**（軽量版は `api()`、前のアプリは
+  `apiPost`）。対象アクションを増やすときは両方の一覧を直す。
+
+### 軽量版の一覧は月ごとに取得する
+
+`bootstrap` と `list` は `month`（`yyyy-MM`）を受け取り、その月の分だけ返す。
+`month` を付けない呼び出し（前のアプリ・分析ツール・`doGet`）は従来どおり全期間。
+
+- 画面は月ごとにキャッシュする（`state.months`）。**古いバックエンドは月を無視して
+  全期間を返す**ので、受け取ったあとで手元でも絞っている（`setMonth`）。
+- 申請・削除のあとは一覧を取り直さず、載る月のキャッシュを直接直す。
+
+### WebアプリURLの埋め込み（`config.js`）は未実施
+
+軽量版は `config.js`（`window.EXPENSE_CONFIG = { endpoint: "…/exec" }`）があれば読んで
+URL入力欄を出さない。無ければ入力欄に戻る（`file://` での確認もこの経路）。
+**`config.js` を作る処理は入れていない。** `deploy-pages.yml` で
+`APPS_SCRIPT_DEPLOYMENT_ID`（シークレット）から作ると、公開サイトからURLが読める
+ようになる（データはログインが要るが、未ログインで呼べる `loginCode` の総当たり先が
+公開される）。**入れるかは運用の判断。勝手に入れないこと。**
+
 ### 利用者の事業部はカンマ区切りで複数持てる
 
 ユーザーシートの『事業部』列は `人材,BAR` のように複数入る。
@@ -256,7 +285,7 @@ CORS のプリフライトを避けるため、JSON を `text/plain` で送っ�
 ## 未完了の作業
 
 - **軽量版（`expense-app/lite/`）への移行を検討中。** 通常版と並行稼働している。
-  軽量版はバックエンドの `bootstrap` / `login` / `loginCode` / `analyzeReceipt` /
+  軽量版はバックエンドの `bootstrap` / `list` / `login` / `loginCode` / `analyzeReceipt` /
   `create` / `delete` / `listUsers` / `upsertUser` / `issueAccessCode` /
   `addDepartment` / `deleteDepartment` だけを使う。
   **これらの応答形式を変えると軽量版が壊れる。**
