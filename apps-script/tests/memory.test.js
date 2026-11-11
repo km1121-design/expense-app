@@ -1416,4 +1416,95 @@ console.log("✓ 利用コード: 管理者が発行・再発行し、コード�
 }
 console.log("✓ 利用者の事業部: 複数を正規の形で保存し、管理者が変えられる");
 
+/* -------- ログインの有効期間・失効・更新、月ごとの一覧 -------- */
+{
+  const DAY = 24 * 3600 * 1000;
+  const decode = (t) => JSON.parse(Buffer.from(t.split(".")[0], "base64url").toString("utf8"));
+  // 時刻を進められるようにする（トークンの期限は Date.now() で判定している）
+  sandbox.__offset = 0;
+  vm.runInContext("(function(){var o=Date.now;Date.now=function(){return o.call(Date)+__offset;};})()", sandbox);
+
+  const adminToken = g.actionLogin_({ username: "boss", password: bossPassword }).token;
+  const issuedLeft = decode(adminToken).e - Date.now();
+  assert.ok(Math.abs(issuedLeft - 30 * DAY) < 60000, "有効期間は30日");
+
+  // 利用コードを再発行すると、古いログインは使えなくなる
+  const a = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "期限テスト" } });
+  const first = g.actionLoginCode_({ code: a.code }).token;
+  assert.strictEqual(g.requireUser_(first, false).username, a.username);
+  const b = g.actionIssueAccessCode_({ token: adminToken, user: { username: a.username } });
+  assert.strictEqual(b.token, undefined, "他人に発行したときはトークンを返さない");
+  assert.throws(() => g.requireUser_(first, false), /unauthorized/, "再発行で古いログインが切れる");
+  const second = g.actionLoginCode_({ code: b.code }).token;
+  assert.strictEqual(g.requireUser_(second, false).username, a.username, "新しいコードのログインは通る");
+
+  // パスワードを変えると古いトークンは切れ、本人には新しいトークンが返る
+  const pwRes = g.actionChangePassword_({
+    token: second,
+    currentPassword: b.code.replace("-", ""),
+    newPassword: "newpass123",
+  });
+  assert.ok(pwRes.token, "パスワード変更の応答に新しいトークンが入る");
+  assert.throws(() => g.requireUser_(second, false), /unauthorized/, "変更前のトークンは切れる");
+  assert.strictEqual(g.requireUser_(pwRes.token, false).username, a.username, "返ったトークンは使える");
+
+  // 自分自身のコードを発行し直したときは、新しいトークンが返って締め出されない
+  const adm2 = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "管理者2", role: "admin" } });
+  const adm2Token = g.actionLoginCode_({ code: adm2.code }).token;
+  const self = g.actionIssueAccessCode_({ token: adm2Token, user: { username: adm2.username } });
+  assert.ok(self.token, "自分への発行ではトークンを返す");
+  assert.throws(() => g.requireUser_(adm2Token, false), /unauthorized/);
+  assert.strictEqual(g.requireUser_(self.token, true).role, "admin", "返ったトークンで管理者のまま");
+
+  // 管理者が自分のパスワードを upsertUser で変えたときも、新しいトークンが返る
+  const up = g.actionUpsertUser_({ token: self.token, user: { username: adm2.username, password: "selfpass123" } });
+  assert.ok(up.token, "自分のパスワード変更ではトークンを返す");
+  assert.throws(() => g.requireUser_(self.token, false), /unauthorized/);
+  assert.strictEqual(g.requireUser_(up.token, true).role, "admin");
+  const other = g.actionUpsertUser_({ token: up.token, user: { username: a.username, displayName: "名前だけ変更" } });
+  assert.strictEqual(other.token, undefined, "他人の更新ではトークンを返さない");
+
+  // 世代を持たない旧トークンは、期限まで受け付ける
+  const legacy = g.issueToken_({ username: a.username, displayName: "旧", role: "user" }, undefined);
+  assert.strictEqual(g.requireUser_(legacy, false).username, a.username, "旧形式のトークンも通る");
+
+  // 起動（bootstrap）で、残りが半分を切っていれば新しいトークンが返る
+  const fresh = g.actionLogin_({ username: a.username, password: "newpass123" }).token;
+  assert.strictEqual(g.actionBootstrap_({ token: fresh }).token, undefined, "発行直後は更新しない");
+  sandbox.__offset = 20 * DAY;
+  const renewed = g.actionBootstrap_({ token: fresh }).token;
+  assert.ok(renewed, "残り10日（半分未満）なら更新する");
+  // （テスト側の Date.now() は進めていないので、進めた20日ぶんを足して比べる）
+  assert.ok(Math.abs(decode(renewed).e - (Date.now() + 20 * DAY) - 30 * DAY) < 60000, "更新後はまた30日");
+  sandbox.__offset = 31 * DAY;
+  assert.throws(() => g.requireUser_(fresh, false), /unauthorized/, "元のトークンは31日目に期限切れ");
+  assert.strictEqual(g.requireUser_(renewed, false).username, a.username, "更新したトークンは31日目も有効");
+  sandbox.__offset = 0;
+
+  // 月ごとの一覧: その月の分だけ返す。一般ユーザーは自分の分だけ、管理者は全員分
+  const H = val("HEADERS");
+  const exp = sheets["経費データ"];
+  const mk = (id, date, applicantId) => {
+    const r = { id: id, date: date, applicantId: applicantId, applicant: applicantId, amount: 100 };
+    exp.appendRow(H.map((h) => (r[h] === undefined ? "" : r[h])));
+  };
+  mk("m1", "2026-10-31", a.username);
+  mk("m2", "2026-11-01", a.username);
+  mk("m3", "2026-11-30", "other");
+  mk("m4", "2026-12-01", a.username);
+  const ids = (recs) => recs.map((r) => r.id).filter((i) => /^m\d$/.test(i)).sort().join(",");
+  const userU = g.requireUser_(pwRes.token, false);
+  const adminU = g.requireUser_(adminToken, true);
+  assert.strictEqual(ids(g.recordsForUser_(userU, "2026-11")), "m2", "一般ユーザーは自分のその月だけ");
+  assert.strictEqual(ids(g.recordsForUser_(adminU, "2026-11")), "m2,m3", "管理者は全員のその月");
+  assert.strictEqual(ids(g.recordsForUser_(userU, "2026-10")), "m1", "月の境目（月末）を落とさない");
+  assert.strictEqual(ids(g.recordsForUser_(userU, "")), "m1,m2,m4", "月の指定なしは全期間（従来の動作）");
+  assert.strictEqual(ids(g.recordsForUser_(userU, "2026-13")), "m1,m2,m4", "不正な月は全期間として扱う");
+  const boot = g.actionBootstrap_({ token: pwRes.token, month: "2026-11" });
+  assert.strictEqual(ids(boot.records), "m2", "bootstrap も月で絞る");
+  assert.strictEqual(boot.month, "2026-11", "返した範囲を伝える");
+  assert.strictEqual(ids(g.actionBootstrap_({ token: pwRes.token }).records), "m1,m2,m4", "month なしの bootstrap は従来どおり");
+}
+console.log("✓ ログイン30日・失効（再発行/パスワード変更）・更新・月ごとの一覧");
+
 console.log("\nすべて成功");

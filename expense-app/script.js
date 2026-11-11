@@ -277,6 +277,12 @@ async function apiPost(payload) {
     if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
     throw new Error(data.error || "APIエラー");
   }
+  // サーバーが新しいトークンを返したとき（有効期間の更新・パスワード変更）は差し替える。
+  // パスワードを変えると変更前のトークンは使えなくなるため、これが無いと次の操作で締め出される。
+  if (data.token && state.session && ["bootstrap", "changePassword", "upsertUser"].includes(body.action)) {
+    state.session.token = data.token;
+    saveSession();
+  }
   return data;
 }
 

@@ -164,7 +164,13 @@ const RECEIPT_RAW_TEXT_MAX_LINES = 12;
 /** 読み直し時の上限。難しいレシートはここで根拠を厚くする */
 const RECEIPT_RAW_TEXT_RETRY_LINES = 24;
 
-const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12時間
+/**
+ * ログインの有効期間。スタッフが半日ごとに入り直さなくて済むよう30日にしている。
+ * 残りが半分を切った状態で起動（bootstrap）すると新しいトークンを返す（使うたびに延びる）。
+ * 失効させたいときは、利用コードの再発行・パスワードの変更・無効化（tokenVersion_）。
+ */
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30日
+const TOKEN_RENEW_MS = TOKEN_TTL_MS / 2;
 
 function getProp_(key) {
   return PropertiesService.getScriptProperties().getProperty(key);
@@ -479,11 +485,21 @@ function b64url_(data) {
   return Utilities.base64EncodeWebSafe(data).replace(/=+$/, "");
 }
 
-function issueToken_(user) {
+/**
+ * トークンの世代。パスワード（＝利用コード）を変えるとソルトが変わるので、
+ * ソルトから作ったこの値も変わり、それ以前に発行したトークンはすべて無効になる。
+ * トークンの中身は読めるため、ソルトそのものは入れずに一方向の値だけを入れる。
+ */
+function tokenVersion_(rec) {
+  return hexDigest_("tv:" + String(rec.salt)).slice(0, 12);
+}
+
+function issueToken_(user, version) {
   const payload = JSON.stringify({
     u: user.username,
     n: user.displayName,
     r: user.role,
+    s: version,
     e: Date.now() + TOKEN_TTL_MS,
   });
   const p = b64url_(payload);
@@ -504,7 +520,13 @@ function verifyToken_(token) {
       Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[0])).getDataAsString()
     );
     if (!payload.e || payload.e < Date.now()) return null;
-    return { username: payload.u, displayName: payload.n, role: payload.r };
+    return {
+      username: payload.u,
+      displayName: payload.n,
+      role: payload.r,
+      version: payload.s, // 世代の無い旧トークンは undefined（発行は最長12時間前までなので期限切れを待つ）
+      exp: payload.e,
+    };
   } catch (err) {
     return null;
   }
@@ -552,6 +574,11 @@ function requireUser_(token, adminOnly) {
   if (!u) throw new Error("unauthorized");
   const rec = findUser_(u.username);
   if (!rec || rec.active === false || String(rec.active) === "false") {
+    throw new Error("unauthorized");
+  }
+  // パスワード・利用コードが変わった後は、古いトークンを受け付けない
+  u.tokenVersion = tokenVersion_(rec);
+  if (u.version !== undefined && u.version !== u.tokenVersion) {
     throw new Error("unauthorized");
   }
   // 役割はシートの最新値を正とする（トークン発行後に変更された場合に反映）
@@ -675,10 +702,11 @@ function actionDeleteDepartment_(body) {
 function actionSetup_(body) {
   if (usersExist_()) throw new Error("既に管理者が設定されています");
   createUserRow_(body.username, body.displayName, body.password, "admin", body.department);
-  const user = publicUser_(findUser_(body.username));
+  const created = findUser_(body.username);
+  const user = publicUser_(created);
   return {
     ok: true,
-    token: issueToken_(user),
+    token: issueToken_(user, tokenVersion_(created)),
     user: user,
     departments: listDepartments_(),
   };
@@ -697,7 +725,7 @@ function actionLogin_(body) {
   const user = publicUser_(rec);
   return {
     ok: true,
-    token: issueToken_(user),
+    token: issueToken_(user, tokenVersion_(rec)),
     user: user,
     departments: listDepartments_(),
   };
@@ -720,7 +748,11 @@ function actionChangePassword_(body) {
     .getRange(rec._row, USER_HEADERS.indexOf("passwordHash") + 1)
     .setValue(hashPassword_(body.newPassword, salt));
   sheet.getRange(rec._row, USER_HEADERS.indexOf("salt") + 1).setValue(salt);
-  return { ok: true };
+  // ソルトが変わると今のトークンは失効するので、本人には新しいトークンを返す
+  return {
+    ok: true,
+    token: issueToken_(publicUser_(rec), tokenVersion_({ salt: salt })),
+  };
 }
 
 function actionListUsers_(body) {
@@ -753,13 +785,23 @@ function actionUpsertUser_(body) {
     }
     set("active", !!u.active);
   }
+  let renewed = null;
   if (u.password) {
     validatePassword_(u.password);
     const salt = Utilities.getUuid();
     set("passwordHash", hashPassword_(u.password, salt));
     set("salt", salt);
+    // 自分のパスワードを変えると自分のトークンも失効するので、新しいものを返す
+    if (String(u.username) === admin.username) {
+      renewed = issueToken_(
+        { username: admin.username, displayName: admin.displayName, role: admin.role },
+        tokenVersion_({ salt: salt })
+      );
+    }
   }
-  return { ok: true, updated: true };
+  const out = { ok: true, updated: true };
+  if (renewed) out.token = renewed;
+  return out;
 }
 
 /* ==================== 利用コードでのログイン（軽量版） ==================== */
@@ -822,7 +864,12 @@ function actionLoginCode_(body) {
     throw new Error("このアカウントは無効化されています");
   }
   const user = publicUser_(rec);
-  return { ok: true, token: issueToken_(user), user: user, departments: listDepartments_() };
+  return {
+    ok: true,
+    token: issueToken_(user, tokenVersion_(rec)),
+    user: user,
+    departments: listDepartments_(),
+  };
 }
 
 /**
@@ -832,7 +879,7 @@ function actionLoginCode_(body) {
  * コードは応答でしか返さない（保存はハッシュのみ）。
  */
 function actionIssueAccessCode_(body) {
-  requireUser_(body.token, true);
+  const admin = requireUser_(body.token, true);
   const u = body.user || {};
   const users = readUsers_();
   // 他人とコードが重なると、ログイン時にどちらか一方にしか入れなくなるので避ける
@@ -866,7 +913,15 @@ function actionIssueAccessCode_(body) {
     sheet.getRange(rec._row, USER_HEADERS.indexOf("passwordHash") + 1).setValue(hashPassword_(code, salt));
     sheet.getRange(rec._row, USER_HEADERS.indexOf("salt") + 1).setValue(salt);
   }
-  return { ok: true, username: username, code: formatAccessCode_(code) };
+  const out = { ok: true, username: username, code: formatAccessCode_(code) };
+  // 自分のコードを発行し直すと自分のトークンも失効するので、新しいものを返す
+  if (username === admin.username) {
+    out.token = issueToken_(
+      { username: admin.username, displayName: admin.displayName, role: admin.role },
+      tokenVersion_({ salt: salt })
+    );
+  }
+  return out;
 }
 
 /* ========================= 応答ユーティリティ ========================= */
@@ -963,12 +1018,24 @@ function doGet(e) {
 }
 
 /** 一般ユーザーには自分の申請だけを返す（絞り込みはサーバー側で行う） */
-function recordsForUser_(u) {
-  const records = rowsToRecords_(getSheet_());
-  if (u.legacy || u.role === "admin") return records;
+function recordsForUser_(u, month) {
+  let records = rowsToRecords_(getSheet_());
+  if (!(u.legacy || u.role === "admin")) {
+    records = records.filter(function (r) {
+      return String(r.applicantId) === u.username;
+    });
+  }
+  // 月の指定があれば、その月の分だけ返す（一覧のダウンロード量を月の件数に抑える）
+  const m = normalizeMonth_(month);
+  if (!m) return records;
   return records.filter(function (r) {
-    return String(r.applicantId) === u.username;
+    return String(r.date || "").slice(0, 7) === m;
   });
+}
+
+/** "yyyy-MM" だけを月として認める。空・不正な値は「全期間」（従来の動作） */
+function normalizeMonth_(month) {
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(String(month || "")) ? String(month) : "";
 }
 
 /**
@@ -1019,7 +1086,15 @@ function actionBootstrap_(body) {
     department: String(u.department || ""), // requireUser_ が読み取り済み
   };
   out.departments = listDepartments_();
-  out.records = recordsForUser_(u);
+  out.records = recordsForUser_(u, body.month);
+  out.month = normalizeMonth_(body.month); // 返した範囲（空 = 全期間）
+  // 残りの有効期間が半分を切っていたら新しいトークンを返す（使うたびに延びる）
+  if (u.exp && u.exp - Date.now() < TOKEN_RENEW_MS) {
+    out.token = issueToken_(
+      { username: u.username, displayName: u.displayName, role: u.role },
+      u.tokenVersion
+    );
+  }
   // PLへ反映できなかった申請の件数。管理者にだけ知らせれば足りるので、
   // 一般ユーザーの起動ではスキップ記録のシートを読まない。
   if (u.role === "admin" && isPlSyncEnabled_()) {
@@ -1044,6 +1119,15 @@ function doPost(e) {
       // 起動用。status + me + 一覧を1往復で返す（起動の待ち時間を減らすため）。
       case "bootstrap":
         return json_(actionBootstrap_(body));
+      // 月ごとの一覧（軽量版）。月を切り替えたときに、その月の分だけ取得する
+      case "list": {
+        const u = requireUser_(body.token, false);
+        return json_({
+          ok: true,
+          month: normalizeMonth_(body.month),
+          records: recordsForUser_(u, body.month),
+        });
+      }
       case "setup":
         return json_(actionSetup_(body));
       case "login":

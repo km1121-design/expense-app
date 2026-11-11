@@ -13,7 +13,10 @@
 
 const CONFIG_KEY = "expense-app:config"; // 通常版と共有
 const SESSION_KEY = "expense-app:session"; // 通常版と共有
-const CACHE_KEY = "expense-lite:records"; // 軽量版の一覧キャッシュ
+const CACHE_KEY = "expense-lite:months"; // 軽量版の一覧キャッシュ（月ごと）
+
+/** config.js（任意）のWebアプリURL。あれば入力欄を出さない（無ければ従来どおり入力） */
+const EMBEDDED_ENDPOINT = String((window.EXPENSE_CONFIG || {}).endpoint || "");
 
 const CATEGORIES = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
 const GROUP_KEYS = { department: "事業部", applicant: "申請者", category: "費目" };
@@ -22,7 +25,9 @@ const state = {
   endpoint: "",
   session: null, // { token, user: { username, displayName, role, department } }
   departments: [],
-  records: [],
+  months: {}, // 月ごとの一覧。キーは "2026-11"、全期間は "all"
+  loadGen: 0, // 月の切り替えの世代番号（遅れて届いた古い応答で上書きしないため）
+  failedKey: "", // 取得に失敗した月（キャッシュが無いときの表示用）
   image: null, // { base64, mime } 申請時にドライブへ保存する画像
   analyzing: 0, // 解析の世代番号（古い解析結果で上書きしないため）
   loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）
@@ -91,8 +96,14 @@ async function api(payload) {
     if (String(data.error).includes("unauthorized")) throw new AuthError("unauthorized");
     throw new Error(data.error || "エラーが発生しました");
   }
+  // サーバーが新しいトークンを返したとき（有効期間の更新・自分のコードの再発行）は差し替える
+  if (data.token && state.session && RENEW_ACTIONS.includes(body.action)) {
+    state.session.token = data.token;
+    writeJson(SESSION_KEY, state.session);
+  }
   return data;
 }
+const RENEW_ACTIONS = ["bootstrap", "issueAccessCode", "changePassword", "upsertUser"];
 
 function normalize(r) {
   return {
@@ -111,6 +122,67 @@ function normalize(r) {
   };
 }
 
+/* ---------- 月ごとの一覧 ---------- */
+const monthKey = () => $("#month").value || "all";
+const inMonth = (r, key) => key === "all" || r.date.startsWith(key);
+
+/** 端末に残すのは直近3か月だけ（全期間は残さない） */
+function persistMonths() {
+  if (!state.session) return;
+  const months = {};
+  Object.keys(state.months)
+    .filter((k) => k !== "all")
+    .sort()
+    .reverse()
+    .slice(0, 3)
+    .forEach((k) => (months[k] = state.months[k]));
+  writeJson(CACHE_KEY, { user: state.session.user.username, months });
+}
+
+/** 古いバックエンドは月を絞らず全期間を返すので、受け取ったあとで手元でも絞る */
+function setMonth(key, records) {
+  state.months[key] = records.map(normalize).filter((r) => inMonth(r, key));
+}
+
+async function fetchMonth(key) {
+  const month = key === "all" ? "" : key;
+  let data;
+  try {
+    data = await api({ action: "list", month });
+  } catch (err) {
+    // 月ごとの取得に未対応の古いバックエンドでは、起動用の取得で代用する
+    if (!/unknown action/i.test(err.message)) throw err;
+    data = await api({ action: "bootstrap", month });
+  }
+  setMonth(key, data.records || []);
+}
+
+/** 月を切り替えたとき。キャッシュがあれば先に描き、そのあと最新を取りに行く */
+async function loadMonth() {
+  const key = monthKey();
+  const gen = ++state.loadGen;
+  state.failedKey = "";
+  render();
+  try {
+    await fetchMonth(key);
+    persistMonths();
+    if (gen === state.loadGen) render();
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    if (gen !== state.loadGen) return;
+    if (!state.months[key]) state.failedKey = key;
+    render();
+    toast("一覧を取得できませんでした: " + err.message);
+  }
+}
+
+/** 申請したものを、載るべき月のキャッシュへ加える（一覧を取り直さない） */
+function addToMonths(rec) {
+  Object.keys(state.months).forEach((k) => {
+    if (inMonth(rec, k)) state.months[k] = [rec, ...state.months[k].filter((x) => x.id !== rec.id)];
+  });
+}
+
 /* ---------- 画面の切り替え ---------- */
 function toast(msg) {
   const t = $("#toast");
@@ -125,7 +197,7 @@ function showLogin(message) {
   $("#userBox").hidden = true;
   $("#loginView").hidden = false;
   // URLが未設定のとき、または失敗したとき（URL違いの可能性）は接続先も直せるようにする
-  $("#endpointRow").hidden = !!state.endpoint && !message;
+  $("#endpointRow").hidden = !!EMBEDDED_ENDPOINT || (!!state.endpoint && !message);
   $("#endpoint").value = state.endpoint;
   $("#endpoint").required = true;
   const byCode = state.loginMode === "code";
@@ -190,7 +262,8 @@ const checkedValues = (root, name) =>
 /* ---------- 起動・同期 ---------- */
 async function sync() {
   // status + ログイン中のユーザー + 一覧 を1往復で取得する
-  const data = await api({ action: "bootstrap" });
+  const key = monthKey();
+  const data = await api({ action: "bootstrap", month: key === "all" ? "" : key });
   if (!data.authEnabled) {
     state.session = null;
     writeJson(SESSION_KEY, null);
@@ -206,13 +279,13 @@ async function sync() {
   state.session.user = data.user;
   writeJson(SESSION_KEY, state.session);
   state.departments = data.departments || [];
-  state.records = (data.records || []).map(normalize);
-  writeJson(CACHE_KEY, { user: data.user.username, records: state.records });
+  setMonth(key, data.records || []);
+  persistMonths();
   showApp();
 }
 
 async function start() {
-  state.endpoint = (readJson(CONFIG_KEY, {}) || {}).endpoint || "";
+  state.endpoint = EMBEDDED_ENDPOINT || (readJson(CONFIG_KEY, {}) || {}).endpoint || "";
   state.session = readJson(SESSION_KEY, null);
   CATEGORIES.forEach((c) => $("#fCategory").insertAdjacentHTML("beforeend", `<option>${c}</option>`));
   $("#fDate").value = today();
@@ -223,7 +296,7 @@ async function start() {
   const invite = new URLSearchParams(location.hash.slice(1));
   if (invite.get("api") || invite.get("code")) {
     history.replaceState(null, "", location.pathname + location.search);
-    if (invite.get("api")) {
+    if (invite.get("api") && !EMBEDDED_ENDPOINT) {
       state.endpoint = invite.get("api");
       writeJson(CONFIG_KEY, { ...(readJson(CONFIG_KEY, {}) || {}), endpoint: state.endpoint });
     }
@@ -243,15 +316,15 @@ async function start() {
 
   // 通信の前に前回の一覧を描く（白い画面を見せない）
   const cache = readJson(CACHE_KEY, null);
-  if (cache && cache.user === state.session.user.username) {
-    state.records = cache.records || [];
-    showApp();
+  if (cache && cache.user === state.session.user.username && cache.months) {
+    state.months = cache.months;
+    if (state.months[monthKey()]) showApp();
   }
   try {
     await sync();
   } catch (err) {
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
-    if (cache) toast("最新の一覧を取得できませんでした: " + err.message);
+    if (state.months[monthKey()]) toast("最新の一覧を取得できませんでした: " + err.message);
     else showLogin(err.message);
   }
 }
@@ -300,7 +373,7 @@ function logout() {
   state.session = null;
   state.users = [];
   $("#issued").hidden = true;
-  state.records = [];
+  state.months = {};
   writeJson(SESSION_KEY, null);
   writeJson(CACHE_KEY, null);
   showLogin("");
@@ -402,8 +475,8 @@ async function onSubmit(e) {
   try {
     const data = await api({ action: "create", record });
     // 保存済みのレコードが返るので、一覧を取り直さずにそのまま加える
-    state.records.unshift(normalize(data.record || record));
-    writeJson(CACHE_KEY, { user: state.session.user.username, records: state.records });
+    addToMonths(normalize(data.record || record));
+    persistMonths();
     resetForm();
     render();
     toast(`申請しました（${yen(record.amount)}）`);
@@ -438,10 +511,15 @@ function render() {
   const month = $("#month").value;
   const key = $("#sortKey").value;
   const me = state.session ? state.session.user.username : "";
-  const list = sortRecords(
-    state.records.filter((r) => !month || r.date.startsWith(month)),
-    key
-  );
+  const recs = state.months[monthKey()];
+  if (!recs) {
+    // まだ取得できていない月（取得に失敗したときは、その旨を出す）
+    const failed = state.failedKey === monthKey();
+    $("#total").textContent = failed ? "" : "読み込み中…";
+    $("#rows").innerHTML = `<li class="empty">${failed ? "取得できませんでした。「再読込」を押してください" : "読み込み中…"}</li>`;
+    return;
+  }
+  const list = sortRecords(recs.slice(), key);
   const sum = (rs) => rs.reduce((s, r) => s + (isRejected(r) ? 0 : r.amount), 0);
   $("#total").textContent = `${month ? month.replace("-", "年") + "月" : "全期間"}　${
     list.filter((r) => !isRejected(r)).length
@@ -485,13 +563,13 @@ function render() {
 async function onRowsClick(e) {
   const id = e.target.dataset && e.target.dataset.del;
   if (!id) return;
-  const r = state.records.find((x) => x.id === id);
+  const r = (state.months[monthKey()] || []).find((x) => x.id === id);
   if (!r || !confirm(`${r.date} ${r.vendor || r.category} ${yen(r.amount)} を削除しますか？`)) return;
   e.target.disabled = true;
   try {
     await api({ action: "delete", id });
-    state.records = state.records.filter((x) => x.id !== id);
-    writeJson(CACHE_KEY, { user: state.session.user.username, records: state.records });
+    Object.keys(state.months).forEach((k) => (state.months[k] = state.months[k].filter((x) => x.id !== id)));
+    persistMonths();
     render();
     toast("削除しました");
   } catch (err) {
@@ -583,8 +661,13 @@ function showIssued(name, code) {
 function inviteText() {
   const name = $("#issued").dataset.name;
   const code = $("#issuedCode").textContent;
+  // URLを埋め込んである公開では、リンクにコードだけ入れればよい
   const link =
-    location.origin + location.pathname + "#api=" + encodeURIComponent(state.endpoint) + "&code=" + encodeURIComponent(code);
+    location.origin +
+    location.pathname +
+    (EMBEDDED_ENDPOINT ? "#" : "#api=" + encodeURIComponent(state.endpoint) + "&") +
+    "code=" +
+    encodeURIComponent(code);
   return `${name}さん\n経費申請アプリの利用コードです: ${code}\n次のリンクを開くとログインできます。\n${link}`;
 }
 
@@ -729,7 +812,7 @@ $("#deptRows").addEventListener("click", onDeptRowsClick);
 $("#closeIssuedBtn").addEventListener("click", () => ($("#issued").hidden = true));
 $("#photo").addEventListener("change", onPhoto);
 $("#applyForm").addEventListener("submit", onSubmit);
-$("#month").addEventListener("change", render);
+$("#month").addEventListener("change", loadMonth);
 $("#sortKey").addEventListener("change", render);
 $("#reloadBtn").addEventListener("click", onReload);
 $("#rows").addEventListener("click", onRowsClick);
