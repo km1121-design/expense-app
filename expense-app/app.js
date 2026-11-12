@@ -1,22 +1,18 @@
 "use strict";
 
 /* =========================================================================
- * 経費申請（軽量版）
+ * 経費申請アプリ
  *
  * 機能は「レシートのAI読み取り → 申請 → スプレッドシートへ蓄積」と
- * 「月ごとの一覧（申請者は自分の分、管理者は全体）」だけ。
- * バックエンドは通常版と同じ Apps Script を使う（承認フローなし＝自動承認）。
+ * 「月ごとの一覧（申請者は自分の分、管理者は全体）」、管理者向けの
+ * 「アカウント・事業部の管理」だけ。承認フローはなく、申請はそのまま計上される。
  *
- * 設定（WebアプリURL）とログイン状態は通常版と同じキーで localStorage に置く。
- * 同じオリジン（GitHub Pages）なので、通常版でログイン済みならそのまま使える。
+ * 設定（WebアプリURL）とログイン状態は localStorage に置く。
  * ========================================================================= */
 
-const CONFIG_KEY = "expense-app:config"; // 通常版と共有
-const SESSION_KEY = "expense-app:session"; // 通常版と共有
-const CACHE_KEY = "expense-lite:months"; // 軽量版の一覧キャッシュ（月ごと）
-
-/** config.js（任意）のWebアプリURL。あれば入力欄を出さない（無ければ従来どおり入力） */
-const EMBEDDED_ENDPOINT = String((window.EXPENSE_CONFIG || {}).endpoint || "");
+const CONFIG_KEY = "expense-app:config";
+const SESSION_KEY = "expense-app:session";
+const CACHE_KEY = "expense-lite:months"; // 一覧キャッシュ（月ごと）。旧名のまま（変えると一度キャッシュが消える）
 
 const CATEGORIES = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
 const GROUP_KEYS = { department: "事業部", applicant: "申請者", category: "費目" };
@@ -30,7 +26,7 @@ const state = {
   failedKey: "", // 取得に失敗した月（キャッシュが無いときの表示用）
   image: null, // { base64, mime } 申請時にドライブへ保存する画像
   analyzing: 0, // 解析の世代番号（古い解析結果で上書きしないため）
-  loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）
+  loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）/ "setup" = 最初の管理者の作成
   users: [], // アカウント画面の利用者一覧（管理者のみ）
   editing: "", // 事業部を編集中の利用者（username）
 };
@@ -197,14 +193,21 @@ function showLogin(message) {
   $("#userBox").hidden = true;
   $("#loginView").hidden = false;
   // URLが未設定のとき、または失敗したとき（URL違いの可能性）は接続先も直せるようにする
-  $("#endpointRow").hidden = !!EMBEDDED_ENDPOINT || (!!state.endpoint && !message);
+  $("#endpointRow").hidden = !!state.endpoint && !message;
   $("#endpoint").value = state.endpoint;
   $("#endpoint").required = true;
-  const byCode = state.loginMode === "code";
+  const mode = state.loginMode;
+  const byCode = mode === "code";
+  const setup = mode === "setup"; // まだ管理者がいない（初回）
   $("#codeRow").hidden = !byCode;
   $("#pwRows").hidden = byCode;
+  $("#nameRow").hidden = !setup;
   $("#loginCode").required = byCode;
   $("#loginId").required = $("#loginPw").required = !byCode;
+  $("#setupName").required = setup;
+  $("#loginTitle").textContent = setup ? "最初の管理者を作る" : "ログイン";
+  $("#loginSubmit").textContent = setup ? "管理者を作成" : "ログイン";
+  $("#loginModeBtn").hidden = setup;
   $("#loginModeBtn").textContent = byCode ? "IDとパスワードでログイン（管理者）" : "利用コードでログイン";
   $("#loginErr").textContent = message || "";
 }
@@ -267,7 +270,8 @@ async function sync() {
   if (!data.authEnabled) {
     state.session = null;
     writeJson(SESSION_KEY, null);
-    showLogin("初期設定（最初の管理者の作成）は通常版で行ってください");
+    state.loginMode = "setup";
+    showLogin("まだ管理者がいません。最初の管理者を作成してください");
     return;
   }
   if (!data.user) {
@@ -285,18 +289,18 @@ async function sync() {
 }
 
 async function start() {
-  state.endpoint = EMBEDDED_ENDPOINT || (readJson(CONFIG_KEY, {}) || {}).endpoint || "";
+  state.endpoint = (readJson(CONFIG_KEY, {}) || {}).endpoint || "";
   state.session = readJson(SESSION_KEY, null);
   CATEGORIES.forEach((c) => $("#fCategory").insertAdjacentHTML("beforeend", `<option>${c}</option>`));
   $("#fDate").value = today();
   $("#month").value = today().slice(0, 7);
 
-  // 案内リンク（…/lite/#api=<URL>&code=<利用コード>）から開いたとき。
+  // 案内リンク（…/#api=<URL>&code=<利用コード>）から開いたとき。
   // URLの # 以降はサーバーへ送られない。履歴に残さないよう読んだらすぐ消す。
   const invite = new URLSearchParams(location.hash.slice(1));
   if (invite.get("api") || invite.get("code")) {
     history.replaceState(null, "", location.pathname + location.search);
-    if (invite.get("api") && !EMBEDDED_ENDPOINT) {
+    if (invite.get("api")) {
       state.endpoint = invite.get("api");
       writeJson(CONFIG_KEY, { ...(readJson(CONFIG_KEY, {}) || {}), endpoint: state.endpoint });
     }
@@ -344,16 +348,29 @@ async function login() {
   btn.disabled = true;
   $("#loginErr").textContent = "";
   try {
+    const mode = state.loginMode;
     const data =
-      state.loginMode === "code"
+      mode === "code"
         ? await api({ action: "loginCode", code: $("#loginCode").value })
-        : await api({ action: "login", username: $("#loginId").value.trim(), password: $("#loginPw").value });
+        : mode === "setup"
+          ? await api({
+              action: "setup",
+              displayName: $("#setupName").value.trim(),
+              username: $("#loginId").value.trim(),
+              password: $("#loginPw").value,
+            })
+          : await api({ action: "login", username: $("#loginId").value.trim(), password: $("#loginPw").value });
     state.session = { token: data.token, user: data.user };
     writeJson(SESSION_KEY, state.session);
     $("#loginPw").value = "";
     $("#loginCode").value = "";
     await sync();
   } catch (err) {
+    // 管理者がまだ一人もいない（初回）。作成の画面へ切り替える
+    if (/初期設定/.test(err.message)) {
+      state.loginMode = "setup";
+      return showLogin("まだ管理者がいません。最初の管理者を作成してください");
+    }
     showLogin(
       /unknown action/.test(err.message)
         ? "サーバーが利用コードに未対応です（バックエンドの更新待ち）。管理者はIDとパスワードでログインできます"
@@ -661,13 +678,8 @@ function showIssued(name, code) {
 function inviteText() {
   const name = $("#issued").dataset.name;
   const code = $("#issuedCode").textContent;
-  // URLを埋め込んである公開では、リンクにコードだけ入れればよい
   const link =
-    location.origin +
-    location.pathname +
-    (EMBEDDED_ENDPOINT ? "#" : "#api=" + encodeURIComponent(state.endpoint) + "&") +
-    "code=" +
-    encodeURIComponent(code);
+    location.origin + location.pathname + "#api=" + encodeURIComponent(state.endpoint) + "&code=" + encodeURIComponent(code);
   return `${name}さん\n経費申請アプリの利用コードです: ${code}\n次のリンクを開くとログインできます。\n${link}`;
 }
 
@@ -728,7 +740,7 @@ async function onUserRowsClick(e) {
   try {
     if (issue) {
       const warn = self
-        ? "自分のコードを発行し直すと、通常版でのパスワードもこのコードに変わります。続けますか？"
+        ? "自分のコードを発行し直すと、パスワードもこのコードに変わります（IDとパスワードでログインするときも、このコードを使います）。続けますか？"
         : `${u.displayName}さんのコードを発行し直しますか？\n今のコードは使えなくなります。`;
       if (!confirm(warn)) return;
       e.target.disabled = true;

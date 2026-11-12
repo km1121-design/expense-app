@@ -1,626 +1,141 @@
 <!doctype html>
 <html lang="ja">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>経費申請アプリ</title>
-    <link rel="stylesheet" href="./style.css" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>経費申請</title>
+    <link rel="stylesheet" href="app.css" />
   </head>
   <body>
-    <header class="app-header">
-      <div class="app-header__inner">
-        <h1 class="app-title">経費申請アプリ</h1>
-        <div class="user-box">
-          <span class="sync-badge" id="syncBadge">ローカルのみ</span>
-          <button id="reSyncBtn" type="button" class="btn btn--ghost btn--sm" hidden>
-            再同期
-          </button>
-
-          <!-- ローカル（試用）モード用 -->
-          <span class="local-only" id="localUserBox">
-            <label for="currentUser">氏名</label>
-            <input
-              id="currentUser"
-              type="text"
-              placeholder="氏名を入力"
-              autocomplete="off"
-            />
-            <button id="adminToggle" type="button" class="btn btn--ghost">
-              管理者モード
-            </button>
-          </span>
-
-          <!-- クラウド（認証）モード用 -->
-          <span class="cloud-only" id="sessionBox" hidden>
-            <span class="user-chip">
-              <span id="sessionName"></span>
-              <span class="role-badge" id="sessionRole"></span>
-            </span>
-            <button id="logoutBtn" type="button" class="btn btn--ghost btn--sm">
-              ログアウト
-            </button>
-          </span>
-
-          <button id="settingsBtn" type="button" class="btn btn--ghost" title="クラウド連携設定">
-            ⚙️
-          </button>
-        </div>
+    <header class="bar">
+      <h1>経費申請</h1>
+      <div class="bar__user" id="userBox" hidden>
+        <span id="userName"></span>
+        <button type="button" class="link" id="logoutBtn">ログアウト</button>
       </div>
-      <nav class="tabs" id="tabs">
-        <button class="tab is-active" data-tab="apply" type="button">経費を申請</button>
-        <button class="tab" data-tab="personal" type="button">個人ダッシュボード</button>
-        <button class="tab is-admin-only" data-tab="admin" type="button" hidden>
-          管理者ダッシュボード
-        </button>
-      </nav>
     </header>
 
-    <main class="container">
-      <!-- バックエンド（Apps Script）が古い版のときの案内 -->
-      <p class="notice" id="backendNotice" hidden></p>
-      <!-- ===== 申請タブ ===== -->
-      <section class="panel is-active" data-panel="apply">
-        <div class="grid grid--apply">
-          <div class="card">
-            <h2 class="card__title">レシート画像から自動入力（任意）</h2>
-            <p class="card__hint">
-              レシートや領収書の写真をアップロードすると、AIが読み取って
-              金額・日付・店名・科目を自動で入力します。申請時に
-              画像は Google ドライブへ、内容はスプレッドシートへ保存されます。
-              <strong>領収書がない場合は、画像なしのまま右のフォームだけで申請できます。</strong>
-            </p>
+    <!-- ログイン（WebアプリURLが未設定なら、ここで入力する） -->
+    <main id="loginView" hidden>
+      <form class="card" id="loginForm">
+        <h2 id="loginTitle">ログイン</h2>
+        <label id="endpointRow" hidden>
+          WebアプリURL（…/exec）
+          <input id="endpoint" type="url" placeholder="https://script.google.com/macros/s/…/exec" />
+        </label>
+        <!-- 通常は利用コードだけ。IDとパスワードは管理者の最初のログイン用 -->
+        <label id="codeRow">利用コード
+          <input id="loginCode" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false"
+                 placeholder="ABCD-EFGH" maxlength="12" />
+        </label>
+        <div id="pwRows" hidden>
+          <label id="nameRow" hidden>表示名<input id="setupName" maxlength="40" autocomplete="name" /></label>
+          <label>ユーザーID<input id="loginId" autocomplete="username" /></label>
+          <label>パスワード<input id="loginPw" type="password" autocomplete="current-password" /></label>
+        </div>
+        <button class="btn" type="submit" id="loginSubmit">ログイン</button>
+        <button type="button" class="link" id="loginModeBtn">IDとパスワードでログイン（管理者）</button>
+        <p class="err" id="loginErr"></p>
+      </form>
+    </main>
 
-            <label class="dropzone" id="dropzone">
-              <input id="imageInput" type="file" accept="image/*" hidden />
-              <span class="dropzone__icon">🖼️</span>
-              <span class="dropzone__text">
-                クリックして画像を選択、またはドラッグ＆ドロップ
-              </span>
+    <main id="appView" hidden>
+      <nav class="tabs">
+        <button type="button" class="tab is-active" data-tab="apply">申請</button>
+        <button type="button" class="tab" data-tab="list">一覧</button>
+        <button type="button" class="tab" data-tab="accounts" id="accountsTab" hidden>アカウント</button>
+      </nav>
+
+      <!-- 申請 -->
+      <section data-panel="apply">
+        <form class="card" id="applyForm">
+          <label class="photo">
+            <input id="photo" type="file" accept="image/*" />
+            <img id="preview" alt="" hidden />
+            <span id="photoHint">📷 レシートを撮影・選択（AIが読み取ります）</span>
+          </label>
+          <p class="note" id="aiMsg"></p>
+          <div class="grid">
+            <label>日付<input id="fDate" type="date" required /></label>
+            <label>金額（円）<input id="fAmount" type="number" min="1" step="1" inputmode="numeric" required /></label>
+            <label>費目<select id="fCategory" required></select></label>
+            <label>事業部<select id="fDept"></select></label>
+          </div>
+          <label>支払先<input id="fVendor" maxlength="60" /></label>
+          <label>摘要<input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
+          <button class="btn" type="submit" id="submitBtn">申請する</button>
+        </form>
+      </section>
+
+      <!-- 一覧 -->
+      <section data-panel="list" hidden>
+        <div class="card">
+          <div class="filters">
+            <label>月<input id="month" type="month" /></label>
+            <label>並べ替え
+              <select id="sortKey">
+                <option value="date">日付</option>
+                <option value="department">事業部ごと</option>
+                <option value="applicant">人ごと</option>
+                <option value="category">費目ごと</option>
+                <option value="amount">金額</option>
+              </select>
             </label>
-            <div class="upload-actions">
-              <label class="btn btn--ghost" id="cameraBtn">
-                📷 その場で撮影
-                <input
-                  id="cameraInput"
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  hidden
-                />
-              </label>
-            </div>
-
-            <div class="preview" id="preview" hidden>
-              <img id="previewImg" alt="レシートプレビュー" />
-              <div class="preview__actions">
-                <button id="retryAnalyze" type="button" class="btn btn--ghost btn--sm">
-                  ⟳ もう一度AI解析
-                </button>
-                <button id="rotateImage" type="button" class="btn btn--ghost btn--sm">
-                  ↻ 90°回転して再解析
-                </button>
-                <button id="clearImage" type="button" class="btn btn--ghost btn--sm">
-                  画像を削除
-                </button>
-              </div>
-            </div>
-
-            <div class="ocr-status" id="ocrStatus" hidden>
-              <div class="ocr-bar"><div class="ocr-bar__fill" id="ocrBarFill"></div></div>
-              <span id="ocrStatusText">解析中…</span>
-              <p class="ocr-error" id="ocrError" hidden></p>
-            </div>
-
-            <details class="ocr-raw" id="ocrRawWrap" hidden>
-              <summary>読み取ったテキストを表示（誤りの確認用）</summary>
-              <pre id="ocrRaw"></pre>
-            </details>
+            <button type="button" class="link" id="reloadBtn">再読込</button>
           </div>
-
-          <div class="card">
-            <h2 class="card__title">申請内容</h2>
-            <form id="expenseForm" class="form">
-              <div class="form__row">
-                <label for="expDate">日付 <span class="req">*</span></label>
-                <input id="expDate" type="date" required />
-              </div>
-              <div class="form__row">
-                <label for="expCategory">科目 <span class="req">*</span></label>
-                <select id="expCategory" required>
-                  <option value="交通費">交通費</option>
-                  <option value="交際費">交際費</option>
-                  <option value="会議費">会議費</option>
-                  <option value="消耗品費">消耗品費</option>
-                  <option value="通信費">通信費</option>
-                  <option value="宿泊費">宿泊費</option>
-                  <option value="その他">その他</option>
-                </select>
-              </div>
-              <div class="form__row">
-                <label for="expDept">事業部</label>
-                <select id="expDept"></select>
-              </div>
-              <div class="form__row">
-                <label for="expVendor">支払先 / 店名</label>
-                <input id="expVendor" type="text" placeholder="例：〇〇商店" />
-              </div>
-
-              <!-- 交通費の運賃照合（科目が交通費のときだけ表示） -->
-              <details class="fare-box" id="fareBox" hidden>
-                <summary>
-                  <span>電車賃の照合（任意）</span>
-                  <span class="fare-box__state" id="fareSummary">区間を入れると運賃を照合できます</span>
-                </summary>
-                <div class="fare-grid">
-                  <div class="form__row">
-                    <label for="fareFrom">出発駅</label>
-                    <input id="fareFrom" type="text" placeholder="例：新井薬師前" autocomplete="off" />
-                  </div>
-                  <div class="form__row">
-                    <label for="fareTo">到着駅</label>
-                    <input id="fareTo" type="text" placeholder="例：武蔵浦和" autocomplete="off" />
-                  </div>
-                  <div class="form__row">
-                    <label for="fareRound">片道 / 往復</label>
-                    <select id="fareRound">
-                      <option value="round">往復</option>
-                      <option value="one">片道</option>
-                    </select>
-                  </div>
-                  <div class="form__row">
-                    <label for="fareTrips">回数</label>
-                    <input id="fareTrips" type="number" min="1" max="60" step="1" value="1" />
-                  </div>
-                </div>
-                <div class="fare-actions">
-                  <button id="fareLookupBtn" type="button" class="btn btn--ghost btn--sm">
-                    🔎 運賃マスタと照合
-                  </button>
-                  <a id="fareSearchLink" class="btn btn--ghost btn--sm" href="#"
-                     target="_blank" rel="noopener"
-                     title="自分のブラウザで路線検索を開きます（無料・AIを使いません）">
-                    🚉 路線検索で調べる ↗
-                  </a>
-                  <button id="fareApplyBtn" type="button" class="btn btn--ghost btn--sm" hidden>
-                    金額に反映
-                  </button>
-                </div>
-                <p class="fare-result" id="fareResult" hidden></p>
-              </details>
-
-              <div class="form__row">
-                <label for="expAmount">金額（円） <span class="req">*</span></label>
-                <input id="expAmount" type="number" min="0" step="1" required />
-              </div>
-              <div class="form__row">
-                <label for="expDesc">摘要 / 目的</label>
-                <textarea id="expDesc" rows="3" placeholder="例：取引先との打合せ"></textarea>
-              </div>
-              <div class="form__actions">
-                <button type="submit" class="btn btn--primary" id="submitBtn">申請する</button>
-                <button type="reset" class="btn btn--ghost">クリア</button>
-              </div>
-            </form>
-          </div>
+          <p class="total" id="total"></p>
+          <ul class="list" id="rows"></ul>
         </div>
       </section>
 
-      <!-- ===== 個人ダッシュボード ===== -->
-      <section class="panel" data-panel="personal">
-        <div class="month-nav">
-          <button id="personalPrev" type="button" class="btn btn--ghost btn--sm">◀</button>
-          <input id="personalMonth" type="month" class="month-input" />
-          <button id="personalNext" type="button" class="btn btn--ghost btn--sm">▶</button>
-          <button id="personalAll" type="button" class="btn btn--ghost btn--sm">全期間</button>
-        </div>
-        <div class="stats" id="personalStats"></div>
-        <div class="card">
-          <div class="card__head">
-            <h2 class="card__title">自分の申請一覧</h2>
-            <div class="filters">
-              <select id="personalFilter" class="mini-select">
-                <option value="all">すべて</option>
-                <option value="pending">申請中</option>
-                <option value="approved">承認済み</option>
-                <option value="rejected">却下</option>
-              </select>
-              <div class="view-toggle" id="personalViewToggle" role="group" aria-label="表示切替">
-                <button type="button" data-view="cards" data-scope="personal">🧾 領収書</button>
-                <button type="button" data-view="table" data-scope="personal">≡ 表</button>
-              </div>
-            </div>
-          </div>
-          <div class="cards" id="personalCards" hidden></div>
-          <div class="table-wrap" id="personalTableWrap">
-            <table class="table" id="personalTable">
-              <thead>
-                <tr>
-                  <th>日付</th>
-                  <th>科目</th>
-                  <th>支払先</th>
-                  <th class="num">金額</th>
-                  <th>状態</th>
-                  <th>領収書</th>
-                  <th>備考</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
+      <!-- アカウント（管理者のみ） -->
+      <section data-panel="accounts" hidden>
+        <form class="card" id="addUserForm">
+          <h2>利用者を追加</h2>
+          <label>名前<input id="uName" maxlength="40" required /></label>
+          <fieldset class="checks">
+            <legend>事業部（複数選べます）</legend>
+            <div id="uDepts"></div>
+          </fieldset>
+          <label>権限
+            <select id="uRole">
+              <option value="user">一般（自分の申請だけ見られる）</option>
+              <option value="admin">管理者（全員分を見られる・利用者を管理できる）</option>
+            </select>
+          </label>
+          <button class="btn" type="submit">追加して利用コードを発行</button>
+        </form>
 
-        <div class="card cloud-only" id="passwordCard" hidden>
-          <h2 class="card__title">パスワード変更</h2>
-          <form id="passwordForm" class="form form--grid">
-            <div class="form__row">
-              <label for="pwCurrent">現在のパスワード</label>
-              <input id="pwCurrent" type="password" autocomplete="current-password" required />
-            </div>
-            <div class="form__row">
-              <label for="pwNew">新しいパスワード（8文字以上）</label>
-              <input id="pwNew" type="password" autocomplete="new-password" minlength="8" required />
-            </div>
-            <div class="form__actions">
-              <button type="submit" class="btn btn--ghost">変更する</button>
-            </div>
-          </form>
-        </div>
-      </section>
-
-      <!-- ===== 管理者ダッシュボード ===== -->
-      <section class="panel" data-panel="admin">
-        <p class="notice" id="plNotice" hidden></p>
-        <div class="month-nav">
-          <button id="adminPrev" type="button" class="btn btn--ghost btn--sm">◀</button>
-          <input id="adminMonth" type="month" class="month-input" />
-          <button id="adminNext" type="button" class="btn btn--ghost btn--sm">▶</button>
-          <button id="adminAll" type="button" class="btn btn--ghost btn--sm">全期間</button>
-        </div>
-        <div class="stats" id="adminStats"></div>
-
-        <div class="grid grid--charts">
-          <div class="card">
-            <div class="card__head">
-              <h2 class="card__title" id="adminGroupTitle">グループ別 承認済み金額</h2>
-              <select id="adminGroupBy" class="mini-select">
-                <option value="category">区分（科目）別</option>
-                <option value="department">事業部別</option>
-                <option value="applicant">スタッフ別</option>
-              </select>
-            </div>
-            <div class="bars" id="adminByGroup"></div>
-          </div>
-
-          <div class="card">
-            <h2 class="card__title">月次推移（承認済み金額・直近6ヶ月）</h2>
-            <div class="bars" id="adminTrend"></div>
+        <!-- 発行したコード。保存はハッシュだけなので、ここを閉じると二度と表示できない -->
+        <div class="card issued" id="issued" hidden>
+          <h2 id="issuedTitle"></h2>
+          <p class="code" id="issuedCode"></p>
+          <p class="note">この画面を離れると再表示できません。忘れたときは「コード再発行」で発行し直してください。</p>
+          <div class="row">
+            <button type="button" class="btn" id="copyInviteBtn">案内文をコピー</button>
+            <button type="button" class="link" id="closeIssuedBtn">閉じる</button>
           </div>
         </div>
 
         <div class="card">
-          <div class="card__head">
-            <h2 class="card__title">全申請一覧</h2>
-            <div class="filters">
-              <input id="adminSearch" type="search" placeholder="申請者・店名で検索" />
-              <select id="adminStatusFilter" class="mini-select">
-                <option value="all">すべての状態</option>
-                <option value="pending">申請中</option>
-                <option value="approved">承認済み</option>
-                <option value="rejected">却下</option>
-              </select>
-              <select id="adminReceiptFilter" class="mini-select">
-                <option value="all">領収書：すべて</option>
-                <option value="yes">領収書あり</option>
-                <option value="no">領収書なし</option>
-              </select>
-              <select id="adminFareFilter" class="mini-select">
-                <option value="all">運賃照合：すべて</option>
-                <option value="diff">差額あり</option>
-                <option value="registered">新規登録</option>
-                <option value="unchecked">未照合</option>
-                <option value="match">一致</option>
-              </select>
-              <select id="adminSort" class="mini-select">
-                <option value="date_desc">日付（新しい順）</option>
-                <option value="date_asc">日付（古い順）</option>
-                <option value="amount_desc">金額（大きい順）</option>
-                <option value="applicant">スタッフ順</option>
-                <option value="department">事業部順</option>
-                <option value="category">区分（科目）順</option>
-              </select>
-              <div class="view-toggle" id="adminViewToggle" role="group" aria-label="表示切替">
-                <button type="button" data-view="cards" data-scope="admin">🧾 領収書</button>
-                <button type="button" data-view="table" data-scope="admin">≡ 表</button>
-              </div>
-              <button id="csvBtn" type="button" class="btn btn--ghost btn--sm">
-                CSV書き出し
-              </button>
-            </div>
-          </div>
-          <div class="cards" id="adminCards" hidden></div>
-          <div class="table-wrap" id="adminTableWrap">
-            <table class="table" id="adminTable">
-              <thead>
-                <tr>
-                  <th>申請者</th>
-                  <th>事業部</th>
-                  <th>日付</th>
-                  <th>科目</th>
-                  <th>支払先</th>
-                  <th class="num">金額</th>
-                  <th>領収書</th>
-                  <th>状態</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
+          <h2>利用者一覧</h2>
+          <ul class="list" id="userRows"></ul>
         </div>
 
-        <!-- 事業部マスタ管理（クラウド＋認証モードのみ） -->
-        <div class="card cloud-only" id="deptMgmtCard" hidden>
-          <h2 class="card__title">事業部の管理</h2>
-          <p class="card__hint">
-            ここで登録した事業部が、申請フォームとユーザー登録のプルダウンに反映されます。
-            削除しても過去の申請データの事業部名は残ります（選択肢から外れるだけ）。
-          </p>
-          <div id="deptChips" class="dept-chips"></div>
-          <form id="deptAddForm" class="form form--inline-add">
-            <input id="newDeptName" type="text" placeholder="新しい事業部名" maxlength="40" required />
-            <button type="submit" class="btn btn--primary">追加</button>
+        <!-- 事業部マスタ。申請と利用者の事業部はここから選ぶ -->
+        <div class="card">
+          <h2>事業部</h2>
+          <ul class="chips" id="deptRows"></ul>
+          <form class="row" id="addDeptForm">
+            <input id="deptName" maxlength="40" placeholder="新しい事業部名" required />
+            <button class="btn btn--sm" type="submit">追加</button>
           </form>
-        </div>
-
-        <!-- 運賃マスタ（クラウド＋認証モードのみ） -->
-        <div class="card cloud-only" id="fareMgmtCard" hidden>
-          <div class="card__head">
-            <h2 class="card__title">運賃マスタ（電車賃の照合基準）</h2>
-            <button id="fareReloadBtn" type="button" class="btn btn--ghost btn--sm">
-              再読込
-            </button>
-          </div>
-          <p class="card__hint">
-            未登録の区間が申請されると、<strong>その申請額から片道運賃を割り戻してここへ登録</strong>
-            します（更新欄が「申請（申請者名）」の行）。2回目以降の同じ区間はこの値で即照合するため、
-            結果がぶれません。<strong>最初の1件は申請額をそのまま基準にしているので、
-            一覧で「新規登録」が付いた申請は承認前に金額を確かめてください。</strong>
-            運賃改定や誤りは運賃欄を直接書き換えて修正します
-            （削除すると次の申請でまた登録し直されます）。上りと下りは同じ区間として扱います。
-          </p>
-          <div class="table-wrap">
-            <table class="table" id="fareTable">
-              <thead>
-                <tr>
-                  <th>出発駅</th>
-                  <th>到着駅</th>
-                  <th class="num">片道運賃</th>
-                  <th>経路</th>
-                  <th>出典</th>
-                  <th>更新</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-
-          <h3 class="card__subtitle">区間を手で追加する</h3>
-          <form id="fareAddForm" class="form form--inline-add">
-            <input id="nfFrom" type="text" placeholder="出発駅" required />
-            <input id="nfTo" type="text" placeholder="到着駅" required />
-            <input id="nfFare" type="number" min="1" step="1" placeholder="片道運賃" required />
-            <input id="nfRoute" type="text" placeholder="経路（任意）" />
-            <a id="nfSearchLink" class="btn btn--ghost" href="#" target="_blank" rel="noopener"
-               title="駅名を入れると路線検索を開けます（無料・AIを使いません）">
-              🚉 調べる ↗
-            </a>
-            <button type="submit" class="btn btn--primary">追加</button>
-          </form>
-
-        </div>
-
-        <!-- AI解析の学習データ（クラウド＋認証モードのみ） -->
-        <div class="card cloud-only" id="memoryCard" hidden>
-          <div class="card__head">
-            <h2 class="card__title">AI解析の学習データ（店舗別）</h2>
-            <button id="memoryReloadBtn" type="button" class="btn btn--ghost btn--sm">
-              再読込
-            </button>
-          </div>
-          <p class="card__hint">
-            申請時の手修正を店舗ごとに記憶し、次回同じ店舗のレシートで
-            <strong>店名・科目・摘要</strong>を自動補正します。過去に金額・日付を誤読した店舗では、
-            その事例をAIに伝えたうえで読み直します。
-            学習内容が実態に合わなくなったら「学習を削除」でその店舗の記憶だけを消せます
-            （申請データは消えません）。
-          </p>
-          <div class="table-wrap">
-            <table class="table" id="memoryTable">
-              <thead>
-                <tr>
-                  <th>店名</th>
-                  <th>科目</th>
-                  <th>摘要</th>
-                  <th>学習件数</th>
-                  <th>誤読事例</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
-
-        <!-- ユーザー管理（クラウド＋認証モードのみ） -->
-        <div class="card cloud-only" id="userMgmtCard" hidden>
-          <div class="card__head">
-            <h2 class="card__title">ユーザー管理</h2>
-            <button id="userReloadBtn" type="button" class="btn btn--ghost btn--sm">
-              再読込
-            </button>
-          </div>
-          <div class="table-wrap">
-            <table class="table" id="userTable">
-              <thead>
-                <tr>
-                  <th>ユーザーID</th>
-                  <th>表示名</th>
-                  <th>事業部</th>
-                  <th>権限</th>
-                  <th>状態</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-
-          <h3 class="card__subtitle">ユーザーを追加</h3>
-          <form id="userAddForm" class="form form--grid">
-            <div class="form__row">
-              <label for="nuUsername">ユーザーID（半角英数 3〜32字）</label>
-              <input id="nuUsername" type="text" pattern="[a-zA-Z0-9._\-]{3,32}" required />
-            </div>
-            <div class="form__row">
-              <label for="nuDisplayName">表示名</label>
-              <input id="nuDisplayName" type="text" required />
-            </div>
-            <div class="form__row">
-              <label for="nuDept">事業部</label>
-              <select id="nuDept"></select>
-            </div>
-            <div class="form__row">
-              <label for="nuPassword">初期パスワード（8文字以上）</label>
-              <input id="nuPassword" type="text" minlength="8" required />
-            </div>
-            <div class="form__row">
-              <label for="nuRole">権限</label>
-              <select id="nuRole">
-                <option value="user">一般（自分の申請のみ）</option>
-                <option value="admin">管理者（全件・承認・ユーザー管理）</option>
-              </select>
-            </div>
-            <div class="form__actions">
-              <button type="submit" class="btn btn--primary">追加する</button>
-            </div>
-          </form>
+          <p class="note">削除しても、過去の申請や利用者に付いている事業部名はそのまま残ります。</p>
         </div>
       </section>
     </main>
 
-    <!-- ===== ログイン / 初期設定 ===== -->
-    <div class="auth-overlay" id="authOverlay" hidden>
-      <div class="auth-box">
-        <h1 class="app-title">経費申請アプリ</h1>
-
-        <form id="loginForm" class="form" hidden>
-          <h2 class="card__title">ログイン</h2>
-          <div class="form__row">
-            <label for="loginUsername">ユーザーID</label>
-            <input id="loginUsername" type="text" autocomplete="username" required />
-          </div>
-          <div class="form__row">
-            <label for="loginPassword">パスワード</label>
-            <input id="loginPassword" type="password" autocomplete="current-password" required />
-          </div>
-          <p class="form-error" id="loginError" hidden></p>
-          <div class="form__actions">
-            <button type="submit" class="btn btn--primary btn--wide">ログイン</button>
-          </div>
-        </form>
-
-        <form id="setupForm" class="form" hidden>
-          <h2 class="card__title">初期設定：管理者アカウントの作成</h2>
-          <p class="card__hint">
-            最初にシステム管理者のアカウントを作成します。作成後は全員ログインが必要になります。
-          </p>
-          <div class="form__row">
-            <label for="setupUsername">ユーザーID（半角英数 3〜32字）</label>
-            <input id="setupUsername" type="text" pattern="[a-zA-Z0-9._\-]{3,32}" required />
-          </div>
-          <div class="form__row">
-            <label for="setupDisplayName">表示名（氏名）</label>
-            <input id="setupDisplayName" type="text" required />
-          </div>
-          <div class="form__row">
-            <label for="setupPassword">パスワード（8文字以上）</label>
-            <input id="setupPassword" type="password" minlength="8" required />
-          </div>
-          <p class="form-error" id="setupError" hidden></p>
-          <div class="form__actions">
-            <button type="submit" class="btn btn--primary btn--wide">作成してはじめる</button>
-          </div>
-        </form>
-      </div>
-    </div>
-
-    <!-- ===== 設定モーダル ===== -->
-    <div class="modal" id="settingsModal" hidden>
-      <div class="modal__backdrop" data-close></div>
-      <div class="modal__box">
-        <h2 class="card__title">クラウド連携設定</h2>
-        <p class="card__hint">
-          Google Apps Script で公開した Web アプリの URL を設定すると、申請データが
-          スプレッドシートに、領収書画像が Google ドライブに保存され、ログインと権限管理が
-          有効になります。未設定の場合はこの端末内（localStorage）のみの試用モードです。
-          設定手順は <code>apps-script/README.md</code> を参照してください。
-        </p>
-        <div class="form__row">
-          <label for="cfgEndpoint">Web アプリ URL</label>
-          <input
-            id="cfgEndpoint"
-            type="url"
-            placeholder="https://script.google.com/macros/s/.../exec"
-          />
-        </div>
-        <div class="form__actions">
-          <button id="cfgSave" type="button" class="btn btn--primary">保存して接続</button>
-          <button id="cfgClear" type="button" class="btn btn--ghost">連携を解除</button>
-          <button type="button" class="btn btn--ghost" data-close>閉じる</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- ===== 領収書ビューア（拡大表示） ===== -->
-    <div class="modal lightbox" id="receiptModal" hidden>
-      <div class="modal__backdrop" data-lb-close></div>
-      <div class="lightbox__box">
-        <div class="lightbox__bar">
-          <div class="lightbox__title">
-            <strong id="lbTitle"></strong>
-            <span id="lbSub"></span>
-          </div>
-          <span class="lightbox__count" id="lbCount"></span>
-          <button type="button" class="lightbox__btn" data-lb-close aria-label="閉じる">✕</button>
-        </div>
-        <div class="lightbox__stage">
-          <button type="button" class="lightbox__nav" data-lb-prev aria-label="前の領収書">◀</button>
-          <img id="lbImg" alt="領収書" />
-          <p class="lightbox__error" id="lbError" hidden>
-            画像を表示できませんでした。Google ドライブ上の画像に、
-            このGoogleアカウントの閲覧権限が無い可能性があります。
-            下の「ドライブで開く」から確認してください。
-          </p>
-          <button type="button" class="lightbox__nav" data-lb-next aria-label="次の領収書">▶</button>
-        </div>
-        <div class="lightbox__foot">
-          <a id="lbOpen" href="#" target="_blank" rel="noopener" class="btn btn--ghost btn--sm">
-            ドライブで開く ↗
-          </a>
-          <span class="lightbox__hint">← → キーで移動 / Esc で閉じる</span>
-        </div>
-      </div>
-    </div>
-
     <div class="toast" id="toast" hidden></div>
-
-    <!--
-      外部スクリプトをここへ足さないこと。script.js より前に同期で置くと、
-      その通信が終わるまでアプリのJSが1行も動かず、起動が丸ごと待たされる。
-      必要なものは script.js から使う直前に動的に読み込む。
-    -->
-    <script src="./script.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>

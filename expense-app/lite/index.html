@@ -3,140 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>経費申請（軽量版）</title>
-    <link rel="stylesheet" href="lite.css" />
+    <title>経費申請</title>
+    <!-- 旧URL（/lite/）で配った案内リンクとブックマークを、本来のURLへ移す。
+         # 以降（利用コード）も引き継ぐ。軽量版を正式版にしたため、このフォルダは移動案内だけ。 -->
+    <script>
+      location.replace("../" + location.hash);
+    </script>
+    <noscript><meta http-equiv="refresh" content="0; url=../" /></noscript>
   </head>
   <body>
-    <header class="bar">
-      <h1>経費申請</h1>
-      <div class="bar__user" id="userBox" hidden>
-        <span id="userName"></span>
-        <button type="button" class="link" id="logoutBtn">ログアウト</button>
-      </div>
-    </header>
-
-    <!-- ログイン（WebアプリURLが未設定なら、ここで入力する） -->
-    <main id="loginView" hidden>
-      <form class="card" id="loginForm">
-        <h2>ログイン</h2>
-        <label id="endpointRow" hidden>
-          WebアプリURL（…/exec）
-          <input id="endpoint" type="url" placeholder="https://script.google.com/macros/s/…/exec" />
-        </label>
-        <!-- 通常は利用コードだけ。IDとパスワードは管理者の最初のログイン用 -->
-        <label id="codeRow">利用コード
-          <input id="loginCode" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false"
-                 placeholder="ABCD-EFGH" maxlength="12" />
-        </label>
-        <div id="pwRows" hidden>
-          <label>ユーザーID<input id="loginId" autocomplete="username" /></label>
-          <label>パスワード<input id="loginPw" type="password" autocomplete="current-password" /></label>
-        </div>
-        <button class="btn" type="submit">ログイン</button>
-        <button type="button" class="link" id="loginModeBtn">IDとパスワードでログイン（管理者）</button>
-        <p class="err" id="loginErr"></p>
-      </form>
-    </main>
-
-    <main id="appView" hidden>
-      <nav class="tabs">
-        <button type="button" class="tab is-active" data-tab="apply">申請</button>
-        <button type="button" class="tab" data-tab="list">一覧</button>
-        <button type="button" class="tab" data-tab="accounts" id="accountsTab" hidden>アカウント</button>
-      </nav>
-
-      <!-- 申請 -->
-      <section data-panel="apply">
-        <form class="card" id="applyForm">
-          <label class="photo">
-            <input id="photo" type="file" accept="image/*" />
-            <img id="preview" alt="" hidden />
-            <span id="photoHint">📷 レシートを撮影・選択（AIが読み取ります）</span>
-          </label>
-          <p class="note" id="aiMsg"></p>
-          <div class="grid">
-            <label>日付<input id="fDate" type="date" required /></label>
-            <label>金額（円）<input id="fAmount" type="number" min="1" step="1" inputmode="numeric" required /></label>
-            <label>費目<select id="fCategory" required></select></label>
-            <label>事業部<select id="fDept"></select></label>
-          </div>
-          <label>支払先<input id="fVendor" maxlength="60" /></label>
-          <label>摘要<input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
-          <button class="btn" type="submit" id="submitBtn">申請する</button>
-        </form>
-      </section>
-
-      <!-- 一覧 -->
-      <section data-panel="list" hidden>
-        <div class="card">
-          <div class="filters">
-            <label>月<input id="month" type="month" /></label>
-            <label>並べ替え
-              <select id="sortKey">
-                <option value="date">日付</option>
-                <option value="department">事業部ごと</option>
-                <option value="applicant">人ごと</option>
-                <option value="category">費目ごと</option>
-                <option value="amount">金額</option>
-              </select>
-            </label>
-            <button type="button" class="link" id="reloadBtn">再読込</button>
-          </div>
-          <p class="total" id="total"></p>
-          <ul class="list" id="rows"></ul>
-        </div>
-      </section>
-
-      <!-- アカウント（管理者のみ） -->
-      <section data-panel="accounts" hidden>
-        <form class="card" id="addUserForm">
-          <h2>利用者を追加</h2>
-          <label>名前<input id="uName" maxlength="40" required /></label>
-          <fieldset class="checks">
-            <legend>事業部（複数選べます）</legend>
-            <div id="uDepts"></div>
-          </fieldset>
-          <label>権限
-            <select id="uRole">
-              <option value="user">一般（自分の申請だけ見られる）</option>
-              <option value="admin">管理者（全員分を見られる・利用者を管理できる）</option>
-            </select>
-          </label>
-          <button class="btn" type="submit">追加して利用コードを発行</button>
-        </form>
-
-        <!-- 発行したコード。保存はハッシュだけなので、ここを閉じると二度と表示できない -->
-        <div class="card issued" id="issued" hidden>
-          <h2 id="issuedTitle"></h2>
-          <p class="code" id="issuedCode"></p>
-          <p class="note">この画面を離れると再表示できません。忘れたときは「コード再発行」で発行し直してください。</p>
-          <div class="row">
-            <button type="button" class="btn" id="copyInviteBtn">案内文をコピー</button>
-            <button type="button" class="link" id="closeIssuedBtn">閉じる</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>利用者一覧</h2>
-          <ul class="list" id="userRows"></ul>
-        </div>
-
-        <!-- 事業部マスタ。申請と利用者の事業部はここから選ぶ -->
-        <div class="card">
-          <h2>事業部</h2>
-          <ul class="chips" id="deptRows"></ul>
-          <form class="row" id="addDeptForm">
-            <input id="deptName" maxlength="40" placeholder="新しい事業部名" required />
-            <button class="btn btn--sm" type="submit">追加</button>
-          </form>
-          <p class="note">削除しても、過去の申請や利用者に付いている事業部名はそのまま残ります。</p>
-        </div>
-      </section>
-    </main>
-
-    <div class="toast" id="toast" hidden></div>
-    <!-- WebアプリURLの設定（任意）。無くても動く（その場合はログイン画面にURL入力欄が出る） -->
-    <script src="../config.js"></script>
-    <script src="lite.js"></script>
+    <p><a href="../">経費申請アプリはこちらへ移動しました</a></p>
   </body>
 </html>
