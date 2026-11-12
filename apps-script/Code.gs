@@ -2,11 +2,12 @@
  * 経費申請アプリ バックエンド（Google Apps Script Web App）
  *
  * 役割:
- *   - スプレッドシートを経費データ／ユーザー／AI解析の学習ログのデータベースとして使用
+ *   - スプレッドシートを経費データ／ユーザー／事業部のデータベースとして使用
  *     （タブ名・1行目の見出しは日本語。内部キー・JSON APIのキー名は英語で固定）
  *   - アップロードされた領収書画像を Google Drive フォルダに保存し、URL を行に記録
  *   - ユーザー認証（ソルト付き SHA-256 ハッシュ）と署名付きセッショントークンの発行
- *   - 権限制御: user = 自分の申請のみ / admin = 全申請＋承認＋ユーザー管理
+ *   - 権限制御: user = 自分の申請のみ / admin = 全申請＋ユーザー・事業部の管理
+ *   - 承認の手続きは無い（申請はそのまま計上される）
  *   - 実績管理・分析ツール向けに JSON API（doGet）で全データを提供
  *
  * デプロイ手順は apps-script/README.md を参照。
@@ -35,7 +36,7 @@
 
 /**
  * シートの列定義。[内部キー, シート1行目に表示する見出し] の順で列順そのものを表す。
- * 内部キーは JSON API・CSV・フロントエンドが使う名前なので変更しない。
+ * 内部キーは JSON API・フロントエンドが使う名前なので変更しない。
  * 見出しだけを日本語にすることで、シートを直接見る人にわかりやすくする。
  * 旧版で作られた英語見出し・英語タブ名は ensureSheet_ が自動で日本語へ移行する。
  */
@@ -58,7 +59,8 @@ const EXPENSE_COLUMNS = [
   ["imageFileId", "領収書ファイルID"],
   ["applicantId", "申請者ID"],
   ["department", "事業部"],
-  // 交通費の運賃照合（電車賃。区間と回数から想定額を出して申請額と突き合わせる）
+  // 以下は、かつての交通費の運賃照合の列。機能は削除したが、過去の行と列の位置を
+  // そろえるため（列は位置で読み書きする）定義だけ残している。新しい申請では空。
   ["fareFrom", "出発駅"],
   ["fareTo", "到着駅"],
   ["fareRound", "往復"],
@@ -91,22 +93,6 @@ const DEPARTMENTS_SHEET = "事業部マスタ";
 const DEPARTMENTS_SHEET_LEGACY = "departments";
 const DEPARTMENT_COLUMNS = [["name", "事業部名"]];
 
-/**
- * 区間運賃マスタ。一度Webで照合した区間の運賃を蓄積し、
- * 次回以降は検索せずに即照合する（結果がぶれず、検索の課金も発生しない）。
- * 運賃改定やAIの誤りは管理者が上書き・削除して直せる。
- */
-const FARES_SHEET = "運賃マスタ";
-const FARE_COLUMNS = [
-  ["key", "区間キー"],
-  ["from", "出発駅"],
-  ["to", "到着駅"],
-  ["fare", "片道運賃"],
-  ["route", "経路"],
-  ["source", "出典URL"],
-  ["checkedAt", "照合日時"],
-  ["checkedBy", "照合方法"],
-];
 const DEFAULT_DEPARTMENTS = [
   "BAR",
   "人材",
@@ -117,41 +103,6 @@ const DEFAULT_DEPARTMENTS = [
   "GoonerHouse",
 ];
 
-/**
- * AI解析の学習ログ（店舗ごとの手修正の履歴）。
- * 申請保存時に「AIの読み取り結果」と「利用者が確定した値」を1行ずつ記録し、
- * 次回以降の解析で ①辞書補正 ②誤読事例のフィードバック に再利用する。
- */
-const CORRECTIONS_SHEET = "AI学習ログ";
-const CORRECTIONS_SHEET_LEGACY = "corrections";
-const CORRECTION_COLUMNS = [
-  ["createdAt", "記録日時"],
-  ["vendorKey", "店舗キー"],
-  ["aiVendorKey", "店舗キー（AI読取）"],
-  ["vendor", "店名（確定）"],
-  ["date", "利用日（確定）"],
-  ["amount", "金額（確定）"],
-  ["category", "科目（確定）"],
-  ["description", "摘要（確定）"],
-  ["aiVendor", "店名（AI読取）"],
-  ["aiDate", "利用日（AI読取）"],
-  ["aiAmount", "金額（AI読取）"],
-  ["aiCategory", "科目（AI読取）"],
-  ["aiDescription", "摘要（AI読取）"],
-  ["corrected", "修正された項目"],
-  ["applicantId", "申請者ID"],
-  ["rawHead", "書き起こし（先頭）"],
-];
-const CORRECTION_HEADERS = CORRECTION_COLUMNS.map(function (c) {
-  return c[0];
-});
-
-/** 学習に使う直近の履歴件数（履歴が育っても解析の所要時間を一定に保つ） */
-const CORRECTION_LOOKBACK = 600;
-/** プロンプトへ添付する誤読事例の最大件数 */
-const CORRECTION_HINT_MAX = 3;
-/** 摘要を自動補正するのに必要な最低一致回数（1回だけの摘要は使い回さない） */
-const DESCRIPTION_MIN_HITS = 2;
 /**
  * レシートの書き起こし（raw_text）に許す行数の上限。
  *
@@ -174,14 +125,6 @@ const TOKEN_RENEW_MS = TOKEN_TTL_MS / 2;
 
 function getProp_(key) {
   return PropertiesService.getScriptProperties().getProperty(key);
-}
-
-/**
- * 自動承認モード。既定は有効（申請は即 approved になる）。
- * 承認フローを復活させる場合はスクリプトプロパティ AUTO_APPROVE を "false" に設定。
- */
-function isAutoApprove_() {
-  return getProp_("AUTO_APPROVE") !== "false";
 }
 
 /* ========================= ストレージ ========================= */
@@ -265,18 +208,6 @@ function getUsersSheet_() {
   return ensureSheet_(USERS_SHEET, USER_COLUMNS, USERS_SHEET_LEGACY);
 }
 
-function getCorrectionsSheet_() {
-  return ensureSheet_(
-    CORRECTIONS_SHEET,
-    CORRECTION_COLUMNS,
-    CORRECTIONS_SHEET_LEGACY
-  );
-}
-
-function getFaresSheet_() {
-  return ensureSheet_(FARES_SHEET, FARE_COLUMNS);
-}
-
 /**
  * シート名・見出しの定義の版。ここを変えると次のリクエストで全シートを移行する。
  */
@@ -285,9 +216,8 @@ const SCHEMA_VERSION = "2026-08-ja-2";
 /**
  * 全シートのタブ名と見出しを現在の定義に揃える。
  *
- * 各シートは使われたときにしか ensureSheet_ を通らないため、たとえば
- * AI学習ログ（旧 corrections）は「AI解析を使った申請」が発生するまで
- * 日本語化されない。それを避けるため、版が変わったときだけ全シートを
+ * 各シートは使われたときにしか ensureSheet_ を通らないため、使われていない
+ * シートは日本語化されない。それを避けるため、版が変わったときだけ全シートを
  * まとめて移行する（普段はプロパティ1回の読み取りだけで終わる）。
  * 存在しないシートはここで作成され、見出しだけの空シートになる。
  */
@@ -306,13 +236,6 @@ function migrateSheets() {
   getSheet_();
   getUsersSheet_();
   getDepartmentsSheet_();
-  getCorrectionsSheet_();
-  getFaresSheet_();
-  // PL連携用のシートは、連携を有効にしたときだけ作る（使わない人には出さない）
-  if (isPlSyncEnabled_()) {
-    getPlMappingSheet_();
-    getPlSkippedSheet_();
-  }
 }
 
 /** 移行の失敗でリクエスト自体を落とさないためのラッパー */
@@ -731,30 +654,6 @@ function actionLogin_(body) {
   };
 }
 
-function actionChangePassword_(body) {
-  const u = requireUser_(body.token, false);
-  if (u.legacy) throw new Error("認証が無効のため変更できません");
-  const rec = findUser_(u.username);
-  if (
-    hashPassword_(body.currentPassword, String(rec.salt)) !==
-    String(rec.passwordHash)
-  ) {
-    throw new Error("現在のパスワードが違います");
-  }
-  validatePassword_(body.newPassword);
-  const salt = Utilities.getUuid();
-  const sheet = getUsersSheet_();
-  sheet
-    .getRange(rec._row, USER_HEADERS.indexOf("passwordHash") + 1)
-    .setValue(hashPassword_(body.newPassword, salt));
-  sheet.getRange(rec._row, USER_HEADERS.indexOf("salt") + 1).setValue(salt);
-  // ソルトが変わると今のトークンは失効するので、本人には新しいトークンを返す
-  return {
-    ok: true,
-    token: issueToken_(publicUser_(rec), tokenVersion_({ salt: salt })),
-  };
-}
-
 function actionListUsers_(body) {
   requireUser_(body.token, true);
   return { ok: true, users: readUsers_().map(publicUser_) };
@@ -971,27 +870,6 @@ function findRow_(sheet, id) {
   return -1;
 }
 
-/**
- * 指定した内部キーの列だけを見て、値が一致する行番号を返す（無ければ -1）。
- * シート全体を読み込まずに済むよう、対象の1列だけを取得する。
- */
-function findRowByColumn_(sheet, key, value, columns) {
-  const last = sheet.getLastRow();
-  if (last < 2) return -1;
-  const head = headerKeys_(
-    sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
-    columns || EXPENSE_COLUMNS
-  );
-  const col = head.indexOf(key);
-  if (col < 0) return -1;
-  const values = sheet.getRange(2, col + 1, last - 1, 1).getValues();
-  const target = String(value);
-  for (let i = 0; i < values.length; i++) {
-    if (String(values[i][0]) === target) return i + 2;
-  }
-  return -1;
-}
-
 /* ========================= HTTPエントリポイント ========================= */
 
 /**
@@ -1047,22 +925,18 @@ function statusPayload_() {
   return {
     ok: true,
     authEnabled: usersExist_(),
-    autoApprove: isAutoApprove_(),
     aiOcr: !!resolveOcrProvider_(),
     version: SCHEMA_VERSION,
     features: {
-      fare: true, // 交通費の運賃照合
-      receiptImage: true, // 領収書画像のアプリ経由取得
-      vendorMemory: true, // AI解析の学習
-      jaSheets: true, // シートの日本語化
       bootstrap: true, // 起動を1往復にまとめられるか
-      plSync: isPlSyncEnabled_(), // PL管理モデルへの連携（プロパティ1回の読み取り）
+      list: true, // 月ごとの一覧
+      accessCode: true, // 利用コードでのログイン
     },
   };
 }
 
 /**
- * 起動用。`status` `me` 一覧取得の3往復を1往復にまとめる。
+ * 起動用。`status`・ログイン中のユーザー・一覧取得の3往復を1往復にまとめる。
  *
  * トークンが無効でもエラーにしない（`user: null` を返す）。ここで例外にすると、
  * アプリはログイン画面を出すためにもう1往復することになり、統合の意味がなくなる。
@@ -1095,19 +969,10 @@ function actionBootstrap_(body) {
       u.tokenVersion
     );
   }
-  // PLへ反映できなかった申請の件数。管理者にだけ知らせれば足りるので、
-  // 一般ユーザーの起動ではスキップ記録のシートを読まない。
-  if (u.role === "admin" && isPlSyncEnabled_()) {
-    try {
-      out.plSkipped = countPlSkipped_();
-    } catch (err) {
-      // 件数が取れなくても起動は成立させる
-    }
-  }
   return out;
 }
 
-/** POST: 認証・申請の作成・更新・削除・ユーザー管理 */
+/** POST: 認証・申請の作成と削除・一覧・ユーザーと事業部の管理 */
 function doPost(e) {
   try {
     safeMigrateSheets_();
@@ -1135,77 +1000,29 @@ function doPost(e) {
       // 利用コードだけでログイン（軽量版）
       case "loginCode":
         return json_(actionLoginCode_(body));
-      // ---- 認証（トークン必要） ----
-      case "me": {
-        const u = requireUser_(body.token, false);
-        return json_({
-          ok: true,
-          user: {
-            username: u.username,
-            displayName: u.displayName,
-            role: u.role,
-            department: String(u.department || ""), // requireUser_ が読み取り済み
-          },
-          departments: listDepartments_(),
-        });
-      }
-      case "changePassword":
-        return json_(actionChangePassword_(body));
+      // ---- 利用者（管理者のみ） ----
       case "listUsers":
         return json_(actionListUsers_(body));
       case "upsertUser":
         return json_(actionUpsertUser_(body));
       case "issueAccessCode":
         return json_(actionIssueAccessCode_(body));
-      // ---- 事業部マスタ ----
-      case "listDepartments": {
-        requireUser_(body.token, false);
-        return json_({ ok: true, departments: listDepartments_() });
-      }
+      // ---- 事業部マスタ（管理者のみ） ----
       case "addDepartment":
         return json_(actionAddDepartment_(body));
       case "deleteDepartment":
         return json_(actionDeleteDepartment_(body));
-      // ---- 交通費の運賃照合（電車賃） ----
-      case "lookupFare":
-        return json_(actionLookupFare_(body));
-      case "listFares":
-        return json_(actionListFares_(body));
-      case "upsertFare":
-        return json_(actionUpsertFare_(body));
-      case "deleteFare":
-        return json_(actionDeleteFare_(body));
-      // ---- 領収書画像（Driveの閲覧権限が無い利用者向け） ----
-      case "receiptImage":
-        return json_(actionReceiptImage_(body));
       // ---- AIレシート解析 ----
       case "analyzeReceipt":
         return json_(actionAnalyzeReceipt_(body));
-      // ---- AI解析の学習データ（店舗別の補正記憶） ----
-      case "listVendorMemory":
-        return json_(actionListVendorMemory_(body));
-      case "deleteVendorMemory":
-        return json_(actionDeleteVendorMemory_(body));
       // ---- 経費データ ----
       case "create": {
         const u = requireUser_(body.token, false);
         return json_(createExpense_(body.record, u));
       }
-      case "update": {
-        const u = requireUser_(body.token, true); // 承認・却下・差戻は管理者のみ
-        return json_(updateExpense_(body.id, body.fields || {}, u));
-      }
       case "delete": {
         const u = requireUser_(body.token, false);
         return json_(deleteExpense_(body.id, u));
-      }
-      // ---- PL管理モデルへの連携 ----
-      case "syncPl": {
-        requireUser_(body.token, true); // 管理者のみ
-        if (!isPlSyncEnabled_()) {
-          return json_({ ok: false, error: "PL連携が未設定です（PL_SPREADSHEET_ID）" });
-        }
-        return json_({ ok: true, message: syncAllToPl(), skipped: countPlSkipped_() });
       }
       default:
         return json_({ ok: false, error: "unknown action" });
@@ -1254,13 +1071,8 @@ function createExpense_(record, user) {
     imageFileId = file.getId();
     imageUrl = "https://drive.google.com/file/d/" + imageFileId + "/view";
   }
-  // 交通費の運賃照合。片道運賃は運賃マスタ（サーバー側の正）から取り直して
-  // 想定金額を計算するため、クライアントから送られた金額は信用しない。
-  // 未登録の区間は、この申請額から運賃マスタへ登録する（誰が入れたか残す）。
-  const fare = resolveFareForRecord_(record, Number(record.amount) || 0, applicant);
-
-  // 自動承認モードでは申請と同時に承認済みにする
-  const auto = isAutoApprove_();
+  // 承認の手続きは無い。申請はそのまま計上される（状態は常に approved）。
+  // 運賃照合の列は、過去の行と列の位置をそろえるために空のまま残している。
   const rec = {
     id: record.id,
     createdAt: record.createdAt || new Date().toISOString(),
@@ -1270,73 +1082,21 @@ function createExpense_(record, user) {
     vendor: record.vendor || "",
     amount: Number(record.amount) || 0,
     description: record.description || "",
-    status: auto ? "approved" : "pending",
-    reviewedAt: auto ? new Date().toISOString() : "",
-    reviewer: auto ? "自動承認" : "",
+    status: "approved",
+    reviewedAt: new Date().toISOString(),
+    reviewer: "自動承認",
     reviewComment: "",
     imageUrl: imageUrl,
     imageFileId: imageFileId,
     applicantId: applicantId,
     department: department,
-    fareFrom: fare.from,
-    fareTo: fare.to,
-    fareRound: fare.from ? fare.round : "",
-    fareTrips: fare.from ? fare.trips : "",
-    fareUnit: fare.unit || "",
-    fareExpected: fare.expected || "",
-    fareCheck: fare.check,
   };
   sheet.appendRow(
     HEADERS.map(function (h) {
-      return rec[h];
+      return rec[h] === undefined ? "" : rec[h];
     })
   );
-  // AI解析を使った申請は「AIの読み取り」と「確定値」の差分を学習ログへ残す。
-  // 学習ログの失敗で申請そのものを落とさないよう、例外は握りつぶす。
-  if (record.ai) {
-    try {
-      logCorrection_(rec, record.ai, applicantId);
-    } catch (err) {
-      // noop
-    }
-  }
-  // PL管理モデルへの連携（承認済みのみ反映。無効なら何もしない）
-  safeSyncExpenseToPl_(rec);
   return { ok: true, record: rec };
-}
-
-function updateExpense_(id, fields, user) {
-  const sheet = getSheet_();
-  const row = findRow_(sheet, id);
-  if (row < 0) return { ok: false, error: "not found" };
-  // 承認系の記録者もサーバー側で強制
-  if (!user.legacy && (fields.status || fields.reviewer != null)) {
-    fields.reviewer = user.displayName;
-  }
-  Object.keys(fields).forEach(function (k) {
-    const col = HEADERS.indexOf(k);
-    if (col >= 0) sheet.getRange(row, col + 1).setValue(fields[k]);
-  });
-  // 承認・却下・金額修正をPLへ反映する（却下・差戻しならPLから取り下げる）。
-  // 連携が無効なら読み取りも起きないよう、判定を先に済ませる。
-  if (isPlSyncEnabled_()) safeSyncExpenseToPl_(recordAtRow_(sheet, row));
-  return { ok: true };
-}
-
-/** 指定行を1件のレコードとして読む（更新後の値をPLへ渡すために使う）。 */
-function recordAtRow_(sheet, row) {
-  const width = sheet.getLastColumn();
-  const head = headerKeys_(
-    sheet.getRange(1, 1, 1, width).getValues()[0],
-    EXPENSE_COLUMNS
-  );
-  const values = sheet.getRange(row, 1, 1, width).getValues()[0];
-  const rec = {};
-  head.forEach(function (h, j) {
-    rec[h] = normalizeValue_(h, values[j]);
-  });
-  rec.amount = Number(rec.amount) || 0;
-  return rec;
 }
 
 function deleteExpense_(id, user) {
@@ -1363,743 +1123,7 @@ function deleteExpense_(id, user) {
     }
   }
   sheet.deleteRow(row);
-  safeRemoveFromPl_(id); // PLに載っていれば取り下げる
   return { ok: true };
-}
-
-/* ==================== 交通費の運賃照合（電車賃） ==================== */
-
-/** 1回の申請で認める回数の上限（打ち間違いで巨額にならないように） */
-const FARE_TRIPS_MAX = 60;
-
-/**
- * 申請から運賃マスタへ自動登録するときに認める片道運賃の上限。
- * 桁を打ち間違えた申請がそのままマスタになると、以降の申請が誤った金額で
- * 「一致」と判定されてしまうため、明らかに運賃ではない額は登録しない。
- */
-const FARE_UNIT_MAX = 100000;
-
-/** 駅名の照合キー。表記ゆれ（全半角・空白・「駅」の有無）を吸収する */
-function stationKey_(s) {
-  let v = String(s || "").trim();
-  if (!v) return "";
-  try {
-    v = v.normalize("NFKC");
-  } catch (err) {
-    // 旧ランタイム互換
-  }
-  v = v.replace(/[\s　()（）]/g, "");
-  v = v.replace(/駅$/, "");
-  return v.toLowerCase().slice(0, 24);
-}
-
-/**
- * 区間キー。上りと下りで運賃は同じなので、2駅を並べ替えて同一視する。
- * これにより「A→B」で調べた運賃を「B→A」の申請にも使える。
- */
-function fareKey_(from, to) {
-  const a = stationKey_(from);
-  const b = stationKey_(to);
-  if (!a || !b || a === b) return "";
-  return a < b ? a + "|" + b : b + "|" + a;
-}
-
-/** 運賃マスタを全件読む（件数は区間数なので多くならない） */
-function readFares_() {
-  const sheet = getFaresSheet_();
-  const last = sheet.getLastRow();
-  if (last < 2) return [];
-  const values = sheet
-    .getRange(2, 1, last - 1, FARE_COLUMNS.length)
-    .getValues();
-  const out = [];
-  values.forEach(function (row, i) {
-    if (!row[0]) return;
-    const r = { _row: i + 2 };
-    FARE_COLUMNS.forEach(function (c, j) {
-      r[c[0]] = row[j];
-    });
-    r.fare = Math.max(0, Math.round(Number(r.fare) || 0));
-    out.push(r);
-  });
-  return out;
-}
-
-/** 区間キーで運賃マスタを引く */
-function findFare_(key) {
-  if (!key) return null;
-  const rows = readFares_();
-  for (let i = 0; i < rows.length; i++) {
-    if (String(rows[i].key) === key) return rows[i];
-  }
-  return null;
-}
-
-/** 運賃マスタの1行分（定義順） */
-function fareRow_(rec) {
-  return FARE_COLUMNS.map(function (c) {
-    return rec[c[0]] == null ? "" : rec[c[0]];
-  });
-}
-
-/** 運賃マスタへ登録（同じ区間があれば上書き） */
-function saveFare_(rec) {
-  const existing = findFare_(rec.key);
-  if (existing) {
-    getFaresSheet_()
-      .getRange(existing._row, 1, 1, FARE_COLUMNS.length)
-      .setValues([fareRow_(rec)]);
-  } else {
-    appendFare_(rec);
-  }
-}
-
-/**
- * 未登録と分かっている区間を追記する。
- * 呼び出し側が既に findFare_ で不在を確認している場合に使い、
- * 運賃マスタを2度読まないようにする。
- */
-function appendFare_(rec) {
-  getFaresSheet_().appendRow(fareRow_(rec));
-}
-
-
-/**
- * 運賃マスタに未登録の区間を返す（エラーにしない）。
- * 申請自体は金額を手入力すれば進められるため、次の行動を伝えるだけにする。
- */
-function unregisteredFare_(from, to, round, trips) {
-  return {
-    ok: true,
-    registered: false,
-    from: from,
-    to: to,
-    round: round,
-    trips: trips,
-    unit: 0,
-    expected: 0,
-    route: "",
-    source: "",
-    message:
-      "この区間は運賃マスタに未登録です。「🚉 路線検索で調べる」で運賃を確認して" +
-      "金額を入力してください。この申請の金額から運賃マスタへ登録されるので、" +
-      "次回からは自動で照合されます。",
-  };
-}
-
-/** 回数・往復から想定金額を組み立てる */
-function fareTotal_(unit, round, trips) {
-  const u = Math.max(0, Math.round(Number(unit) || 0));
-  const n = Math.min(FARE_TRIPS_MAX, Math.max(1, Math.round(Number(trips) || 1)));
-  return u * (round ? 2 : 1) * n;
-}
-
-/**
- * 区間の運賃を照合する。
- * 1. 運賃マスタにあればそれを使う（Web検索なし・即時・結果が一定）
- * 2. 無ければ Gemini の Google 検索グラウンディングで調べ、マスタへ登録する
- * 想定金額 = 片道運賃 × (往復なら2) × 回数。申請額との比較は呼び出し側で行う。
- */
-function actionLookupFare_(body) {
-  requireUser_(body.token, false);
-  const from = String(body.from || "").trim();
-  const to = String(body.to || "").trim();
-  const key = fareKey_(from, to);
-  if (!key) throw new Error("出発駅と到着駅を（別々の駅名で）入力してください");
-  const round = !!body.round;
-  const trips = Math.min(
-    FARE_TRIPS_MAX,
-    Math.max(1, Math.round(Number(body.trips) || 1))
-  );
-
-  const hit = findFare_(key);
-  // 運賃マスタに無い区間は、エラーにせず「未登録」として返す。申請者は路線検索で
-  // 調べて金額を手入力すればよく、その申請額から運賃マスタへ登録される。
-  if (!hit) return unregisteredFare_(from, to, round, trips);
-
-  return {
-    ok: true,
-    registered: true,
-    cached: true,
-    from: String(hit.from || from),
-    to: String(hit.to || to),
-    unit: hit.fare,
-    round: round,
-    trips: trips,
-    expected: fareTotal_(hit.fare, round, trips),
-    route: String(hit.route || ""),
-    source: String(hit.source || ""),
-    checkedBy: String(hit.checkedBy || ""),
-  };
-}
-
-
-/**
- * Gemini を1回呼び、候補（candidate）を返す。
- * Google 検索グラウンディングは thinkingLevel / responseSchema と併用できない構成が
- * あるため、400 のときは該当フィールドを外して1回だけ再試行する。
- */
-function callFareSearch_(apiKey, model, prompt) {
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    encodeURIComponent(model) +
-    ":generateContent?key=" +
-    encodeURIComponent(apiKey);
-  const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0, maxOutputTokens: 900 },
-  };
-  // 応答時間を短縮（Webアプリのタイムアウトで画面がHTMLエラーになるのを避ける）
-  if (/gemini-3/.test(model)) {
-    payload.generationConfig.thinkingLevel = "minimal";
-  } else if (/gemini-2\.5/.test(model)) {
-    payload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  }
-
-  const fetchOnce = function (p) {
-    return UrlFetchApp.fetch(url, {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify(p),
-      muteHttpExceptions: true,
-    });
-  };
-  let res = fetchOnce(payload);
-  let code = res.getResponseCode();
-  let text = res.getContentText();
-  // 思考制御・検索ツール非対応の構成では 400 になるため、外して一度だけ再試行
-  if (code === 400 && /thinking|tool|search/i.test(text)) {
-    delete payload.generationConfig.thinkingLevel;
-    delete payload.generationConfig.thinkingConfig;
-    if (/tool|search/i.test(text)) delete payload.tools;
-    res = fetchOnce(payload);
-    code = res.getResponseCode();
-    text = res.getContentText();
-  }
-  // 無料枠では Google 検索を伴うリクエストの割当が 0 のことがある（429 / limit: 0）。
-  // その場合は検索なしで一度だけ試す。出典が付かないため画面には
-  // 「出典が取れていない＝要確認」の警告が出て、運賃マスタにも印が残る。
-  if ((code === 429 || code === 403) && payload.tools) {
-    delete payload.tools;
-    res = fetchOnce(payload);
-    code = res.getResponseCode();
-    text = res.getContentText();
-  }
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (err) {
-    throw new Error("運賃照合の応答を読み取れませんでした（HTTP " + code + "）");
-  }
-  if (code !== 200) {
-    const msg =
-      data && data.error && data.error.message ? data.error.message : "HTTP " + code;
-    throw new Error("運賃照合エラー(" + model + " / HTTP " + code + "): " + msg);
-  }
-  const cand = (data.candidates || [])[0];
-  if (!cand || !cand.content) {
-    throw new Error("運賃照合が応答を返しませんでした（" + model + "）");
-  }
-  return cand;
-}
-
-
-
-/**
- * 申請額から片道運賃を割り戻す。運賃マスタへ登録してよい額のときだけ返し、
- * 登録すべきでないときは 0 を返す。
- *
- * 往復・回数で割り切れない金額は、申請額に運賃以外（特急券など）が混ざって
- * いるか、区間か回数の入力が実態と合っていない。そのまま割ると端数の分だけ
- * 誤った運賃がマスタに残るため、登録しない。
- */
-function fareUnitFromAmount_(amount, round, trips) {
-  const total = Math.round(Number(amount) || 0);
-  if (total <= 0) return 0;
-  const n = Math.min(FARE_TRIPS_MAX, Math.max(1, Math.round(Number(trips) || 1)));
-  const divisor = (round ? 2 : 1) * n;
-  if (total % divisor !== 0) return 0;
-  const unit = total / divisor;
-  if (unit <= 0 || unit > FARE_UNIT_MAX) return 0;
-  return unit;
-}
-
-/**
- * 申請に付いてきた区間から、保存する運賃照合の内容を決める。
- * 片道運賃は運賃マスタから取り直すため、申請者側で書き換えられない。
- *
- * マスタに無い区間は、申請額から片道運賃を割り戻してマスタへ登録する。
- * 運用しながら区間が貯まっていくようにするためで、以降の同じ区間の申請は
- * 自動で照合できる。ただし登録の元になった申請そのものは「一致」にしない
- * （自分の申請額で自分を照合しても確認したことにならない）。マスタ側には
- * 「申請（申請者名）」と記録されるので、管理者が後から確認・訂正できる。
- *   match      : 申請額 = 想定金額
- *   diff       : 申請額 ≠ 想定金額（管理者が確認する）
- *   registered : この申請額から運賃マスタへ登録した（まだ誰も確認していない）
- *   unchecked  : 区間はあるが、マスタにも無く申請額からも割り出せない
- *   ""         : 区間の指定なし（交通費以外など）
- */
-function resolveFareForRecord_(record, amount, applicant) {
-  const from = String((record && record.fareFrom) || "").trim();
-  const to = String((record && record.fareTo) || "").trim();
-  const key = fareKey_(from, to);
-  if (!key) return { from: "", to: "", round: false, trips: 0, unit: 0, expected: 0, check: "" };
-  const round = !!(record && record.fareRound);
-  const trips = Math.min(
-    FARE_TRIPS_MAX,
-    Math.max(1, Math.round(Number(record && record.fareTrips) || 1))
-  );
-  const hit = findFare_(key);
-  if (!hit || !hit.fare) {
-    const unit = fareUnitFromAmount_(amount, round, trips);
-    if (!unit) {
-      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
-    }
-    // マスタへの登録に失敗しても申請そのものは通す（申請を落とさない）。
-    // 未登録は上の findFare_ で確認済みなので、追記だけ行う（マスタを2度読まない）。
-    try {
-      appendFare_({
-        key: key,
-        from: from,
-        to: to,
-        fare: unit,
-        route: "",
-        source: "",
-        checkedAt: new Date().toISOString(),
-        checkedBy: "申請（" + (applicant || "不明") + "）",
-      });
-    } catch (err) {
-      return { from: from, to: to, round: round, trips: trips, unit: 0, expected: 0, check: "unchecked" };
-    }
-    return {
-      from: from,
-      to: to,
-      round: round,
-      trips: trips,
-      unit: unit,
-      expected: fareTotal_(unit, round, trips),
-      check: "registered",
-    };
-  }
-  const expected = fareTotal_(hit.fare, round, trips);
-  return {
-    from: from,
-    to: to,
-    round: round,
-    trips: trips,
-    unit: hit.fare,
-    expected: expected,
-    check: expected === Math.round(amount) ? "match" : "diff",
-  };
-}
-
-/** 管理者向け: 運賃マスタの一覧 */
-function actionListFares_(body) {
-  requireUser_(body.token, true);
-  const items = readFares_().map(function (r) {
-    return {
-      key: String(r.key),
-      from: String(r.from || ""),
-      to: String(r.to || ""),
-      fare: r.fare,
-      route: String(r.route || ""),
-      source: String(r.source || ""),
-      checkedAt: correctionDate_(r.checkedAt) || String(r.checkedAt || ""),
-      checkedBy: String(r.checkedBy || ""),
-    };
-  });
-  items.sort(function (a, b) {
-    return (a.from + a.to).localeCompare(b.from + b.to, "ja");
-  });
-  return { ok: true, items: items };
-}
-
-/** 管理者向け: 運賃の手修正・手動登録（運賃改定やAIの誤りを直す） */
-function actionUpsertFare_(body) {
-  const u = requireUser_(body.token, true);
-  const from = String(body.from || "").trim();
-  const to = String(body.to || "").trim();
-  const key = fareKey_(from, to);
-  if (!key) throw new Error("出発駅と到着駅を（別々の駅名で）入力してください");
-  const fare = Math.round(Number(body.fare) || 0);
-  if (fare <= 0) throw new Error("片道運賃は1円以上で入力してください");
-  const existing = findFare_(key);
-  saveFare_({
-    key: key,
-    from: from,
-    to: to,
-    fare: fare,
-    route: String(body.route || (existing && existing.route) || ""),
-    source: String(body.source || (existing && existing.source) || ""),
-    checkedAt: new Date().toISOString(),
-    checkedBy: "手動（" + (u.displayName || u.username || "管理者") + "）",
-  });
-  return { ok: true, items: actionListFares_(body).items };
-}
-
-
-/** 管理者向け: 運賃マスタから区間を削除（次回は再びWebで調べ直す） */
-function actionDeleteFare_(body) {
-  requireUser_(body.token, true);
-  const key = String(body.key || "").trim();
-  const existing = findFare_(key);
-  if (existing) getFaresSheet_().deleteRow(existing._row);
-  return { ok: true, items: actionListFares_(body).items };
-}
-
-/* ========================= 領収書画像の取得 ========================= */
-
-/**
- * 領収書画像をアプリ経由（＝GASの実行アカウント権限）で返す。
- * ドライブのフォルダを共有していない場合、利用者のブラウザから
- * drive.google.com のサムネイルを直接読めないため、その代替として使う。
- * 一般ユーザーは自分の申請の画像のみ取得できる。
- *
- * thumb=true のときは Drive 生成のサムネイル（小さく軽い）を優先する。
- */
-function actionReceiptImage_(body) {
-  const u = requireUser_(body.token, false);
-  const id = String(body.imageFileId || "").trim();
-  if (!id) throw new Error("画像が指定されていません");
-
-  // シートに登録されている画像だけを許可する（任意のファイルIDを読ませない）。
-  // 画像1枚ごとにシート全体を読むと一覧表示が重くなるため、該当行だけを引く。
-  const row = findRowByColumn_(getSheet_(), "imageFileId", id);
-  if (row < 0) throw new Error("画像が見つかりません");
-  if (!u.legacy && u.role !== "admin") {
-    const sheet = getSheet_();
-    const head = headerKeys_(
-      sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0],
-      EXPENSE_COLUMNS
-    );
-    const applicantId = String(
-      sheet.getRange(row, head.indexOf("applicantId") + 1).getValue()
-    );
-    if (applicantId !== u.username) throw new Error("forbidden");
-  }
-
-  const file = DriveApp.getFileById(id);
-  let blob = null;
-  if (body.thumb) {
-    try {
-      blob = file.getThumbnail();
-    } catch (err) {
-      blob = null; // サムネイル未生成のファイルは原本で返す
-    }
-  }
-  if (!blob) blob = file.getBlob();
-  if (!blob) throw new Error("画像を取得できませんでした");
-  return {
-    ok: true,
-    dataUrl:
-      "data:" +
-      blob.getContentType() +
-      ";base64," +
-      Utilities.base64Encode(blob.getBytes()),
-  };
-}
-
-/* ==================== AI解析の学習（店舗別の補正記憶） ==================== */
-
-/**
- * 店名の照合キー。表記ゆれ（全半角・空白・法人格・記号）を吸収して
- * 「同じ店」を同じキーに寄せる。空文字なら学習対象外。
- */
-function vendorKey_(s) {
-  let v = String(s || "").trim();
-  if (!v) return "";
-  try {
-    v = v.normalize("NFKC"); // 全角英数・半角カナを正規化
-  } catch (err) {
-    // 旧ランタイム互換（normalize 未対応でも動作させる）
-  }
-  v = v.toLowerCase();
-  v = v.replace(/(株式会社|有限会社|合同会社|㈱|㈲)/g, "");
-  v = v.replace(/[\s　()（）\[\]【】「」・.,、。\-ー–—_/\\]/g, "");
-  return v.slice(0, 24);
-}
-
-/** シートが Date へ自動変換した日付を yyyy-MM-dd の文字列へ戻す */
-function correctionDate_(v) {
-  if (v instanceof Date) {
-    return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
-  }
-  return String(v || "");
-}
-
-/**
- * 直近 CORRECTION_LOOKBACK 件の学習ログを読む（古い順）。
- * 1リクエスト内で複数回引くため結果を保持する（GASは実行ごとに初期化されるので
- * リクエストをまたいで古い内容が残ることはない）。
- */
-let CORRECTIONS_CACHE_ = null;
-function readRecentCorrections_() {
-  if (CORRECTIONS_CACHE_) return CORRECTIONS_CACHE_;
-  const sheet = getCorrectionsSheet_();
-  const last = sheet.getLastRow();
-  if (last < 2) return (CORRECTIONS_CACHE_ = []);
-  const start = Math.max(2, last - CORRECTION_LOOKBACK + 1);
-  const values = sheet
-    .getRange(start, 1, last - start + 1, CORRECTION_HEADERS.length)
-    .getValues();
-  const out = [];
-  values.forEach(function (row) {
-    const r = {};
-    CORRECTION_HEADERS.forEach(function (h, i) {
-      r[h] = row[i];
-    });
-    if (!r.vendorKey && !r.aiVendorKey) return;
-    r.date = correctionDate_(r.date);
-    r.aiDate = correctionDate_(r.aiDate);
-    r.amount = Number(r.amount) || 0;
-    r.aiAmount = Number(r.aiAmount) || 0;
-    out.push(r);
-  });
-  CORRECTIONS_CACHE_ = out;
-  return out;
-}
-
-/**
- * 最頻値を返す。同数の場合は新しい行（＝配列の後ろ）を優先し、
- * 運用の変更が古い履歴に埋もれないようにする。
- */
-function mostFrequent_(rows, field) {
-  const counts = {};
-  let best = "";
-  let bestN = 0;
-  rows.forEach(function (r) {
-    const v = String(r[field] == null ? "" : r[field]).trim();
-    if (!v) return;
-    counts[v] = (counts[v] || 0) + 1;
-    if (counts[v] >= bestN) {
-      bestN = counts[v];
-      best = v;
-    }
-  });
-  return { value: best, count: bestN };
-}
-
-/** 学習ログ（同一店舗分）を、辞書＋誤読事例に要約する */
-function summarizeCorrections_(rows) {
-  const mistakes = [];
-  for (let i = rows.length - 1; i >= 0 && mistakes.length < CORRECTION_HINT_MAX; i--) {
-    const r = rows[i];
-    const amountWrong = r.aiAmount > 0 && r.aiAmount !== r.amount && r.amount > 0;
-    const dateWrong = !!r.aiDate && !!r.date && r.aiDate !== r.date;
-    const vendorWrong =
-      !!r.aiVendor && !!r.vendor && vendorKey_(r.aiVendor) !== vendorKey_(r.vendor);
-    if (!amountWrong && !dateWrong && !vendorWrong) continue;
-    mistakes.push({
-      amountWrong: amountWrong,
-      dateWrong: dateWrong,
-      vendorWrong: vendorWrong,
-      amount: r.amount,
-      aiAmount: r.aiAmount,
-      date: r.date,
-      aiDate: r.aiDate,
-      vendor: String(r.vendor || ""),
-      aiVendor: String(r.aiVendor || ""),
-      rawHead: String(r.rawHead || ""),
-    });
-  }
-  return {
-    count: rows.length,
-    vendor: mostFrequent_(rows, "vendor"),
-    category: mostFrequent_(rows, "category"),
-    description: mostFrequent_(rows, "description"),
-    mistakes: mistakes,
-  };
-}
-
-/**
- * 指定した店舗キーの学習内容を取り出す（履歴が無ければ null）。
- * AIが誤った店名を返した場合でも、その誤読を記録した行から確定名にたどり、
- * 同じ店舗の履歴をまとめて集め直す（誤読1回分だけで判断しない）。
- */
-function buildVendorMemory_(key) {
-  if (!key) return null;
-  const all = readRecentCorrections_();
-  const match = function (r, k) {
-    return r.vendorKey === k || r.aiVendorKey === k;
-  };
-  let rows = all.filter(function (r) {
-    return match(r, key);
-  });
-  if (!rows.length) return null;
-  const canonical = mostFrequent_(rows, "vendorKey").value;
-  if (canonical && canonical !== key) {
-    const merged = all.filter(function (r) {
-      return match(r, canonical) || match(r, key);
-    });
-    if (merged.length > rows.length) rows = merged;
-  }
-  return summarizeCorrections_(rows);
-}
-
-/**
- * ①辞書補正: 過去の確定値で 店名・科目・摘要 を上書きする。
- * 金額・日付は毎回変わるため辞書では触らない（②のヒントで対応する）。
- */
-function applyVendorMemory_(fields, memory) {
-  const applied = [];
-  if (!memory) return applied;
-  if (memory.vendor.value && memory.vendor.value !== fields.vendor) {
-    fields.vendor = memory.vendor.value;
-    applied.push("店名");
-  }
-  if (memory.category.value && memory.category.value !== fields.category) {
-    fields.category = memory.category.value;
-    applied.push("科目");
-  }
-  if (
-    memory.description.count >= DESCRIPTION_MIN_HITS &&
-    memory.description.value &&
-    memory.description.value !== fields.description
-  ) {
-    fields.description = memory.description.value;
-    applied.push("摘要");
-  }
-  return applied;
-}
-
-/** ②誤読事例: 過去に間違えた読み取りをプロンプトへ添える */
-/**
- * 今回のAIの読み取りが、この店舗で過去に実際にあった誤読と同じ値かを判定する。
- * 同じ値を出しているなら、その誤読を伝えて読み直す価値がある。
- * 違う値なら（正しく読めたか、未知の誤りか）読み直しても直せる根拠が無い。
- */
-function repeatsKnownMistake_(fields, mistakes) {
-  if (!fields || !mistakes || !mistakes.length) return false;
-  const amount = Math.max(0, Math.round(Number(fields.amount) || 0));
-  const date = String(fields.date || "");
-  const vendorKey = vendorKey_(fields.vendor);
-  for (let i = 0; i < mistakes.length; i++) {
-    const m = mistakes[i];
-    if (m.amountWrong && amount > 0 && amount === Number(m.aiAmount)) return true;
-    if (m.dateWrong && date && date === String(m.aiDate)) return true;
-    if (m.vendorWrong && vendorKey && vendorKey === vendorKey_(m.aiVendor)) return true;
-  }
-  return false;
-}
-
-function buildCorrectionHint_(memory) {
-  const lines = memory.mistakes.map(function (m) {
-    const parts = [];
-    if (m.amountWrong) {
-      parts.push("金額を " + m.aiAmount + " と読んだが、正しくは " + m.amount + " だった");
-    }
-    if (m.dateWrong) {
-      parts.push("日付を " + m.aiDate + " と読んだが、正しくは " + m.date + " だった");
-    }
-    if (m.vendorWrong) {
-      parts.push(
-        "店名を「" + m.aiVendor + "」と読んだが、正しくは「" + m.vendor + "」だった"
-      );
-    }
-    return "・" + parts.join("／") + (m.rawHead ? "（そのときの書き起こし: " + m.rawHead + "）" : "");
-  });
-  return (
-    "\n\n【この店舗のレシートで過去に実際にあった誤読】\n" +
-    lines.join("\n") +
-    "\n同じ間違いを繰り返さないでください。金額は最終的な支払合計、日付は発行日を、" +
-    "根拠になる行を慎重に選び直してから答えること。"
-  );
-}
-
-/** 申請確定時に「AIの読み取り」と「確定値」を1行記録する */
-function logCorrection_(rec, ai, applicantId) {
-  const aiVendor = String(ai.vendor || "").slice(0, 60);
-  const key = vendorKey_(rec.vendor);
-  const aiKey = vendorKey_(aiVendor);
-  if (!key && !aiKey) return; // 店名が無いと次回の手がかりにできない
-  const aiDate = String(ai.date || "");
-  const aiAmount = Math.max(0, Math.round(Number(ai.amount) || 0));
-  const aiCategory = String(ai.category || "");
-  const aiDescription = String(ai.description || "").slice(0, 60);
-  const corrected = [];
-  if (aiDate !== String(rec.date || "")) corrected.push("date");
-  if (aiAmount !== Number(rec.amount || 0)) corrected.push("amount");
-  if (aiKey !== key) corrected.push("vendor");
-  if (aiCategory !== String(rec.category || "")) corrected.push("category");
-  if (aiDescription !== String(rec.description || "")) corrected.push("description");
-  const rawHead = String(ai.rawText || "")
-    .replace(/\s+/g, " ")
-    .slice(0, 150);
-  const row = {
-    createdAt: new Date().toISOString(),
-    vendorKey: key,
-    aiVendorKey: aiKey,
-    vendor: String(rec.vendor || ""),
-    date: String(rec.date || ""),
-    amount: Number(rec.amount || 0),
-    category: String(rec.category || ""),
-    description: String(rec.description || "").slice(0, 60),
-    aiVendor: aiVendor,
-    aiDate: aiDate,
-    aiAmount: aiAmount,
-    aiCategory: aiCategory,
-    aiDescription: aiDescription,
-    corrected: corrected.join(","),
-    applicantId: String(applicantId || ""),
-    rawHead: rawHead,
-  };
-  getCorrectionsSheet_().appendRow(
-    CORRECTION_HEADERS.map(function (h) {
-      return row[h];
-    })
-  );
-  CORRECTIONS_CACHE_ = null;
-}
-
-/** 管理者向け: 学習内容を店舗ごとに集計して返す */
-function actionListVendorMemory_(body) {
-  requireUser_(body.token, true);
-  const groups = {};
-  readRecentCorrections_().forEach(function (r) {
-    const k = r.vendorKey || r.aiVendorKey;
-    if (!groups[k]) groups[k] = [];
-    groups[k].push(r);
-  });
-  const items = Object.keys(groups).map(function (k) {
-    const m = summarizeCorrections_(groups[k]);
-    return {
-      key: k,
-      vendor: m.vendor.value || String(groups[k][groups[k].length - 1].aiVendor || ""),
-      category: m.category.value,
-      description:
-        m.description.count >= DESCRIPTION_MIN_HITS ? m.description.value : "",
-      count: m.count,
-      mistakes: m.mistakes.length,
-    };
-  });
-  items.sort(function (a, b) {
-    return b.count - a.count;
-  });
-  return { ok: true, items: items };
-}
-
-/** 管理者向け: 誤った学習をやり直すため、店舗単位で履歴を削除する */
-function actionDeleteVendorMemory_(body) {
-  requireUser_(body.token, true);
-  const key = String(body.key || "").trim();
-  if (!key) throw new Error("削除対象の店舗が指定されていません");
-  const sheet = getCorrectionsSheet_();
-  const last = sheet.getLastRow();
-  if (last < 2) return { ok: true, deleted: 0 };
-  const kCol = CORRECTION_HEADERS.indexOf("vendorKey");
-  const aCol = CORRECTION_HEADERS.indexOf("aiVendorKey");
-  const vals = sheet.getRange(2, 1, last - 1, CORRECTION_HEADERS.length).getValues();
-  let deleted = 0;
-  for (let i = vals.length - 1; i >= 0; i--) {
-    if (String(vals[i][kCol]) === key || String(vals[i][aCol]) === key) {
-      sheet.deleteRow(i + 2);
-      deleted++;
-    }
-  }
-  CORRECTIONS_CACHE_ = null;
-  return { ok: true, deleted: deleted };
 }
 
 /* ========================= AIレシート解析 ========================= */
@@ -2115,9 +1139,9 @@ function todayStr_() {
 
 /**
  * レシート解析プロンプト（今日の日付を埋め込む）。
- * hint には過去の誤読事例（buildCorrectionHint_）を渡せる。
+ * maxLines は書き起こし（raw_text）に許す行数の上限。
  */
-function buildReceiptPrompt_(hint, maxLines) {
+function buildReceiptPrompt_(maxLines) {
   const today = todayStr_();
   const lines = Math.max(3, Math.round(Number(maxLines) || RECEIPT_RAW_TEXT_MAX_LINES));
   return (
@@ -2149,8 +1173,7 @@ function buildReceiptPrompt_(hint, maxLines) {
     "・category: 品目から最適な経費科目を1つ（交通費=切符/IC/タクシー/高速/駐車, 交際費=接待飲食/手土産, " +
     "会議費=打合せ飲食/会議室, 消耗品費=文具/日用品/備品, 通信費=携帯/切手/宅配便, 宿泊費=ホテル/旅館, その他=該当なし）。\n" +
     "・description: 何の支払いかを15文字以内で簡潔に（例: 取引先との会食、事務用品購入）。\n\n" +
-    "読み取れない項目は空文字（amount は 0）にし、創作しないこと。" +
-    String(hint || "")
+    "読み取れない項目は空文字（amount は 0）にし、創作しないこと。"
   );
 }
 
@@ -2399,10 +1422,10 @@ function normalizeReceiptFields_(o) {
 }
 
 /**
- * レシート解析（AI）。プロバイダはサーバー設定で選択、3段フォールバックの1段目。
- * 解析後、読み取れた店名をキーに過去の手修正（学習ログ）を反映する:
- *   ② 過去に金額・日付・店名を誤読した店舗なら、その事例を添えて1回だけ読み直す
- *   ① 確定済みの 店名・科目・摘要 を辞書として上書きする
+ * レシート解析（AI）。プロバイダはサーバー設定で選択する。
+ *
+ * AI呼び出しは1リクエストにつき最大2回。1回目は速度寄りの行数で読み、
+ * 金額か日付が取れなかったときだけ、行数を増やして読み直す（needsEscalation_）。
  */
 function actionAnalyzeReceipt_(body) {
   requireUser_(body.token, false);
@@ -2411,14 +1434,14 @@ function actionAnalyzeReceipt_(body) {
   if (!provider) {
     throw new Error("AI解析は未設定です（GEMINI_API_KEY または ANTHROPIC_API_KEY を設定してください）");
   }
-  const analyze = function (hint, opts) {
+  const analyze = function (opts) {
     const o = opts || {};
     return o.provider === "claude" || (!o.provider && provider === "claude")
-      ? analyzeWithClaude_(body, hint, o)
-      : analyzeWithGemini_(body, hint, o);
+      ? analyzeWithClaude_(body, o)
+      : analyzeWithGemini_(body, o);
   };
 
-  let out = analyze("", { lines: RECEIPT_RAW_TEXT_MAX_LINES });
+  let out = analyze({ lines: RECEIPT_RAW_TEXT_MAX_LINES });
   let fields = out.fields || out;
   let escalated = false;
 
@@ -2428,7 +1451,7 @@ function actionAnalyzeReceipt_(body) {
   if (needsEscalation_(fields)) {
     try {
       const esc = resolveEscalation_();
-      const out2 = analyze("", {
+      const out2 = analyze({
         lines: RECEIPT_RAW_TEXT_RETRY_LINES,
         provider: esc.provider,
         model: esc.model,
@@ -2444,41 +1467,11 @@ function actionAnalyzeReceipt_(body) {
     }
   }
 
-  let memory = buildVendorMemory_(vendorKey_(fields.vendor));
-  let retried = false;
-
-  // 読み直しはAI呼び出しがもう1回増えるので、今回の読み取りが過去の誤読を
-  // 実際に再現したときだけ行う。誤読履歴があるだけで毎回読み直すと、
-  // よく使う店舗ほど解析が遅くなってしまう。
-  // 既にエスカレーションで読み直しているときは、これ以上呼び出しを増やさない。
-  if (!escalated && memory && repeatsKnownMistake_(fields, memory.mistakes)) {
-    try {
-      const out2 = analyze(buildCorrectionHint_(memory));
-      const f2 = out2.fields || out2;
-      // 読み直しで金額・日付のどちらも取れないなら初回結果の方が信頼できる
-      if (f2 && (f2.amount || f2.date)) {
-        out = out2;
-        fields = f2;
-        retried = true;
-        const m2 = buildVendorMemory_(vendorKey_(fields.vendor));
-        if (m2) memory = m2;
-      }
-    } catch (err) {
-      // ヒント付きの読み直しに失敗しても、初回の結果で処理を続ける
-    }
-  }
-
-  const applied = applyVendorMemory_(fields, memory);
   return {
     ok: true,
     fields: fields,
     provider: provider,
     model: out.model || "",
-    learned: {
-      applied: applied,
-      count: memory ? memory.count : 0,
-      retried: retried,
-    },
     escalated: escalated,
   };
 }
@@ -2512,7 +1505,7 @@ function resolveEscalation_() {
  * 全滅した場合はこのキーで使えるモデルを調べて追い試ししてから、
  * 全モデルの失敗理由と使えるモデル一覧をまとめて投げる（＝原因が画面に出る）。
  */
-function analyzeWithGemini_(body, hint, opts) {
+function analyzeWithGemini_(body, opts) {
   const o = opts || {};
   // 1巡目で全滅した場合は少し待って再挑戦（503は一時的な混雑が多い）
   return tryGeminiModels_(
@@ -2520,13 +1513,13 @@ function analyzeWithGemini_(body, hint, opts) {
     getProp_("GEMINI_API_KEY"),
     o.model || getProp_("GEMINI_MODEL"),
     function (model) {
-      return callGemini_(body, model, hint, o.lines);
+      return callGemini_(body, model, o.lines);
     },
     2
   );
 }
 
-function callGemini_(body, model, hint, maxLines) {
+function callGemini_(body, model, maxLines) {
   const apiKey = getProp_("GEMINI_API_KEY");
   // raw_text を先に書き起こさせることで抽出の根拠を作り、精度を上げる
   const schema = {
@@ -2555,7 +1548,7 @@ function callGemini_(body, model, hint, maxLines) {
               data: String(body.imageBase64),
             },
           },
-          { text: buildReceiptPrompt_(hint, maxLines) },
+          { text: buildReceiptPrompt_(maxLines) },
         ],
       },
     ],
@@ -2622,7 +1615,7 @@ function callGemini_(body, model, hint, maxLines) {
 }
 
 /** Claude で解析。モデルは OCR_MODEL で変更可（既定 claude-opus-4-8） */
-function analyzeWithClaude_(body, hint, opts) {
+function analyzeWithClaude_(body, opts) {
   const o = opts || {};
   const apiKey = getProp_("ANTHROPIC_API_KEY");
   const model = o.model || getProp_("OCR_MODEL") || "claude-opus-5";
@@ -2655,7 +1648,7 @@ function analyzeWithClaude_(body, hint, opts) {
               data: String(body.imageBase64),
             },
           },
-          { type: "text", text: buildReceiptPrompt_(hint, o.lines) },
+          { type: "text", text: buildReceiptPrompt_(o.lines) },
         ],
       },
     ],
@@ -2689,789 +1682,6 @@ function analyzeWithClaude_(body, hint, opts) {
     fields: normalizeReceiptFields_(JSON.parse(text)),
     model: String(data.model || model),
   };
-}
-
-/* ==================== PL管理モデルへの連携 ==================== */
-
-/**
- * 別スプレッドシート「PL管理プロトタイプ」の『経費入力テーブル』へ、承認済みの
- * 経費申請を1行ずつ反映する。PL計算シートの SUMIFS がこの表を集計しているため、
- * ここに書けば各事業部の月次PL・インセンティブへそのまま反映される。
- *
- * 連携は PL_SPREADSHEET_ID を設定したときだけ有効。未設定なら一切何もしないので、
- * 設定しなければ従来どおりの動作になる。
- *
- * PL側の表は「アプリからの自動連携」と「手動入力」が混在する設計なので、
- * G列『申請ID』の有無でどちらの行かを見分ける。
- * **申請IDが空の行（手動入力）は絶対に書き換えない。**
- * アプリ由来の行は申請IDで upsert するため、何度流しても重複しない。
- */
-const PL_EXPENSE_SHEET = "経費入力テーブル";
-const PL_SALES_SHEET = "案件・売上入力テーブル";
-
-/** PL側の表は1行目がタイトル・4行目が見出しで、データは5行目から始まる */
-const PL_HEADER_ROW = 4;
-const PL_FIRST_ROW = 5;
-/**
- * SUMIFS に持たせる範囲の最終行。元のモデルは 100 行（実質96件）で打ち止めだったため、
- * setupPlSheets() でこの行まで広げる。申請は貯まり続けるので余裕を持たせる。
- */
-const PL_LAST_ROW = 2000;
-
-/**
- * PL側『経費入力テーブル』の列。既存モデルの列順そのもので、読み書きは位置で行う。
- * 申請ID列だけがアプリ連携のために増える列（元のモデルには無い）。
- */
-const PL_EXPENSE_COLUMNS = [
-  ["date", "日付"],
-  ["applicant", "担当者名"],
-  ["department", "所属事業部"],
-  ["category", "経費項目"],
-  ["amount", "金額"],
-  ["note", "備考"],
-  ["id", "申請ID"],
-];
-const PL_ID_COLUMN = PL_EXPENSE_COLUMNS.length; // G列
-
-/**
- * アプリの語彙（事業部・科目）をPL側の語彙へ変換する対応表。
- * PL側の SUMIFS は "イベント営業" "雑費交通費" のような固定文字列で拾うため、
- * そのままでは一件も一致しない。対応表はシートに置いて運用側で直せるようにする。
- */
-const PL_MAPPING_SHEET = "PL連携マッピング";
-const PL_MAPPING_COLUMNS = [
-  ["kind", "種別"],
-  ["appValue", "アプリの値"],
-  ["plValue", "PLの値"],
-];
-const PL_KIND_DEPARTMENT = "事業部";
-const PL_KIND_CATEGORY = "科目";
-/** 対応先が無い科目の受け皿。setupPlSheets() がPL側に同名の行を作る。 */
-const PL_OTHER_CATEGORY = "その他経費";
-const PL_OTHER_ROW_LABEL = "  その他経費（実費）";
-
-/**
- * 対応表の初期値。事業部はPL計算シートが存在する2つ（イベント営業／人材）しか
- * 受け皿が無いため、人材以外はイベント営業へ寄せる。実態に合わなければシートを直す。
- * 科目はPL側に行がある3つへ寄せ、残りは「その他経費」へ集める（落とさない）。
- */
-const DEFAULT_PL_MAPPINGS = [
-  [PL_KIND_DEPARTMENT, "人材", "人材"],
-  [PL_KIND_DEPARTMENT, "BAR", "イベント営業"],
-  [PL_KIND_DEPARTMENT, "運送", "イベント営業"],
-  [PL_KIND_DEPARTMENT, "本部", "イベント営業"],
-  [PL_KIND_DEPARTMENT, "ARTGRAGE", "イベント営業"],
-  [PL_KIND_DEPARTMENT, "クリニック", "イベント営業"],
-  [PL_KIND_DEPARTMENT, "GoonerHouse", "イベント営業"],
-  [PL_KIND_CATEGORY, "交通費", "雑費交通費"],
-  [PL_KIND_CATEGORY, "交際費", "接待交際費"],
-  [PL_KIND_CATEGORY, "会議費", PL_OTHER_CATEGORY],
-  [PL_KIND_CATEGORY, "消耗品費", PL_OTHER_CATEGORY],
-  [PL_KIND_CATEGORY, "通信費", PL_OTHER_CATEGORY],
-  [PL_KIND_CATEGORY, "宿泊費", PL_OTHER_CATEGORY],
-  [PL_KIND_CATEGORY, "その他", PL_OTHER_CATEGORY],
-];
-
-/**
- * PLへ反映できなかった申請の記録。事業部の対応先が無いと金額の行き先を決められず、
- * 黙って捨てると利益が実態より良く見えてしまうため、ここへ残して管理画面で警告する。
- */
-const PL_SKIPPED_SHEET = "PL連携スキップ";
-const PL_SKIPPED_COLUMNS = [
-  ["recordedAt", "記録日時"],
-  ["id", "申請ID"],
-  ["applicant", "申請者"],
-  ["department", "事業部"],
-  ["category", "科目"],
-  ["amount", "金額"],
-  ["reason", "理由"],
-];
-
-/** 連携先のPLスプレッドシート。PL_SPREADSHEET_ID 未設定なら null（連携無効）。 */
-function getPlSpreadsheet_() {
-  const id = getProp_("PL_SPREADSHEET_ID");
-  if (!id) return null;
-  return SpreadsheetApp.openById(id);
-}
-
-function isPlSyncEnabled_() {
-  return !!getProp_("PL_SPREADSHEET_ID");
-}
-
-function getPlMappingSheet_() {
-  const existed = !!getSpreadsheet_().getSheetByName(PL_MAPPING_SHEET);
-  const sheet = ensureSheet_(PL_MAPPING_SHEET, PL_MAPPING_COLUMNS);
-  if (!existed) {
-    DEFAULT_PL_MAPPINGS.forEach(function (m) {
-      sheet.appendRow(m);
-    });
-  }
-  return sheet;
-}
-
-function getPlSkippedSheet_() {
-  return ensureSheet_(PL_SKIPPED_SHEET, PL_SKIPPED_COLUMNS);
-}
-
-/** 対応表を読み、{department: {アプリ値: PL値}, category: {...}} を返す。 */
-function loadPlMappings_() {
-  const sheet = getPlMappingSheet_();
-  const last = sheet.getLastRow();
-  const maps = { department: {}, category: {} };
-  if (last < 2) return maps;
-  const values = sheet.getRange(2, 1, last - 1, PL_MAPPING_COLUMNS.length).getValues();
-  values.forEach(function (r) {
-    const kind = String(r[0] == null ? "" : r[0]).trim();
-    const appValue = String(r[1] == null ? "" : r[1]).trim();
-    const plValue = String(r[2] == null ? "" : r[2]).trim();
-    if (!appValue || !plValue) return;
-    if (kind === PL_KIND_DEPARTMENT) maps.department[appValue] = plValue;
-    else if (kind === PL_KIND_CATEGORY) maps.category[appValue] = plValue;
-  });
-  return maps;
-}
-
-/**
- * PL側『経費入力テーブル』。連携が無効、またはシートが無ければ null。
- * 元のモデルには無い『申請ID』列の見出しだけは、無ければここで補う
- * （setupPlSheets() を流す前でも連携が成立するようにしておく）。
- */
-function getPlExpenseSheet_() {
-  const ss = getPlSpreadsheet_();
-  if (!ss) return null;
-  const sheet = ss.getSheetByName(PL_EXPENSE_SHEET);
-  if (!sheet) return null;
-  const label = PL_EXPENSE_COLUMNS[PL_ID_COLUMN - 1][1];
-  const cell = sheet.getRange(PL_HEADER_ROW, PL_ID_COLUMN);
-  if (String(cell.getValue() || "").trim() !== label) cell.setValue(label);
-  return sheet;
-}
-
-/** 申請IDでPL側の行番号を探す（無ければ -1）。申請ID列だけを読む。 */
-function findPlRow_(sheet, id) {
-  const last = sheet.getLastRow();
-  if (last < PL_FIRST_ROW) return -1;
-  const values = sheet
-    .getRange(PL_FIRST_ROW, PL_ID_COLUMN, last - PL_FIRST_ROW + 1, 1)
-    .getValues();
-  const target = String(id);
-  for (let i = 0; i < values.length; i++) {
-    if (String(values[i][0] || "").trim() === target) return PL_FIRST_ROW + i;
-  }
-  return -1;
-}
-
-/** その瞬間を指定タイムゾーンで見た「見かけの日時」を UTC ミリ秒として返す。 */
-function tzShownMs_(instant, tz) {
-  const p = Utilities.formatDate(instant, tz, "yyyy-MM-dd-HH-mm")
-    .split("-")
-    .map(Number);
-  return Date.UTC(p[0], p[1] - 1, p[2], p[3], p[4]);
-}
-
-/**
- * 指定タイムゾーンで「その日の 0:00」になる Date を返す。
- *
- * `new Date(y, m, d)` はスクリプトのタイムゾーンでの 0:00 なので、
- * スプレッドシートのタイムゾーンが違うと**シート上では別の日付になる**。
- * 実際に起きた例: スクリプトが Asia/Tokyo(+9)、PLモデルが
- * America/Los_Angeles(-7) で 16時間巻き戻り、全ての日付が1日前になった。
- * 日付がずれると月初・月末の SUMIFS が外れ、その月の経費が消える。
- */
-function dateInTimeZone_(y, m, d, tz) {
-  const want = Date.UTC(y, m - 1, d);
-  let t = want;
-  // 見かけの日時と目的の日時の差を当てて補正する（夏時間の境界のため2回まで）
-  for (let i = 0; i < 2; i++) {
-    const diff = want - tzShownMs_(new Date(t), tz);
-    if (!diff) break;
-    t += diff;
-  }
-  return new Date(t);
-}
-
-/**
- * 日付を、PLシートのタイムゾーンで 0:00 になる Date にする。
- *
- * PL側の SUMIFS は ">=2026-08-01" と日付として比較するため、文字列のまま
- * 書くと一件も集計されない（元のモデルが全月 0 だった原因）。
- * `tz` を省略した場合はスクリプトのタイムゾーンでの 0:00（テスト用）。
- */
-function toPlDate_(value, tz) {
-  let y;
-  let m;
-  let d;
-  if (value instanceof Date) {
-    // シート上の表示日を取り出す（表示はシートのタイムゾーン基準）
-    const p = Utilities.formatDate(value, tz || Session.getScriptTimeZone(), "yyyy-MM-dd")
-      .split("-")
-      .map(Number);
-    y = p[0];
-    m = p[1];
-    d = p[2];
-  } else {
-    const s = String(value == null ? "" : value).trim();
-    const mt = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-    if (!mt) return null;
-    y = Number(mt[1]);
-    m = Number(mt[2]);
-    d = Number(mt[3]);
-  }
-  return tz ? dateInTimeZone_(y, m, d, tz) : new Date(y, m - 1, d);
-}
-
-/** PLシートのタイムゾーン。日付を書くたびに必要なので、シートから直接取る。 */
-function plTimeZone_(sheet) {
-  return sheet.getParent().getSpreadsheetTimeZone();
-}
-
-/** PLの1行分の値。列は PL_EXPENSE_COLUMNS の定義順そのもの。 */
-function buildPlRowValues_(rec, plDepartment, plCategory, tz) {
-  const note = [rec.vendor, rec.description]
-    .map(function (v) {
-      return String(v == null ? "" : v).trim();
-    })
-    .filter(function (v) {
-      return v;
-    })
-    .join(" / ");
-  return [
-    toPlDate_(rec.date, tz),
-    String(rec.applicant || ""),
-    plDepartment,
-    plCategory,
-    Number(rec.amount) || 0,
-    note,
-    String(rec.id || ""),
-  ];
-}
-
-/**
- * 書き込み先の行を決める。申請IDも日付も金額も空の行があればそこを再利用し、
- * 無ければ最終行の次に足す。PL_LAST_ROW を超える場合は null（SUMIFS の範囲外に
- * 書いても集計されないため、黙って範囲外へ書かない）。
- */
-function nextPlRow_(sheet) {
-  const last = sheet.getLastRow();
-  if (last >= PL_FIRST_ROW) {
-    const values = sheet
-      .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, PL_ID_COLUMN)
-      .getValues();
-    for (let i = 0; i < values.length; i++) {
-      const r = values[i];
-      const empty = !String(r[0] || "").trim() && !r[4] && !String(r[6] || "").trim();
-      if (empty) return PL_FIRST_ROW + i;
-    }
-  }
-  const row = Math.max(last + 1, PL_FIRST_ROW);
-  return row > PL_LAST_ROW ? null : row;
-}
-
-function writePlRow_(sheet, row, values) {
-  sheet.getRange(row, 1, 1, values.length).setValues([values]);
-  sheet.getRange(row, 1).setNumberFormat("yyyy-mm-dd");
-}
-
-/** スキップ記録の upsert（同じ申請を何度も積まない）。 */
-function recordPlSkip_(rec, reason) {
-  const sheet = getPlSkippedSheet_();
-  const values = [
-    new Date().toISOString(),
-    String(rec.id || ""),
-    String(rec.applicant || ""),
-    String(rec.department || ""),
-    String(rec.category || ""),
-    Number(rec.amount) || 0,
-    reason,
-  ];
-  const row = findRowByColumn_(sheet, "id", String(rec.id || ""), PL_SKIPPED_COLUMNS);
-  if (row > 0) sheet.getRange(row, 1, 1, values.length).setValues([values]);
-  else sheet.appendRow(values);
-}
-
-function clearPlSkip_(id) {
-  const sheet = getPlSkippedSheet_();
-  const row = findRowByColumn_(sheet, "id", String(id), PL_SKIPPED_COLUMNS);
-  if (row > 0) sheet.deleteRow(row);
-}
-
-function countPlSkipped_() {
-  const sheet = getPlSkippedSheet_();
-  return Math.max(0, sheet.getLastRow() - 1);
-}
-
-/**
- * 申請1件をPLへ反映する。
- *
- * - 承認済み以外（申請中・却下）はPLに載せない。既に載っていれば取り下げる。
- * - 事業部の対応先が無い場合は書かずにスキップ記録へ残す（金額の行き先を
- *   勝手に決めてしまうと、別の事業部のPLを汚す）。
- * - 科目の対応先が無い場合は「その他経費」へ寄せる（経費そのものは落とさない）。
- */
-function syncExpenseToPl_(rec) {
-  const sheet = getPlExpenseSheet_();
-  if (!sheet) return { ok: false, reason: "disabled" };
-  const id = String(rec.id || "");
-  if (!id) return { ok: false, reason: "no id" };
-  const row = findPlRow_(sheet, id);
-
-  if (String(rec.status || "") !== "approved") {
-    if (row > 0) sheet.deleteRow(row);
-    clearPlSkip_(id);
-    return { ok: true, posted: false, reason: "not approved" };
-  }
-
-  const maps = loadPlMappings_();
-  const department = String(rec.department || "").trim();
-  const plDepartment = maps.department[department];
-  if (!plDepartment) {
-    if (row > 0) sheet.deleteRow(row);
-    recordPlSkip_(
-      rec,
-      "事業部「" + (department || "未設定") + "」のPL対応先が未設定"
-    );
-    return { ok: false, posted: false, reason: "unmapped department" };
-  }
-  const plCategory =
-    maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
-  const values = buildPlRowValues_(rec, plDepartment, plCategory, plTimeZone_(sheet));
-  if (!values[0]) {
-    recordPlSkip_(rec, "利用日が日付として読めない（" + rec.date + "）");
-    return { ok: false, posted: false, reason: "bad date" };
-  }
-
-  if (row > 0) {
-    writePlRow_(sheet, row, values);
-  } else {
-    const target = nextPlRow_(sheet);
-    if (!target) {
-      recordPlSkip_(rec, "PL側の行数上限（" + PL_LAST_ROW + "行）に達した");
-      return { ok: false, posted: false, reason: "out of range" };
-    }
-    writePlRow_(sheet, target, values);
-  }
-  clearPlSkip_(id);
-  return { ok: true, posted: true };
-}
-
-/**
- * PL連携の失敗で申請そのものを落とさないためのラッパー。
- * 連携先が一時的に開けなくても、申請の保存・承認は成立させる
- * （取りこぼしは syncAllToPl() で後から揃えられる）。
- */
-function safeSyncExpenseToPl_(rec) {
-  try {
-    return syncExpenseToPl_(rec);
-  } catch (err) {
-    return { ok: false, reason: String(err && err.message ? err.message : err) };
-  }
-}
-
-/** 申請IDでPLの行を取り下げる（削除時に使う）。 */
-function safeRemoveFromPl_(id) {
-  try {
-    const sheet = getPlExpenseSheet_();
-    if (!sheet) return;
-    const row = findPlRow_(sheet, String(id));
-    if (row > 0) sheet.deleteRow(row);
-    clearPlSkip_(id);
-  } catch (err) {
-    // 連携先を触れなくても申請の削除は成立させる
-  }
-}
-
-/**
- * メンテナンス用：既存の全申請をPLへ反映し直す（エディタから手動実行）。
- * 連携を有効にした直後の取り込みと、一時的な失敗の埋め戻しに使う。
- *
- * アプリ由来の行（申請IDあり）をいったん全て取り下げてから、承認済みを
- * まとめて書き直す。手動入力行（申請IDなし）は読み取りも書き換えもしない。
- */
-function syncAllToPl() {
-  const sheet = getPlExpenseSheet_();
-  if (!sheet) {
-    const msg =
-      "PL連携が無効です。スクリプトプロパティ PL_SPREADSHEET_ID に" +
-      "PL管理モデルのスプレッドシートIDを設定してください。";
-    Logger.log(msg);
-    return msg;
-  }
-  // 既存のアプリ由来の行を下から削除（手動入力行は申請IDが空なので残る）
-  const last = sheet.getLastRow();
-  if (last >= PL_FIRST_ROW) {
-    const ids = sheet
-      .getRange(PL_FIRST_ROW, PL_ID_COLUMN, last - PL_FIRST_ROW + 1, 1)
-      .getValues();
-    for (let i = ids.length - 1; i >= 0; i--) {
-      if (String(ids[i][0] || "").trim()) sheet.deleteRow(PL_FIRST_ROW + i);
-    }
-  }
-  // 承認済みを対応表で変換して書き出す
-  const tz = plTimeZone_(sheet);
-  const maps = loadPlMappings_();
-  const records = rowsToRecords_(getSheet_());
-  const rows = [];
-  const skipped = [];
-  records.forEach(function (rec) {
-    if (String(rec.status || "") !== "approved") return;
-    const department = String(rec.department || "").trim();
-    const plDepartment = maps.department[department];
-    if (!plDepartment) {
-      skipped.push([rec, "事業部「" + (department || "未設定") + "」のPL対応先が未設定"]);
-      return;
-    }
-    const plCategory =
-      maps.category[String(rec.category || "").trim()] || PL_OTHER_CATEGORY;
-    const values = buildPlRowValues_(rec, plDepartment, plCategory, tz);
-    if (!values[0]) {
-      skipped.push([rec, "利用日が日付として読めない（" + rec.date + "）"]);
-      return;
-    }
-    rows.push(values);
-  });
-
-  const start = Math.max(sheet.getLastRow() + 1, PL_FIRST_ROW);
-  const room = PL_LAST_ROW - start + 1;
-  const writable = rows.slice(0, Math.max(0, room));
-  rows.slice(writable.length).forEach(function (v) {
-    skipped.push([{ id: v[6], applicant: v[1], department: v[2], category: v[3], amount: v[4] },
-      "PL側の行数上限（" + PL_LAST_ROW + "行）に達した"]);
-  });
-  if (writable.length) {
-    sheet.getRange(start, 1, writable.length, PL_ID_COLUMN).setValues(writable);
-    sheet.getRange(start, 1, writable.length, 1).setNumberFormat("yyyy-mm-dd");
-  }
-
-  // スキップ記録は作り直す（解消済みの警告を残さない）
-  const skipSheet = getPlSkippedSheet_();
-  if (skipSheet.getLastRow() > 1) {
-    skipSheet.deleteRows(2, skipSheet.getLastRow() - 1);
-  }
-  skipped.forEach(function (s) {
-    recordPlSkip_(s[0], s[1]);
-  });
-
-  const msg =
-    "PL連携: " + writable.length + "件を反映、" + skipped.length + "件をスキップ";
-  Logger.log(msg);
-  return msg;
-}
-
-/* ---------- PL側スプレッドシートの初期設定（1回だけ実行する） ---------- */
-
-/**
- * メンテナンス用：PL管理モデル側をアプリ連携に合わせて整える（エディタから手動実行）。
- * 何度実行しても同じ結果になる（追加済みのものは飛ばす）。
- *
- *   1. 日付列を実日付へ移行する（経費・売上の両方）
- *   2. SUMIFS の範囲を 100 行から PL_LAST_ROW まで広げる
- *   3. 各PL計算シートへ「その他経費（実費）」行を足し、経費合計に含める
- *
- * 1 は元のモデルが全月 0 円だった原因への対処。日付列が文字列なのに SUMIFS が
- * ">=2026-08-01" と日付比較していたため、条件が一件も一致していなかった。
- */
-function setupPlSheets() {
-  const ss = getPlSpreadsheet_();
-  if (!ss) {
-    const msg =
-      "PL連携が無効です。スクリプトプロパティ PL_SPREADSHEET_ID に" +
-      "PL管理モデルのスプレッドシートIDを設定してください。";
-    Logger.log(msg);
-    return msg;
-  }
-  const done = [];
-  // ずれた日付の復元 → 文字列日付の移行 の順に流す（復元は時刻を目印にするため、
-  // 時刻を落とす移行より先に実行しないと目印が消える）
-  [PL_EXPENSE_SHEET, PL_SALES_SHEET].forEach(function (name) {
-    const n = repairPlShiftedDates_(ss, name);
-    if (n > 0) done.push(name + "のずれた日付を復元: " + n + "件");
-  });
-  [PL_EXPENSE_SHEET, PL_SALES_SHEET].forEach(function (name) {
-    const n = fixPlDateColumn_(ss, name);
-    if (n > 0) done.push(name + "の日付を実日付へ移行: " + n + "件");
-  });
-  const widened = widenPlSumifsRanges_(ss);
-  if (widened > 0) done.push("SUMIFS の範囲を拡張: " + widened + "式");
-  getPlExpenseSheet_(); // 申請ID列の見出しを用意する
-  done.push("『" + PL_EXPENSE_COLUMNS[PL_ID_COLUMN - 1][1] + "』列を用意");
-  ss.getSheets().forEach(function (sheet) {
-    const label = addPlOtherExpenseRow_(sheet);
-    if (label) done.push(sheet.getName() + "に「" + label + "」行を追加");
-  });
-  // 月末の条件を半開区間へ（その他経費の行を作ったあとに変換する）
-  const halfOpen = usePlHalfOpenRanges_(ss);
-  if (halfOpen > 0) done.push("月末の条件を「<翌月1日」へ変更: " + halfOpen + "式");
-  const msg = done.length ? done.join(" / ") : "変更はありませんでした（すでに設定済み）";
-  Logger.log(msg);
-  return msg;
-}
-
-/**
- * 日付列（A列）の文字列を Date に置き換える。
- * SUMIFS の日付条件は文字列の日付と一致しないため、これを直さないと
- * PL計算シートは何を書いても 0 円のままになる。
- */
-function fixPlDateColumn_(ss, sheetName) {
-  const sheet = ss.getSheetByName(sheetName);
-  if (!sheet) return 0;
-  const last = sheet.getLastRow();
-  if (last < PL_FIRST_ROW) return 0;
-  const tz = ss.getSpreadsheetTimeZone();
-  const values = sheet
-    .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1)
-    .getValues();
-  let changed = 0;
-  values.forEach(function (r, i) {
-    const v = r[0];
-    if (v === "" || v == null) return;
-    // すでに 0:00 の日付は書き換えない。
-    // **判定はシートのタイムゾーンで行う**（読み書きともシート基準で解釈される）。
-    // スクリプトのタイムゾーンで見ると、ずれた値がちょうど 0:00 に見えてしまう。
-    if (v instanceof Date && Utilities.formatDate(v, tz, "HH-mm") === "00-00") {
-      return;
-    }
-    const d = toPlDate_(v, tz);
-    if (!d) return;
-    writePlDateCell_(sheet, PL_FIRST_ROW + i, d);
-    changed++;
-  });
-  return changed;
-}
-
-/**
- * 日付セルを1つだけ書き換える。
- * 範囲まとめての setValues は、直す必要のないセルまで書き戻してしまうため使わない。
- */
-function writePlDateCell_(sheet, row, date) {
-  const cell = sheet.getRange(row, 1);
-  cell.setValue(date);
-  cell.setNumberFormat("yyyy-mm-dd");
-}
-
-/**
- * タイムゾーンのずれで日付が1日前になってしまった行を復元する。
- *
- * 見分け方は「**シートのタイムゾーンでの時刻が 0:00 でない**」こと。人がシートへ
- * 入力した日付は 0:00 になるので触らない。旧コードは「スクリプトTZの 0:00」を
- * 書いていたため、シートのTZでは時刻が付いて見える（+9 と -7 なら前日 8:00）。
- *
- * 復元は簡単で、**スクリプトのタイムゾーンで読み直せば本来の日付が出る**
- * （旧コードがスクリプトTZの 0:00 として書いた値そのものだから）。それを
- * シートのタイムゾーンの 0:00 として書き直す。
- *
- * 念のため「スクリプトTZで 0:00 になる」ことも確かめ、旧コード由来でない
- * 時刻付きの値（人が時刻まで入れた場合）は触らない。
- * 2回目以降は対象が無くなるため、何度実行しても同じ結果になる。
- */
-function repairPlShiftedDates_(ss, sheetName) {
-  const sheet = ss.getSheetByName(sheetName);
-  if (!sheet) return 0;
-  const last = sheet.getLastRow();
-  if (last < PL_FIRST_ROW) return 0;
-  const tz = ss.getSpreadsheetTimeZone();
-  const scriptTz = Session.getScriptTimeZone();
-  const values = sheet
-    .getRange(PL_FIRST_ROW, 1, last - PL_FIRST_ROW + 1, 1)
-    .getValues();
-  let changed = 0;
-  values.forEach(function (r, i) {
-    const v = r[0];
-    if (!(v instanceof Date)) return;
-    // シートのTZで 0:00 ＝ 日付として正しく入っている（人が入力した行）
-    if (Utilities.formatDate(v, tz, "HH-mm") === "00-00") return;
-    // 旧コードが書いた値は「スクリプトTZの 0:00」。その形でなければ触らない
-    if (Utilities.formatDate(v, scriptTz, "HH-mm") !== "00-00") return;
-    const p = Utilities.formatDate(v, scriptTz, "yyyy-MM-dd")
-      .split("-")
-      .map(Number);
-    writePlDateCell_(sheet, PL_FIRST_ROW + i, dateInTimeZone_(p[0], p[1], p[2], tz));
-    changed++;
-  });
-  return changed;
-}
-
-/**
- * 月末の条件を「<=月末」から「<翌月1日」へ変える。
- *
- * 日付セルに時刻が残っていると `"<=2026-08-31"` は 8/31 の経費を落とす。
- * 8月にも9月にも入らないため、その経費はPLから消える。半開区間にしておけば
- * 時刻が入っていても取りこぼさない。
- */
-function usePlHalfOpenRanges_(ss) {
-  let count = 0;
-  ss.getSheets().forEach(function (sheet) {
-    const formulas = sheet.getDataRange().getFormulas();
-    formulas.forEach(function (row, i) {
-      row.forEach(function (f, j) {
-        if (!f) return;
-        if (f.indexOf(PL_EXPENSE_SHEET) < 0 && f.indexOf(PL_SALES_SHEET) < 0) return;
-        const next = f.replace(
-          /"<=(\d{4})-(\d{2})-(\d{2})"/g,
-          function (all, y, m, d) {
-            const nd = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d) + 1));
-            return (
-              '"<' +
-              nd.getUTCFullYear() +
-              "-" +
-              ("0" + (nd.getUTCMonth() + 1)).slice(-2) +
-              "-" +
-              ("0" + nd.getUTCDate()).slice(-2) +
-              '"'
-            );
-          }
-        );
-        if (next === f) return;
-        sheet.getRange(i + 1, j + 1).setFormula(next);
-        count++;
-      });
-    });
-  });
-  return count;
-}
-
-/** 『経費入力テーブル』を参照する SUMIFS の範囲を PL_LAST_ROW まで広げる。 */
-function widenPlSumifsRanges_(ss) {
-  const pattern = new RegExp(
-    "('" + PL_EXPENSE_SHEET + "'!\\$[A-Z]\\$" + PL_FIRST_ROW + ":\\$[A-Z]\\$)(\\d+)",
-    "g"
-  );
-  let count = 0;
-  ss.getSheets().forEach(function (sheet) {
-    const formulas = sheet.getDataRange().getFormulas();
-    formulas.forEach(function (row, i) {
-      row.forEach(function (f, j) {
-        if (!f || f.indexOf(PL_EXPENSE_SHEET) < 0) return;
-        const next = f.replace(pattern, function (all, head, lastRow) {
-          if (Number(lastRow) >= PL_LAST_ROW) return all;
-          return head + PL_LAST_ROW;
-        });
-        if (next === f) return;
-        // 変更した数式だけを個別に書き戻す。範囲まとめての setFormulas は、
-        // 数式でないセル（見出し・固定人件費の実数値）を空文字で消してしまう。
-        sheet.getRange(i + 1, j + 1).setFormula(next);
-        count++;
-      });
-    });
-  });
-  return count;
-}
-
-/**
- * PL計算シートへ「その他経費（実費）」行を足し、経費合計に含める。
- *
- * 対応する経費項目の行が無い科目（会議費・消耗品費・通信費・宿泊費・その他）を
- * 受けるための行。個別の科目名で SUMIFS を書くのではなく
- * 「事業部×月の経費合計 − すでに個別行で拾っている分」の差で出すため、
- * **将来アプリ側に科目が増えてもPLから漏れない。**
- *
- * 経費合計の行が無いシート（ダッシュボード等）は対象外。すでに行があれば何もしない。
- */
-function addPlOtherExpenseRow_(sheet) {
-  const last = sheet.getLastRow();
-  if (last < 2) return "";
-  const labels = sheet.getRange(1, 1, last, 1).getValues();
-  let totalRow = 0;
-  for (let i = 0; i < labels.length; i++) {
-    const t = String(labels[i][0] == null ? "" : labels[i][0]).trim();
-    if (t === PL_OTHER_ROW_LABEL.trim()) return ""; // すでに追加済み
-    if (!totalRow && t === "経費合計") totalRow = i + 1;
-  }
-  if (!totalRow) return "";
-
-  // 経費合計より上で『経費入力テーブル』から拾っている行＝すでに個別計上済みの行。
-  // 固定人件費や概算家賃のような手置きの行は引かない（差から漏れてしまう）。
-  const lastCol = sheet.getLastColumn();
-  const formulas = sheet.getRange(1, 1, totalRow, lastCol).getFormulas();
-  const itemRows = [];
-  for (let r = 1; r < totalRow; r++) {
-    const f = formulas[r - 1][1]; // B列（最初の月）で判定する
-    if (f && f.indexOf(PL_EXPENSE_SHEET) >= 0) itemRows.push(r);
-  }
-  if (!itemRows.length) return ""; // 経費を集計していないシート
-
-  // 月ごとの条件（事業部・期間）は既存の数式から取り出して、そのまま使い回す。
-  const sample = formulas[itemRows[0] - 1];
-  const totalFormula = sheet.getRange(totalRow, 2).getFormula();
-
-  sheet.insertRowBefore(totalRow);
-  const newRow = totalRow; // 挿入した行。経費合計は1つ下へ動く
-  sheet.getRange(newRow, 1).setValue(PL_OTHER_ROW_LABEL);
-
-  const values = [];
-  for (let c = 2; c <= lastCol; c++) {
-    const src = sample[c - 1];
-    const args = src ? parsePlSumifsArgs_(src) : null;
-    if (!args) {
-      // 合計列（SUM）などは、この行の月セルを足し合わせる
-      values.push(c > 2 ? "=SUM(B" + newRow + ":" + columnLetter_(c - 1) + newRow + ")" : "");
-      continue;
-    }
-    const total =
-      "SUMIFS('" + PL_EXPENSE_SHEET + "'!$E$" + PL_FIRST_ROW + ":$E$" + PL_LAST_ROW +
-      ", '" + PL_EXPENSE_SHEET + "'!$C$" + PL_FIRST_ROW + ":$C$" + PL_LAST_ROW +
-      ', "' + args.department + '"' +
-      ", '" + PL_EXPENSE_SHEET + "'!$A$" + PL_FIRST_ROW + ":$A$" + PL_LAST_ROW +
-      ', "' + args.from + '"' +
-      ", '" + PL_EXPENSE_SHEET + "'!$A$" + PL_FIRST_ROW + ":$A$" + PL_LAST_ROW +
-      ', "' + args.to + '")';
-    const subtract = itemRows
-      .map(function (r) {
-        // 挿入で1つ下へずれた行は番号を繰り下げる
-        return columnLetter_(c) + (r >= newRow ? r + 1 : r);
-      })
-      .join(" - ");
-    values.push("=" + total + (subtract ? " - " + subtract : ""));
-  }
-  sheet.getRange(newRow, 2, 1, values.length).setValues([values]);
-
-  // 経費合計に新しい行を含める。挿入位置が SUM の範囲の「直後」なので、
-  // 行の挿入では範囲が自動で広がらない（範囲の内側に挿した場合だけ広がる）。
-  if (totalFormula) {
-    const totalRowAfter = newRow + 1;
-    for (let c = 2; c <= lastCol; c++) {
-      const cell = sheet.getRange(totalRowAfter, c);
-      const cur = cell.getFormula();
-      if (!cur) continue; // 数式でないセルには書き込まない（実数値を消さない）
-      const next = shiftPlSumRange_(cur, newRow);
-      if (next !== cur) cell.setFormula(next);
-    }
-  }
-  return PL_OTHER_ROW_LABEL.trim();
-}
-
-/** SUM(B12:B15) の終端を、挿入した行を含む位置まで広げる。 */
-function shiftPlSumRange_(formula, insertedRow) {
-  return formula.replace(
-    /(\$?[A-Z]+\$?)(\d+):(\$?[A-Z]+\$?)(\d+)/,
-    function (all, c1, r1, c2, r2) {
-      const end = Number(r2);
-      return c1 + r1 + ":" + c2 + (end + 1 === insertedRow ? end + 1 : end);
-    }
-  );
-}
-
-/** SUMIFS から 事業部の条件と日付の範囲条件を取り出す。 */
-function parsePlSumifsArgs_(formula) {
-  if (!formula || formula.indexOf("SUMIFS") < 0) return null;
-  const dept = formula.match(/\$C\$\d+:\$C\$\d+,\s*"([^"]+)"/);
-  // 月末の条件は "<=月末" と "<翌月1日" のどちらの形でも受ける
-  const dates = formula.match(
-    /\$A\$\d+:\$A\$\d+,\s*"(>=[^"]+)"[\s\S]*?\$A\$\d+:\$A\$\d+,\s*"(<=?[^"]+)"/
-  );
-  if (!dept || !dates) return null;
-  return { department: dept[1], from: dates[1], to: dates[2] };
-}
-
-/** 1 → "A" の列記号。 */
-function columnLetter_(index) {
-  let n = index;
-  let out = "";
-  while (n > 0) {
-    const rem = (n - 1) % 26;
-    out = String.fromCharCode(65 + rem) + out;
-    n = Math.floor((n - 1) / 26);
-  }
-  return out;
 }
 
 /* ========================= 月次フォルダの自動生成 ========================= */

@@ -99,7 +99,7 @@ async function api(payload) {
   }
   return data;
 }
-const RENEW_ACTIONS = ["bootstrap", "issueAccessCode", "changePassword", "upsertUser"];
+const RENEW_ACTIONS = ["bootstrap", "issueAccessCode", "upsertUser"];
 
 function normalize(r) {
   return {
