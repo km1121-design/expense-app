@@ -15,7 +15,7 @@ const SESSION_KEY = "expense-app:session";
 const CACHE_KEY = "expense-lite:months"; // 一覧キャッシュ（月ごと）。旧名のまま（変えると一度キャッシュが消える）
 
 const CATEGORIES = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
-const GROUP_KEYS = { department: "事業部", applicant: "申請者", category: "費目" };
+const GROUP_KEYS = { month: "月", department: "事業部", applicant: "申請者", category: "費目" };
 
 const state = {
   endpoint: "",
@@ -114,9 +114,20 @@ function normalize(r) {
     amount: Number(r.amount) || 0,
     status: String(r.status || ""),
     imageUrl: String(r.imageUrl || ""),
+    imageFileId: String(r.imageFileId || ""),
+    month: String(r.date || "").slice(0, 7), // 「月ごと」の並べ替え用
     createdAt: String(r.createdAt || ""),
   };
 }
+
+/* ---------- 領収書の画像 ---------- */
+/** ドライブのファイルID。行に無ければ、領収書URL（…/d/<ID>/view）から取る */
+const fileIdOf = (r) => r.imageFileId || ((r.imageUrl.match(/\/d\/([^/?#]+)/) || [])[1] || "");
+/**
+ * ドライブが作る縮小画像。「リンクを知っている人は閲覧可」にしてあるので、ログインなしで読める
+ * （共有を外すと開けなくなり、一覧では 🧾 に置き換わる）。
+ */
+const thumbUrl = (id, width) => "https://drive.google.com/thumbnail?id=" + encodeURIComponent(id) + "&sz=w" + width;
 
 /* ---------- 月ごとの一覧 ---------- */
 const monthKey = () => $("#month").value || "all";
@@ -321,7 +332,8 @@ async function start() {
   // 通信の前に前回の一覧を描く（白い画面を見せない）
   const cache = readJson(CACHE_KEY, null);
   if (cache && cache.user === state.session.user.username && cache.months) {
-    state.months = cache.months;
+    // 古い版が残したキャッシュは項目が足りないので、今の形へ作り直す
+    Object.keys(cache.months).forEach((k) => (state.months[k] = (cache.months[k] || []).map(normalize)));
     if (state.months[monthKey()]) showApp();
   }
   try {
@@ -510,6 +522,7 @@ async function onSubmit(e) {
 function sortRecords(list, key) {
   const byDate = (a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt);
   if (key === "amount") return list.sort((a, b) => b.amount - a.amount || byDate(a, b));
+  if (key === "month") return list.sort(byDate); // 月は新しい順（日付順にすれば月もまとまる）
   if (!GROUP_KEYS[key]) return list.sort(byDate);
   // グループごと：小計の大きい順、グループ内は日付の新しい順
   const totals = {};
@@ -537,6 +550,7 @@ function render() {
     return;
   }
   const list = sortRecords(recs.slice(), key);
+  state.shown = list; // 領収書の拡大表示が、いま並んでいる順に前後へ移るために持つ
   const sum = (rs) => rs.reduce((s, r) => s + (isRejected(r) ? 0 : r.amount), 0);
   $("#total").textContent = `${month ? month.replace("-", "年") + "月" : "全期間"}　${
     list.filter((r) => !isRejected(r)).length
@@ -552,8 +566,9 @@ function render() {
     if (GROUP_KEYS[key] && r[key] !== current) {
       current = r[key];
       const group = list.filter((x) => x[key] === current);
+      const label = key === "month" ? (current ? current.replace("-", "年") + "月" : "（日付なし）") : current || "（未設定）";
       html.push(
-        `<li class="group"><span>${esc(current || "（未設定）")}　${group.filter((x) => !isRejected(x)).length}件</span>` +
+        `<li class="group"><span>${esc(label)}　${group.filter((x) => !isRejected(x)).length}件</span>` +
           `<span>${yen(sum(group))}</span></li>`
       );
     }
@@ -563,13 +578,18 @@ function render() {
       .filter(Boolean)
       .map(esc)
       .join("・");
+    const fid = fileIdOf(r);
     html.push(
       `<li class="item${isRejected(r) ? " is-rejected" : ""}">` +
+        (fid
+          ? `<button type="button" class="thumb" data-view="${esc(r.id)}" aria-label="領収書を拡大">` +
+            `<img src="${esc(thumbUrl(fid, 160))}" alt="領収書" loading="lazy" referrerpolicy="no-referrer" /></button>`
+          : "") +
         `<div class="item__main"><div class="item__title">${esc(r.vendor || r.category || "（支払先なし）")}` +
         `${r.description ? `<small>${esc(r.description)}</small>` : ""}</div>` +
         `<div class="item__meta">${meta}</div></div>` +
         `<div class="item__side">${yen(r.amount)}<div class="acts">` +
-        `${r.imageUrl ? `<a href="${esc(r.imageUrl)}" target="_blank" rel="noopener">🧾領収書</a>` : ""}` +
+        `${!fid && r.imageUrl ? `<a href="${esc(r.imageUrl)}" target="_blank" rel="noopener">🧾領収書</a>` : ""}` +
         `${canDelete ? `<button type="button" class="link danger" data-del="${esc(r.id)}">削除</button>` : ""}` +
         `</div></div></li>`
     );
@@ -578,6 +598,8 @@ function render() {
 }
 
 async function onRowsClick(e) {
+  const view = e.target.closest && e.target.closest("[data-view]");
+  if (view) return openLightbox(view.dataset.view, view);
   const id = e.target.dataset && e.target.dataset.del;
   if (!id) return;
   const r = (state.months[monthKey()] || []).find((x) => x.id === id);
@@ -594,6 +616,52 @@ async function onRowsClick(e) {
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
     toast("削除できませんでした: " + err.message);
   }
+}
+
+/* ---------- 領収書の拡大表示 ---------- */
+const lb = { ids: [], i: 0, opener: null };
+
+function openLightbox(id, opener) {
+  // いま一覧に並んでいる順のうち、画像があるものだけを前後に送れるようにする
+  lb.ids = (state.shown || []).filter((r) => fileIdOf(r)).map((r) => r.id);
+  lb.i = Math.max(0, lb.ids.indexOf(id));
+  lb.opener = opener || null;
+  $("#lightbox").hidden = false;
+  document.body.style.overflow = "hidden"; // 背景の一覧が一緒に動かないように
+  showLightbox();
+  $("#lbClose").focus();
+}
+
+function showLightbox() {
+  const r = (state.shown || []).find((x) => x.id === lb.ids[lb.i]);
+  if (!r) return closeLightbox(); // 表示中に消された
+  const fid = fileIdOf(r);
+  const img = $("#lbImg");
+  img.classList.add("is-loading");
+  img.onload = () => img.classList.remove("is-loading");
+  img.onerror = () => {
+    img.classList.remove("is-loading");
+    $("#lbCap").textContent = "画像を読み込めませんでした。下のリンクから開けます";
+  };
+  img.src = thumbUrl(fid, 1600);
+  const meta = [r.date.slice(5).replace("-", "/"), r.applicant, r.department, r.category].filter(Boolean).join("・");
+  $("#lbCap").textContent = `${r.vendor || r.category}　${yen(r.amount)}　${meta}`;
+  $("#lbCount").textContent = lb.ids.length > 1 ? `${lb.i + 1} / ${lb.ids.length}` : "";
+  $("#lbOpen").href = r.imageUrl || "https://drive.google.com/file/d/" + encodeURIComponent(fid) + "/view";
+  $("#lbPrev").hidden = $("#lbNext").hidden = lb.ids.length < 2;
+}
+
+function stepLightbox(d) {
+  if (lb.ids.length < 2) return;
+  lb.i = (lb.i + d + lb.ids.length) % lb.ids.length;
+  showLightbox();
+}
+
+function closeLightbox() {
+  $("#lightbox").hidden = true;
+  $("#lbImg").removeAttribute("src");
+  document.body.style.overflow = "";
+  if (lb.opener && document.contains(lb.opener)) lb.opener.focus();
 }
 
 async function onReload() {
@@ -828,6 +896,39 @@ $("#month").addEventListener("change", loadMonth);
 $("#sortKey").addEventListener("change", render);
 $("#reloadBtn").addEventListener("click", onReload);
 $("#rows").addEventListener("click", onRowsClick);
+// 画像が読み込めなかったとき（共有が外れている等）は 🧾 に置き換える。ボタンは押せるまま
+$("#rows").addEventListener(
+  "error",
+  (e) => {
+    if (e.target.tagName === "IMG") e.target.replaceWith(document.createTextNode("🧾"));
+  },
+  true
+);
+$("#allMonthsBtn").addEventListener("click", () => {
+  $("#month").value = "";
+  loadMonth();
+});
+$("#lbClose").addEventListener("click", closeLightbox);
+$("#lbPrev").addEventListener("click", () => stepLightbox(-1));
+$("#lbNext").addEventListener("click", () => stepLightbox(1));
+$("#lightbox").addEventListener("click", (e) => {
+  if (e.target === $("#lightbox")) closeLightbox(); // 背景をタップで閉じる
+});
+document.addEventListener("keydown", (e) => {
+  if ($("#lightbox").hidden) return;
+  if (e.key === "Escape") closeLightbox();
+  else if (e.key === "ArrowLeft") stepLightbox(-1);
+  else if (e.key === "ArrowRight") stepLightbox(1);
+});
+// スマホでは左右のスワイプで前後の領収書へ
+let swipeX = null;
+$("#lightbox").addEventListener("touchstart", (e) => (swipeX = e.touches[0].clientX), { passive: true });
+$("#lightbox").addEventListener("touchend", (e) => {
+  if (swipeX == null) return;
+  const dx = e.changedTouches[0].clientX - swipeX;
+  swipeX = null;
+  if (Math.abs(dx) > 60) stepLightbox(dx < 0 ? 1 : -1);
+});
 document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
 start();
