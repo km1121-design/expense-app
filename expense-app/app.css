@@ -68,7 +68,47 @@ input, select {
   display: flex; justify-content: space-between; gap: 12px;
   padding: 10px 2px; border-bottom: 1px solid var(--line);
 }
-.item__main { min-width: 0; }
+.item { align-items: flex-start; }
+.item__main { flex: 1; min-width: 0; }
+/* 領収書の小さな画像（タップで拡大）。読み込めなかったときは 🧾 に置き換わる */
+.thumb {
+  flex: none; width: 56px; height: 56px; padding: 0; overflow: hidden; cursor: zoom-in;
+  display: flex; align-items: center; justify-content: center; font-size: 22px;
+  border: 1px solid var(--line); border-radius: 8px; background: #f3f4f6;
+}
+.thumb img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+
+/* 絞り込み（開閉できる。絞っている間は見出しの色が変わる） */
+.narrow { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.narrow > summary { cursor: pointer; font-size: 14px; }
+.narrow.is-active { border-color: var(--accent); background: #f5f8ff; }
+.narrow.is-active > summary { color: var(--accent); font-weight: 600; }
+.narrow[open] { display: flex; flex-direction: column; gap: 12px; }
+.narrow .checkList { max-height: 160px; overflow-y: auto; }
+.narrow fieldset.checks { margin: 0 0 12px; }
+
+.lightbox {
+  position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+  padding: 56px 12px 16px; background: rgba(0, 0, 0, 0.88);
+}
+.lb__fig { margin: 0; max-width: 100%; max-height: 100%; display: flex; flex-direction: column; align-items: center; gap: 10px; color: #fff; }
+.lb__fig img { max-width: 100%; max-height: calc(100vh - 190px); object-fit: contain; background: #fff; border-radius: 6px; }
+.lb__fig img.is-loading { opacity: 0.35; }
+.lb__cap { font-size: 14px; text-align: center; display: flex; flex-direction: column; gap: 4px; }
+.lb__cap a { color: #93c5fd; margin-left: 10px; }
+/* 白い領収書の上でも暗い背景の上でも見えるように、濃い半透明＋白い縁にする */
+.lb__close, .lb__nav {
+  position: absolute; color: #fff; cursor: pointer;
+  background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(255, 255, 255, 0.6);
+}
+.lb__close { top: 10px; right: 12px; width: 40px; height: 40px; border-radius: 50%; font-size: 18px; }
+.lb__nav { top: 50%; transform: translateY(-50%); width: 44px; height: 64px; border-radius: 8px; font-size: 30px; }
+.lb__prev { left: 6px; }
+.lb__next { right: 6px; }
+@media (max-width: 560px) {
+  /* 画像を広く使うため、前後のボタンは画像の上に重ねて小さめにする */
+  .lb__nav { width: 36px; height: 56px; }
+}
 .item__title { font-weight: 600; overflow-wrap: anywhere; }
 .item__title small { font-weight: 400; color: var(--muted); margin-left: 6px; }
 .item__meta { font-size: 13px; color: var(--muted); }
