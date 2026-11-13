@@ -85,6 +85,19 @@
             </label>
             <button type="button" class="link" id="reloadBtn">再読込</button>
           </div>
+          <!-- 絞り込み: 事業部・人を複数選んで、その分だけ表示する（並べ替えとは別に効く） -->
+          <details class="narrow" id="narrow">
+            <summary id="narrowSummary">絞り込み</summary>
+            <fieldset class="checks">
+              <legend>事業部（複数選べます）</legend>
+              <div id="narrowDepts"></div>
+            </fieldset>
+            <fieldset class="checks" id="narrowPeopleBox">
+              <legend>人（複数選べます）</legend>
+              <div id="narrowPeople"></div>
+            </fieldset>
+            <button type="button" class="link" id="narrowClear">絞り込みをやめる</button>
+          </details>
           <p class="total" id="total"></p>
           <ul class="list" id="rows"></ul>
         </div>

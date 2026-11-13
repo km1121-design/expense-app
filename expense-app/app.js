@@ -29,6 +29,8 @@ const state = {
   loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）/ "setup" = 最初の管理者の作成
   users: [], // アカウント画面の利用者一覧（管理者のみ）
   editing: "", // 事業部を編集中の利用者（username）
+  filters: { depts: new Set(), people: new Set() }, // 絞り込み（事業部名・申請者ID。空 = 絞らない）
+  narrowSig: "", // 絞り込みの選択肢を作り直す必要があるかの判定用
 };
 
 const $ = (s) => document.querySelector(s);
@@ -549,15 +551,23 @@ function render() {
     $("#rows").innerHTML = `<li class="empty">${failed ? "取得できませんでした。「再読込」を押してください" : "読み込み中…"}</li>`;
     return;
   }
-  const list = sortRecords(recs.slice(), key);
+  renderNarrow(recs);
+  const { depts, people } = state.filters;
+  const narrowed = depts.size > 0 || (isAdmin() && people.size > 0);
+  const list = sortRecords(
+    recs.filter(
+      (r) => (!depts.size || depts.has(r.department)) && (!isAdmin() || !people.size || people.has(r.applicantId))
+    ),
+    key
+  );
   state.shown = list; // 領収書の拡大表示が、いま並んでいる順に前後へ移るために持つ
   const sum = (rs) => rs.reduce((s, r) => s + (isRejected(r) ? 0 : r.amount), 0);
   $("#total").textContent = `${month ? month.replace("-", "年") + "月" : "全期間"}　${
     list.filter((r) => !isRejected(r)).length
-  }件　合計 ${yen(sum(list))}${isAdmin() ? "（全員分）" : ""}`;
+  }件　合計 ${yen(sum(list))}${narrowed ? "（絞り込み中）" : isAdmin() ? "（全員分）" : ""}`;
 
   if (!list.length) {
-    $("#rows").innerHTML = '<li class="empty">この月の申請はありません</li>';
+    $("#rows").innerHTML = `<li class="empty">${narrowed ? "条件に合う申請はありません" : "この月の申請はありません"}</li>`;
     return;
   }
   const html = [];
@@ -595,6 +605,56 @@ function render() {
     );
   });
   $("#rows").innerHTML = html.join("");
+}
+
+/* ---------- 絞り込み（事業部・人を複数選ぶ） ---------- */
+/**
+ * 選択肢は、いま読み込んでいる月の申請に出てくる事業部・人。選んだものは、
+ * 別の月へ切り替えて申請が無くても選択肢に残す（絞り込み中なのに見えない、を避ける）。
+ * 人は申請者ID（表示名は変わりうる・同名がありうる）で絞り、名前は表示だけに使う。
+ */
+function renderNarrow(recs) {
+  const deptSet = new Set([...recs.map((r) => r.department), ...state.filters.depts]);
+  const people = new Map(); // 申請者ID -> 表示名
+  recs.forEach((r) => people.set(r.applicantId, r.applicant));
+  state.filters.people.forEach((id) => people.has(id) || people.set(id, id));
+  const depts = [...deptSet].sort((a, b) => a.localeCompare(b, "ja"));
+  const names = [...people.entries()].sort((a, b) => a[1].localeCompare(b[1], "ja"));
+  const dup = (name) => names.filter((n) => n[1] === name).length > 1; // 同名がいれば IDも添える
+  const sig = JSON.stringify([depts, names, isAdmin()]);
+  if (sig !== state.narrowSig) {
+    state.narrowSig = sig;
+    const box = (name, value, label, on) =>
+      `<label><input type="checkbox" name="${name}" value="${esc(value)}"${on ? " checked" : ""} />${esc(label)}</label>`;
+    $("#narrowDepts").innerHTML =
+      '<div class="checkList">' +
+      depts.map((d) => box("nd", d, d || "（未設定）", state.filters.depts.has(d))).join("") +
+      "</div>";
+    $("#narrowPeople").innerHTML =
+      '<div class="checkList">' +
+      names
+        .map(([id, name]) => box("np", id, dup(name) ? `${name}（${id}）` : name, state.filters.people.has(id)))
+        .join("") +
+      "</div>";
+  }
+  $("#narrowPeopleBox").hidden = !isAdmin(); // 一般ユーザーは自分の分しか見ないので、人では絞らない
+  const nd = state.filters.depts.size;
+  const np = isAdmin() ? state.filters.people.size : 0;
+  $("#narrow").classList.toggle("is-active", nd + np > 0);
+  $("#narrowSummary").textContent =
+    nd + np > 0 ? `絞り込み中（${[nd && `事業部 ${nd}`, np && `人 ${np}`].filter(Boolean).join("・")}）` : "絞り込み";
+}
+
+function onNarrowChange() {
+  state.filters.depts = new Set(checkedValues($("#narrowDepts"), "nd"));
+  state.filters.people = new Set(checkedValues($("#narrowPeople"), "np"));
+  render();
+}
+
+function clearNarrow() {
+  state.filters = { depts: new Set(), people: new Set() };
+  state.narrowSig = ""; // 選択肢を作り直して、チェックを外す
+  render();
 }
 
 async function onRowsClick(e) {
@@ -904,6 +964,8 @@ $("#rows").addEventListener(
   },
   true
 );
+$("#narrow").addEventListener("change", onNarrowChange);
+$("#narrowClear").addEventListener("click", clearNarrow);
 $("#allMonthsBtn").addEventListener("click", () => {
   $("#month").value = "";
   loadMonth();
