@@ -1,92 +1,310 @@
+/* =========================================================================
+ * 経費申請アプリの見た目
+ *
+ * スマホ: タブは画面の下（親指で届く位置）、申請ボタンは常に見える位置に固定。
+ * PC（幅1100px以上）: 一覧は「左に集計・右に表」の2列。
+ * 外部のCSS・フォントは読まない（起動を待たせないため）。
+ * ========================================================================= */
 :root {
-  --bg: #f5f6f8;
+  --bg: #f4f5f7;
   --card: #fff;
-  --text: #1f2328;
+  --text: #1c2024;
   --muted: #6b7280;
-  --line: #e5e7eb;
+  --faint: #9ca3af;
+  --line: #e6e8eb;
   --accent: #2563eb;
+  --accent-weak: #eef3ff;
   --danger: #dc2626;
+  --warn: #b45309;
+  --warn-weak: #fff7ed;
+  --ok: #15803d;
+  --radius: 14px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --nav-h: 64px;
 }
 * { box-sizing: border-box; }
-/* hidden 属性を display 指定で打ち消さないようにする */
+/* hidden 属性を display 指定で打ち消さないようにする（消さないこと） */
 [hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font: 15px/1.55 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  -webkit-text-size-adjust: 100%;
 }
-main { max-width: 960px; margin: 0 auto; padding: 12px 16px 40px; }
+main { max-width: 760px; margin: 0 auto; padding: 12px 16px 40px; }
+h2 { margin: 0; font-size: 17px; }
+h3 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
 
+/* ---------- ヘッダー ---------- */
 .bar {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 10;
 }
-.bar h1 { margin: 0; font-size: 18px; }
-.bar__user { display: flex; gap: 10px; align-items: center; font-size: 14px; }
+.bar h1 { margin: 0; font-size: 17px; display: flex; align-items: center; gap: 8px; }
+.bar__logo {
+  display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 8px;
+  background: var(--accent); color: #fff; font-size: 15px;
+}
+.bar__user { display: flex; gap: 8px; align-items: center; font-size: 14px; min-width: 0; }
+.bar__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ---------- 共通の部品 ---------- */
 .card {
-  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-  padding: 16px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 12px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 16px; margin-bottom: 12px;
+  display: flex; flex-direction: column; gap: 12px;
 }
-.card h2 { margin: 0; font-size: 17px; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field__label { font-size: 13px; color: var(--muted); }
 input, select {
-  font: inherit; color: var(--text); padding: 9px 10px;
-  border: 1px solid var(--line); border-radius: 8px; background: #fff; min-width: 0;
+  font: inherit; color: var(--text); padding: 10px 12px; min-width: 0;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff;
 }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-
-.btn {
-  font: inherit; font-weight: 600; padding: 12px; border: 0; border-radius: 8px;
-  background: var(--accent); color: #fff; cursor: pointer;
-}
-.btn:disabled { opacity: 0.6; cursor: wait; }
-.link { font: inherit; font-size: 14px; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 4px; }
-.link.danger { color: var(--danger); }
-
-.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
-.tab {
-  flex: 1; font: inherit; padding: 10px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--card); cursor: pointer;
-}
-.tab.is-active { background: var(--accent); color: #fff; border-color: var(--accent); }
-
-.photo {
-  position: relative; align-items: center; justify-content: center; min-height: 120px;
-  border: 2px dashed var(--line); border-radius: 10px; cursor: pointer; text-align: center; padding: 12px;
-}
-.photo input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-.photo img { max-height: 220px; max-width: 100%; border-radius: 6px; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .note { margin: 0; font-size: 13px; color: var(--muted); min-height: 1em; }
 .err { margin: 0; color: var(--danger); font-size: 13px; min-height: 1em; }
 
-.filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.btn {
+  font: inherit; font-weight: 600; padding: 12px 16px; border: 0; border-radius: 12px;
+  background: var(--accent); color: #fff; cursor: pointer; text-align: center;
+  display: inline-flex; flex-direction: row; align-items: center; justify-content: center; gap: 8px;
+}
+.btn:disabled { opacity: 0.55; cursor: default; }
+.btn--big { padding: 15px 18px; font-size: 16px; }
+.btn--ghost { background: var(--accent-weak); color: var(--accent); }
+.btn--sm { padding: 8px 14px; }
+.link { font: inherit; font-size: 14px; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 4px; }
+.link--muted { color: var(--muted); }
+.link.danger { color: var(--danger); }
+.icon-btn {
+  font: inherit; font-size: 20px; line-height: 1; width: 40px; height: 40px; flex: none;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--text); cursor: pointer;
+}
+.pill {
+  font: inherit; font-size: 13px; padding: 8px 12px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: #fff; color: var(--text);
+}
+.pill.is-on { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+/* ファイル選択は見えない入力をボタン全体に重ねる */
+.file { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.btn, .shot__retake { position: relative; overflow: hidden; }
+
+/* ---------- タブ（スマホは画面の下・PCは上） ---------- */
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.tab {
+  flex: 1; font: inherit; font-size: 14px; padding: 10px; cursor: pointer; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+.tab.is-active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+@media (max-width: 719px) {
+  main#appView { padding-bottom: calc(var(--nav-h) + 96px); }
+  .tabs {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; margin: 0; gap: 0;
+    padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    background: rgba(255, 255, 255, 0.96); border-top: 1px solid var(--line);
+    backdrop-filter: blur(8px);
+  }
+  .tab { flex-direction: column; gap: 0; border: 0; background: none; border-radius: 10px; font-size: 11px; padding: 6px 4px; }
+  .tab__icon { font-size: 20px; line-height: 1.2; }
+  .tab.is-active { background: none; color: var(--accent); }
+}
+
+/* ---------- 申請 ---------- */
+.shot { border-radius: 12px; }
+.shot__empty {
+  display: grid; gap: 10px; padding: 16px; text-align: center;
+  border: 2px dashed #d5dae1; border-radius: 12px; background: #fafbfc;
+}
+.shot__done { display: flex; gap: 12px; align-items: center; }
+.shot__done img {
+  width: 72px; height: 92px; object-fit: cover; object-position: top; flex: none;
+  border-radius: 8px; border: 1px solid var(--line); background: #fff;
+}
+.shot__status { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.shot__msg { margin: 0; font-size: 14px; }
+.shot__msg.is-reading::before {
+  content: ""; display: inline-block; width: 12px; height: 12px; margin-right: 8px; vertical-align: -1px;
+  border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.shot__msg.is-warn { color: var(--warn); }
+.shot__retake { align-self: flex-start; padding: 0; font-size: 13px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.apply__fields { display: flex; flex-direction: column; gap: 12px; }
+#manualBtn { font-size: 13px; }
+.amount { gap: 4px; }
+.amount__box {
+  display: flex; align-items: center; gap: 6px; padding: 4px 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: #fff;
+}
+.amount__box:focus-within { outline: 2px solid var(--accent); outline-offset: -1px; }
+.amount__yen { font-size: 22px; color: var(--muted); font-weight: 600; }
+.amount__box input {
+  border: 0; outline: 0; padding: 6px 0; width: 100%;
+  font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+
+.chipset { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: #fff; color: var(--text);
+}
+.chip.is-on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.field.is-missing .chipset { outline: 2px solid var(--danger); outline-offset: 4px; border-radius: 8px; }
+
+/* 申請ボタンは、スマホでは下のタブのすぐ上に常に見えるようにする */
+.apply__bar { display: flex; }
+.apply__bar .btn { flex: 1; }
+@media (max-width: 719px) {
+  .apply__bar {
+    position: sticky; bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) + 8px); z-index: 5;
+    margin: 0 -4px; padding-top: 4px;
+  }
+  .apply__bar .btn { box-shadow: 0 6px 18px rgba(37, 99, 235, 0.3); }
+}
+.mine {
+  width: 100%; font: inherit; text-align: left; cursor: pointer; color: var(--text);
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 12px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card);
+}
+.mine b { font-variant-numeric: tabular-nums; }
+.mine span:last-child { color: var(--accent); font-size: 14px; white-space: nowrap; }
+
+/* ---------- 一覧: 操作の帯 ---------- */
+.toolbar { gap: 10px; }
+.toolbar__row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.toolbar__right { display: flex; gap: 8px; align-items: center; }
+.monthNav { display: flex; gap: 6px; align-items: center; }
+.monthNav input { width: 180px; }
+label.inline { flex-direction: row; align-items: center; gap: 6px; white-space: nowrap; }
+
+.narrow { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+.narrow > summary { cursor: pointer; font-size: 14px; }
+.narrow.is-active { border-color: var(--accent); background: #f5f8ff; }
+.narrow.is-active > summary { color: var(--accent); font-weight: 600; }
+.narrow[open] { display: flex; flex-direction: column; gap: 4px; }
+.narrow .checkList { max-height: 160px; overflow-y: auto; }
+.narrow fieldset.checks { margin: 8px 0 4px; }
+
+/* ---------- 一覧: 集計 ---------- */
+.listLayout { display: block; }
+.summary { gap: 14px; }
+.kpis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+body:not(.is-admin) .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } /* スタッフは3つ */
+.kpi { background: #f8f9fb; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+.kpi__label { font-size: 12px; color: var(--muted); }
+.kpi__value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.kpi--main { background: var(--accent-weak); }
+.kpi--main .kpi__value { color: var(--accent); }
+.kpi--warn { background: var(--warn-weak); }
+.kpi--warn .kpi__value { color: var(--warn); }
+.breakdown > summary { cursor: pointer; font-size: 14px; color: var(--accent); }
+.breakdown[open] > summary { margin-bottom: 8px; }
+.bars { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.bars:last-child { margin-bottom: 0; }
+.barRow {
+  font: inherit; text-align: left; cursor: pointer; width: 100%;
+  display: grid; grid-template-columns: minmax(64px, 7em) minmax(0, 1fr) auto; gap: 8px; align-items: center;
+  padding: 4px 6px; border: 1px solid transparent; border-radius: 8px; background: none; color: var(--text);
+}
+.barRow:hover { background: #f5f7fa; }
+.barRow.is-on { border-color: var(--accent); background: var(--accent-weak); }
+.barRow__label { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.barRow__track { height: 10px; border-radius: 999px; background: #eef0f3; overflow: hidden; }
+.barRow__fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); min-width: 3px; }
+.barRow__val { font-size: 13px; font-variant-numeric: tabular-nums; }
+.bars__rest { font-size: 12px; color: var(--muted); padding: 0 6px; }
+
+/* ---------- 一覧: 明細 ---------- */
 .total { margin: 0; font-weight: 600; }
+.totalRow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
 .list { list-style: none; margin: 0; padding: 0; }
 .item {
-  display: flex; justify-content: space-between; gap: 12px;
+  display: flex; justify-content: space-between; gap: 12px; align-items: flex-start;
   padding: 10px 2px; border-bottom: 1px solid var(--line);
 }
-.item { align-items: flex-start; }
 .item__main { flex: 1; min-width: 0; }
+.item__title { font-weight: 600; overflow-wrap: anywhere; }
+.item__title small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.item__meta { font-size: 13px; color: var(--muted); }
+.item__side { text-align: right; white-space: nowrap; font-weight: 600; }
+.item.is-rejected .item__title, .item.is-rejected .item__side { color: var(--muted); text-decoration: line-through; }
+.item.is-inactive .item__title { color: var(--muted); }
+.item.is-editing { flex-wrap: wrap; }
+.acts { display: flex; gap: 10px; justify-content: flex-end; font-size: 13px; font-weight: 400; margin-top: 2px; }
+.acts .link { padding: 0; font-size: 13px; }
+.acts a { color: var(--accent); text-decoration: none; }
+/* 削除は目立たせない（押したときだけ確認が出る） */
+.rows .acts .link.danger { color: var(--faint); }
+.rows .acts .link.danger:hover { color: var(--danger); }
+.empty { text-align: center; color: var(--muted); padding: 24px; }
+.group {
+  display: flex; justify-content: space-between; padding: 8px 10px; margin-top: 10px;
+  background: #f1f4f9; border-radius: 8px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+
+/* 明細の1行。スマホは2段、PCは表の列にそろえる */
+.exp {
+  display: grid; grid-template-columns: 48px minmax(0, 1fr) auto;
+  grid-template-areas: "thumb title amount" "thumb meta acts";
+  column-gap: 12px; row-gap: 2px; align-items: start;
+}
+.exp > .thumb, .exp > .thumb-none { grid-area: thumb; }
+.exp .item__title { grid-area: title; }
+.exp .item__meta { grid-area: meta; display: flex; flex-wrap: wrap; align-items: center; }
+.exp .item__meta > span + span::before { content: "・"; color: var(--faint); }
+.exp .item__side { grid-area: amount; font-size: 16px; font-variant-numeric: tabular-nums; }
+.exp .acts { grid-area: acts; margin: 0; }
+.list__head { display: none; }
+
 /* 領収書の小さな画像（タップで拡大）。読み込めなかったときは 🧾 に置き換わる */
 .thumb {
-  flex: none; width: 56px; height: 56px; padding: 0; overflow: hidden; cursor: zoom-in;
+  flex: none; width: 48px; height: 48px; padding: 0; overflow: hidden; cursor: zoom-in;
   display: flex; align-items: center; justify-content: center; font-size: 22px;
   border: 1px solid var(--line); border-radius: 8px; background: #f3f4f6;
 }
 .thumb img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+.thumb-none {
+  width: 48px; height: 48px; border-radius: 8px; border: 1px dashed #d5dae1;
+  display: grid; place-items: center; font-size: 10px; color: var(--faint);
+}
 
-/* 絞り込み（開閉できる。絞っている間は見出しの色が変わる） */
-.narrow { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
-.narrow > summary { cursor: pointer; font-size: 14px; }
-.narrow.is-active { border-color: var(--accent); background: #f5f8ff; }
-.narrow.is-active > summary { color: var(--accent); font-weight: 600; }
-.narrow[open] { display: flex; flex-direction: column; gap: 12px; }
-.narrow .checkList { max-height: 160px; overflow-y: auto; }
-.narrow fieldset.checks { margin: 0 0 12px; }
+/* 費目の色（一覧で見分けやすく） */
+.tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: #eef0f3; color: #374151; }
+.tag[data-cat="交通費"] { background: #e0f2fe; color: #075985; }
+.tag[data-cat="交際費"] { background: #fce7f3; color: #9d174d; }
+.tag[data-cat="会議費"] { background: #ede9fe; color: #5b21b6; }
+.tag[data-cat="消耗品費"] { background: #dcfce7; color: #166534; }
+.tag[data-cat="通信費"] { background: #fef3c7; color: #92400e; }
+.tag[data-cat="宿泊費"] { background: #e0e7ff; color: #3730a3; }
+.flag { color: var(--danger); }
 
+/* ---------- アカウント ---------- */
+.issued { border-color: var(--accent); }
+.code { margin: 0; font: 700 28px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+fieldset.checks { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.checks legend { font-size: 13px; color: var(--muted); margin-bottom: 6px; padding: 0; }
+.checkList { display: flex; flex-wrap: wrap; gap: 8px; }
+.checkList label {
+  flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 14px;
+  border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer;
+}
+.checkList label:has(input:checked) { background: var(--accent-weak); border-color: var(--accent); }
+.checkList input { padding: 0; margin: 0; }
+.editDepts { width: 100%; display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+.chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.chips li { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 6px 4px 12px; }
+.chips .link { padding: 0 4px; }
+#addDeptForm input { flex: 1; }
+
+/* ---------- 領収書の拡大表示 ---------- */
 .lightbox {
   position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
   padding: 56px 12px 16px; background: rgba(0, 0, 0, 0.88);
@@ -105,52 +323,52 @@ input, select {
 .lb__nav { top: 50%; transform: translateY(-50%); width: 44px; height: 64px; border-radius: 8px; font-size: 30px; }
 .lb__prev { left: 6px; }
 .lb__next { right: 6px; }
-@media (max-width: 560px) {
-  /* 画像を広く使うため、前後のボタンは画像の上に重ねて小さめにする */
-  .lb__nav { width: 36px; height: 56px; }
-}
-.item__title { font-weight: 600; overflow-wrap: anywhere; }
-.item__title small { font-weight: 400; color: var(--muted); margin-left: 6px; }
-.item__meta { font-size: 13px; color: var(--muted); }
-.item__side { text-align: right; white-space: nowrap; font-weight: 600; }
-.item.is-rejected .item__title, .item.is-rejected .item__side { color: var(--muted); text-decoration: line-through; }
-.group {
-  display: flex; justify-content: space-between; padding: 8px 10px; margin-top: 8px;
-  background: #eef2ff; border-radius: 6px; font-weight: 600;
-}
-.acts { display: flex; gap: 10px; justify-content: flex-end; font-size: 13px; font-weight: 400; margin-top: 2px; }
-.acts .link { padding: 0; font-size: 13px; }
-.acts a { color: var(--accent); text-decoration: none; }
-.empty { text-align: center; color: var(--muted); padding: 24px; }
-
-.issued { border-color: var(--accent); }
-.code { margin: 0; font: 700 28px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
-.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.item.is-inactive .item__title { color: var(--muted); }
-
-fieldset.checks { border: 0; margin: 0; padding: 0; min-width: 0; }
-fieldset.checks legend { font-size: 13px; color: var(--muted); margin-bottom: 6px; padding: 0; }
-.checkList { display: flex; flex-wrap: wrap; gap: 8px; }
-.checkList label {
-  flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 14px;
-  border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer;
-}
-.checkList label:has(input:checked) { background: #eef2ff; border-color: var(--accent); }
-.checkList input { padding: 0; margin: 0; }
-.editDepts { width: 100%; display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
-.item.is-editing { flex-wrap: wrap; }
-.chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
-.chips li { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 6px 4px 12px; }
-.chips .link { padding: 0 4px; }
-.btn--sm { padding: 8px 14px; }
-#addDeptForm input { flex: 1; }
 
 .toast {
-  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
-  background: #111827; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px;
-  max-width: calc(100% - 32px);
+  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 60;
+  background: #111827; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 14px;
+  max-width: calc(100% - 32px); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
 
-@media (max-width: 560px) {
-  .grid { grid-template-columns: 1fr; }
+/* ---------- スマホ ---------- */
+@media (max-width: 719px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .toast { bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) + 76px); }
+  .lb__nav { width: 36px; height: 56px; }
+  .toolbar__row { align-items: stretch; }
+  .monthNav { width: 100%; }
+  .monthNav input { flex: 1; width: auto; }
+  .toolbar__right { width: 100%; justify-content: space-between; }
+}
+
+/* ---------- PC: 一覧を広く使い、集計を左・表を右に並べる ---------- */
+@media (min-width: 1100px) {
+  main#appView { max-width: 1240px; }
+  body:not(.on-list) main#appView { max-width: 760px; }
+  .listLayout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
+  .listLayout .summary { position: sticky; top: 64px; margin: 0; }
+  .listLayout .listCard { margin: 0; }
+}
+@media (min-width: 900px) {
+  /* 明細を表の列にそろえる（日付・支払先・申請者・事業部・費目・金額） */
+  .rows .exp, .rows .list__head {
+    display: grid; grid-template-areas: none; align-items: center; column-gap: 12px;
+    grid-template-columns: 44px 52px minmax(0, 2fr) var(--col-person, 0px) minmax(0, 1fr) 84px 96px 44px;
+  }
+  body.is-admin .rows { --col-person: minmax(0, 1fr); }
+  .rows .exp > .thumb, .rows .exp > .thumb-none { width: 44px; height: 44px; grid-column: 1; grid-row: 1; }
+  .rows .exp .item__meta { display: contents; }
+  .rows .exp .item__meta > span + span::before { content: none; }
+  .rows .exp .item__meta > span { grid-row: 1; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rows .exp .m-date { grid-column: 2; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .rows .exp .item__title { grid-column: 3; grid-row: 1; }
+  .rows .exp .m-person { grid-column: 4; }
+  .rows .exp .m-dept { grid-column: 5; }
+  .rows .exp .m-cat { grid-column: 6; }
+  .rows .exp .m-flag { grid-column: 3; grid-row: 2 !important; }
+  .rows .exp .item__side { grid-column: 7; grid-row: 1; }
+  .rows .exp .acts { grid-column: 8; grid-row: 1; }
+  .rows .list__head { font-size: 12px; color: var(--muted); padding: 4px 2px 8px; border-bottom: 1px solid var(--line); }
+  .rows .list__head > span:nth-child(7) { text-align: right; }
+  body:not(.is-admin) .rows .list__head .h-person { visibility: hidden; }
 }

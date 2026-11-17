@@ -8,10 +8,10 @@
   </head>
   <body>
     <header class="bar">
-      <h1>経費申請</h1>
+      <h1><span class="bar__logo" aria-hidden="true">¥</span>経費申請</h1>
       <div class="bar__user" id="userBox" hidden>
-        <span id="userName"></span>
-        <button type="button" class="link" id="logoutBtn">ログアウト</button>
+        <span class="bar__name" id="userName"></span>
+        <button type="button" class="link link--muted" id="logoutBtn">ログアウト</button>
       </div>
     </header>
 
@@ -40,52 +40,100 @@
     </main>
 
     <main id="appView" hidden>
-      <nav class="tabs">
-        <button type="button" class="tab is-active" data-tab="apply">申請</button>
-        <button type="button" class="tab" data-tab="list">一覧</button>
-        <button type="button" class="tab" data-tab="accounts" id="accountsTab" hidden>アカウント</button>
+      <!-- スマホでは画面の下、PCでは上に出す -->
+      <nav class="tabs" aria-label="画面の切り替え">
+        <button type="button" class="tab is-active" data-tab="apply"><span class="tab__icon" aria-hidden="true">📷</span><span>申請</span></button>
+        <button type="button" class="tab" data-tab="list"><span class="tab__icon" aria-hidden="true">📋</span><span>一覧</span></button>
+        <button type="button" class="tab" data-tab="accounts" id="accountsTab" hidden><span class="tab__icon" aria-hidden="true">👥</span><span>アカウント</span></button>
       </nav>
 
-      <!-- 申請 -->
-      <section data-panel="apply">
-        <form class="card" id="applyForm">
-          <label class="photo">
-            <input id="photo" type="file" accept="image/*" />
-            <img id="preview" alt="" hidden />
-            <span id="photoHint">📷 レシートを撮影・選択（AIが読み取ります）</span>
-          </label>
-          <p class="note" id="aiMsg"></p>
-          <div class="grid">
-            <label>日付<input id="fDate" type="date" required /></label>
-            <label>金額（円）<input id="fAmount" type="number" min="1" step="1" inputmode="numeric" required /></label>
-            <label>費目<select id="fCategory" required></select></label>
-            <label>事業部<select id="fDept"></select></label>
+      <!-- 申請: 撮る → AIが入れた内容を確かめる → 申請する、の3手で終わるようにする -->
+      <section data-panel="apply" class="panel panel--apply">
+        <form class="card apply" id="applyForm">
+          <div class="shot">
+            <div class="shot__empty" id="photoHint">
+              <label class="btn btn--big shot__cam">
+                <input id="photoCam" class="file" type="file" accept="image/*" capture="environment" />
+                <span aria-hidden="true">📷</span> レシートを撮る
+              </label>
+              <label class="btn btn--ghost shot__pick">
+                <input id="photo" class="file" type="file" accept="image/*" />
+                写真から選ぶ
+              </label>
+              <p class="note">撮るだけで、AIが日付・金額・支払先・費目を入れます</p>
+              <button type="button" class="link" id="manualBtn">領収書がない（写真なしで入力する）</button>
+            </div>
+            <div class="shot__done" id="shotDone" hidden>
+              <img id="preview" alt="レシート" />
+              <div class="shot__status">
+                <p class="shot__msg" id="aiMsg"></p>
+                <label class="link shot__retake">
+                  <input id="photoRetake" class="file" type="file" accept="image/*" />
+                  別の写真にする
+                </label>
+              </div>
+            </div>
           </div>
-          <label>支払先<input id="fVendor" maxlength="60" /></label>
-          <label>摘要<input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
-          <button class="btn" type="submit" id="submitBtn">申請する</button>
+
+          <!-- 入力欄は、写真を選んだとき（または写真なしで入力するとき）に開く -->
+          <div class="apply__fields" id="applyFields" hidden>
+          <label class="amount">
+            <span class="field__label">金額</span>
+            <span class="amount__box">
+              <span class="amount__yen" aria-hidden="true">¥</span>
+              <input id="fAmount" type="number" min="1" step="1" inputmode="numeric" placeholder="0" required />
+            </span>
+          </label>
+          <div class="grid2">
+            <label><span class="field__label">日付</span><input id="fDate" type="date" required /></label>
+            <label><span class="field__label">支払先</span><input id="fVendor" maxlength="60" placeholder="例: ドトール" /></label>
+          </div>
+          <div class="field">
+            <span class="field__label">費目</span>
+            <div class="chipset" id="catChips" role="radiogroup" aria-label="費目"></div>
+            <input type="hidden" id="fCategory" />
+          </div>
+          <!-- 事業部が1つの人には出さない（自動で入る） -->
+          <div class="field" id="deptField">
+            <span class="field__label">事業部</span>
+            <div class="chipset" id="deptChips" role="radiogroup" aria-label="事業部"></div>
+            <input type="hidden" id="fDept" />
+          </div>
+          <label><span class="field__label">摘要（任意）</span><input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
+          <div class="apply__bar">
+            <button class="btn btn--big" type="submit" id="submitBtn">申請する</button>
+          </div>
+          </div>
         </form>
+        <!-- 今月の自分の申請（申請が記録されたことを、その場で確かめられるように） -->
+        <button type="button" class="mine" id="mineSummary" hidden></button>
       </section>
 
       <!-- 一覧 -->
-      <section data-panel="list" hidden>
-        <div class="card">
-          <div class="filters">
-            <label>月<input id="month" type="month" /></label>
-            <button type="button" class="link" id="allMonthsBtn">全期間</button>
-            <label>並べ替え
-              <select id="sortKey">
-                <option value="date">日付</option>
-                <option value="month">月ごと</option>
-                <option value="department">事業部ごと</option>
-                <option value="applicant">人ごと</option>
-                <option value="category">費目ごと</option>
-                <option value="amount">金額</option>
-              </select>
-            </label>
-            <button type="button" class="link" id="reloadBtn">再読込</button>
+      <section data-panel="list" class="panel panel--list" hidden>
+        <div class="card toolbar">
+          <div class="toolbar__row">
+            <div class="monthNav">
+              <button type="button" class="icon-btn" id="monthPrev" aria-label="前の月">‹</button>
+              <input id="month" type="month" aria-label="月" />
+              <button type="button" class="icon-btn" id="monthNext" aria-label="次の月">›</button>
+              <button type="button" class="pill" id="allMonthsBtn">全期間</button>
+            </div>
+            <div class="toolbar__right">
+              <label class="inline">並べ替え
+                <select id="sortKey">
+                  <option value="date">日付</option>
+                  <option value="month">月ごと</option>
+                  <option value="department">事業部ごと</option>
+                  <option value="applicant">人ごと</option>
+                  <option value="category">費目ごと</option>
+                  <option value="amount">金額</option>
+                </select>
+              </label>
+              <button type="button" class="icon-btn" id="reloadBtn" aria-label="最新にする" title="最新にする">↻</button>
+            </div>
           </div>
-          <!-- 絞り込み: 事業部・人を複数選んで、その分だけ表示する（並べ替えとは別に効く） -->
+          <!-- 絞り込み: 事業部・人・費目を複数選んで、その分だけ表示する（並べ替えとは別に効く） -->
           <details class="narrow" id="narrow">
             <summary id="narrowSummary">絞り込み</summary>
             <fieldset class="checks">
@@ -96,10 +144,25 @@
               <legend>人（複数選べます）</legend>
               <div id="narrowPeople"></div>
             </fieldset>
+            <fieldset class="checks">
+              <legend>費目（複数選べます）</legend>
+              <div id="narrowCats"></div>
+            </fieldset>
             <button type="button" class="link" id="narrowClear">絞り込みをやめる</button>
           </details>
-          <p class="total" id="total"></p>
-          <ul class="list" id="rows"></ul>
+        </div>
+
+        <div class="listLayout">
+          <!-- 集計（合計・件数と、事業部・費目・人ごとの内訳）。棒をタップするとその条件で絞り込む -->
+          <aside class="card summary" id="summary" aria-label="集計"></aside>
+          <div class="card listCard">
+            <div class="totalRow">
+              <p class="total" id="total"></p>
+              <!-- 絞り込み中だけ出す。集計の棒で絞ったときも、ここから戻せる -->
+              <button type="button" class="pill is-on" id="totalClear" hidden>✕ 絞り込みをやめる</button>
+            </div>
+            <ul class="list rows" id="rows"></ul>
+          </div>
         </div>
       </section>
 
