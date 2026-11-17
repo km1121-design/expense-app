@@ -29,7 +29,9 @@ const state = {
   loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）/ "setup" = 最初の管理者の作成
   users: [], // アカウント画面の利用者一覧（管理者のみ）
   editing: "", // 事業部を編集中の利用者（username）
-  filters: { depts: new Set(), people: new Set() }, // 絞り込み（事業部名・申請者ID。空 = 絞らない）
+  filters: { depts: new Set(), people: new Set(), cats: new Set() }, // 絞り込み（事業部名・申請者ID・費目。空 = 絞らない）
+  reading: false, // AIが読み取り中（申請ボタンを止める）
+  sending: false, // 申請を送信中
   narrowSig: "", // 絞り込みの選択肢を作り直す必要があるかの判定用
 };
 
@@ -232,13 +234,17 @@ function showApp() {
   $("#userBox").hidden = false;
   $("#userName").textContent = `${u.displayName}${isAdmin() ? "（管理者）" : ""}`;
   $("#accountsTab").hidden = !isAdmin();
+  document.body.classList.toggle("is-admin", isAdmin()); // PCの表に申請者の列を出すか
   if (!isAdmin() && !$('[data-panel="accounts"]').hidden) switchTab("apply");
   fillDepartments();
+  updateSubmit();
   render();
 }
 
 function switchTab(name) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("is-active", b.dataset.tab === name));
+  document.body.classList.toggle("on-list", name === "list"); // PCでは一覧だけ横幅を広く使う
+  window.scrollTo(0, 0);
   document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = p.dataset.panel !== name));
   if (name === "accounts") loadUsers();
 }
@@ -248,17 +254,52 @@ function splitDepts(v) {
   return [...new Set(String(v || "").split(/[,、]/).map((d) => d.trim()).filter(Boolean))];
 }
 
-/** 申請の事業部: 自分に割り当てられた事業部から選ぶ（未割り当てなら全事業部） */
+/* ---------- 申請フォームの選択肢（ボタンで選ぶ） ---------- */
+/** ボタン型の選択肢を描く。押したものだけ is-on になり、値は隠し入力へ入る */
+function renderChips(box, input, values, labelOf) {
+  const cur = $(input).value;
+  $(box).innerHTML = values
+    .map(
+      (v) =>
+        `<button type="button" class="chip${v === cur ? " is-on" : ""}" role="radio" aria-checked="${v === cur}" data-v="${esc(v)}">${esc(labelOf ? labelOf(v) : v)}</button>`
+    )
+    .join("");
+}
+function setChip(box, input, v) {
+  $(input).value = v;
+  $(box)
+    .querySelectorAll(".chip")
+    .forEach((c) => {
+      const on = c.dataset.v === v;
+      c.classList.toggle("is-on", on);
+      c.setAttribute("aria-checked", on);
+    });
+  $(box).closest(".field").classList.remove("is-missing");
+}
+const renderCategoryChips = () => renderChips("#catChips", "#fCategory", CATEGORIES);
+const setCategory = (v) => setChip("#catChips", "#fCategory", CATEGORIES.includes(v) ? v : "");
+const lastDeptKey = () => "expense-app:lastDept:" + ((state.session && state.session.user.username) || "");
+
+/**
+ * 申請の事業部。自分に割り当てられた事業部から選ぶ（未割り当てなら全事業部から）。
+ * 1つしかない人には欄を出さない（自動で入る）。複数ある人は、前回選んだものが最初から入る。
+ */
 function fillDepartments() {
   const mine = splitDepts(state.session && state.session.user.department);
-  const list = mine.length ? mine : state.departments;
-  $("#fDept").innerHTML =
-    (mine.length ? "" : '<option value="">（未設定）</option>') +
-    list.map((d) => `<option>${esc(d)}</option>`).join("");
-  $("#fDept").value = mine[0] || "";
+  const list = mine.length ? mine : ["", ...state.departments];
+  let initial = mine[0] || "";
+  try {
+    const last = localStorage.getItem(lastDeptKey());
+    if (last != null && list.includes(last)) initial = last;
+  } catch {
+    /* 端末に保存できない環境では先頭のまま */
+  }
+  $("#fDept").value = initial;
+  renderChips("#deptChips", "#fDept", list, (d) => d || "（未設定）");
+  $("#deptField").hidden = mine.length === 1;
 }
 
-/** 事業部のチェックボックス群。マスタから消えた事業部も、付いていれば外せるように出す */
+/** 事業部のチェックボックス群。/** 事業部のチェックボックス群。マスタから消えた事業部も、付いていれば外せるように出す */
 function deptChecks(name, selected) {
   const all = [...state.departments, ...selected.filter((d) => !state.departments.includes(d))];
   return (
@@ -304,8 +345,10 @@ async function sync() {
 async function start() {
   state.endpoint = (readJson(CONFIG_KEY, {}) || {}).endpoint || "";
   state.session = readJson(SESSION_KEY, null);
-  CATEGORIES.forEach((c) => $("#fCategory").insertAdjacentHTML("beforeend", `<option>${c}</option>`));
+  renderCategoryChips();
   $("#fDate").value = today();
+  // PCでは集計の内訳を最初から開いておく（スマホでは合計だけ見せて、内訳は畳む）
+  state.wideScreen = window.matchMedia && window.matchMedia("(min-width: 1100px)").matches;
   $("#month").value = today().slice(0, 7);
 
   // 案内リンク（…/#api=<URL>&code=<利用コード>）から開いたとき。
@@ -433,60 +476,102 @@ function shrink(file) {
   });
 }
 
-async function onPhoto() {
-  const file = $("#photo").files[0];
+function setAiMsg(text, kind) {
+  const msg = $("#aiMsg");
+  msg.textContent = text;
+  msg.classList.toggle("is-reading", kind === "reading");
+  msg.classList.toggle("is-warn", kind === "warn");
+}
+
+async function onPhoto(e) {
+  const input = e.target;
+  const file = input.files[0];
+  input.value = ""; // 同じ写真を選び直しても反応するように
   if (!file) return;
   const gen = ++state.analyzing;
-  const msg = $("#aiMsg");
   const dataUrl = await shrink(file);
   if (gen !== state.analyzing) return;
   if (!dataUrl) {
     state.image = null;
-    msg.textContent = "画像を読み込めませんでした。別の画像を選んでください";
+    $("#photoHint").hidden = true;
+    $("#shotDone").hidden = false;
+    $("#preview").removeAttribute("src");
+    setAiMsg("画像を読み込めませんでした。別の写真にしてください", "warn");
     return;
   }
   state.image = { base64: dataUrl.split(",")[1], mime: "image/jpeg" };
   $("#preview").src = dataUrl;
-  $("#preview").hidden = false;
   $("#photoHint").hidden = true;
+  $("#shotDone").hidden = false;
+  $("#applyFields").hidden = false;
 
-  msg.textContent = "AIで読み取り中…（数秒かかります）";
+  setAiMsg("AIで読み取り中…", "reading");
+  state.reading = true;
+  updateSubmit();
   try {
     const data = await api({ action: "analyzeReceipt", imageBase64: state.image.base64, imageMime: state.image.mime });
     if (gen !== state.analyzing) return; // 別の画像に差し替えられた
     const f = data.fields || {};
     if (f.date) $("#fDate").value = f.date;
     if (f.amount) $("#fAmount").value = f.amount;
-    if (f.category && CATEGORIES.includes(f.category)) $("#fCategory").value = f.category;
+    if (f.category && CATEGORIES.includes(f.category)) setCategory(f.category);
     if (f.vendor) $("#fVendor").value = f.vendor;
     if (f.description) $("#fDesc").value = f.description;
     const missing = [!f.date && "日付", !f.amount && "金額"].filter(Boolean);
-    msg.textContent = missing.length
-      ? `読み取れなかった項目（${missing.join("・")}）を入力してください`
-      : "読み取りました。内容を確認して申請してください";
+    if (missing.length) setAiMsg(`${missing.join("・")}を読み取れませんでした。入力してください`, "warn");
+    else setAiMsg("✓ 読み取りました。確認して申請してください");
   } catch (err) {
     if (gen !== state.analyzing) return;
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
-    msg.textContent = "AIで読み取れませんでした。手入力で申請できます（" + err.message + "）";
+    setAiMsg("AIで読み取れませんでした。手で入力すれば申請できます（" + err.message + "）", "warn");
+  } finally {
+    if (gen === state.analyzing) {
+      state.reading = false;
+      updateSubmit();
+    }
   }
+}
+
+/** 申請ボタン: 読み取り中・送信中は押せない。金額が入っていれば、その金額を出す */
+function updateSubmit() {
+  const btn = $("#submitBtn");
+  const amount = Math.round(Number($("#fAmount").value) || 0);
+  btn.disabled = state.reading || state.sending;
+  btn.textContent = state.sending
+    ? "送信中…"
+    : state.reading
+      ? "読み取り中…"
+      : amount > 0
+        ? `申請する（${yen(amount)}）`
+        : "申請する";
 }
 
 function resetForm() {
   state.analyzing++;
   state.image = null;
+  state.reading = false;
   $("#applyForm").reset();
-  $("#preview").hidden = true;
   $("#preview").removeAttribute("src");
+  $("#shotDone").hidden = true;
   $("#photoHint").hidden = false;
-  $("#aiMsg").textContent = "";
+  $("#applyFields").hidden = true; // 次のレシートは、また「撮る」から
+  $("#manualBtn").hidden = false;
+  setAiMsg("");
   $("#fDate").value = today();
+  setCategory("");
   fillDepartments();
+  updateSubmit();
 }
 
 /* ---------- 申請 ---------- */
 async function onSubmit(e) {
   e.preventDefault();
-  const btn = $("#submitBtn");
+  if (!$("#fCategory").value) {
+    // 費目はボタンで選ぶので、ブラウザの必須チェックが効かない。ここで止める
+    $("#catChips").closest(".field").classList.add("is-missing");
+    $("#catChips").scrollIntoView({ behavior: "smooth", block: "center" });
+    return toast("費目を選んでください");
+  }
   const record = {
     id: "e" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     createdAt: new Date().toISOString(),
@@ -501,23 +586,43 @@ async function onSubmit(e) {
     record.imageBase64 = state.image.base64;
     record.imageMime = state.image.mime;
   }
-  btn.disabled = true;
-  btn.textContent = "送信中…";
+  state.sending = true;
+  updateSubmit();
   try {
     const data = await api({ action: "create", record });
+    try {
+      localStorage.setItem(lastDeptKey(), record.department); // 次回の事業部の初期値
+    } catch {
+      /* 保存できなくても申請はできている */
+    }
     // 保存済みのレコードが返るので、一覧を取り直さずにそのまま加える
     addToMonths(normalize(data.record || record));
     persistMonths();
+    state.sending = false;
     resetForm();
     render();
-    toast(`申請しました（${yen(record.amount)}）`);
+    window.scrollTo(0, 0); // 続けて次のレシートを撮れるように
+    toast(`✓ 申請しました（${yen(record.amount)}）`);
   } catch (err) {
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました。もう一度ログインして申請してください");
     toast("申請できませんでした: " + err.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = "申請する";
+    state.sending = false;
+    updateSubmit();
   }
+}
+
+/** 申請画面の下に出す「今月の自分の申請」。申請が記録されたことをその場で確かめられる */
+function renderMine() {
+  const recs = state.months[today().slice(0, 7)];
+  const me = state.session && state.session.user.username;
+  const box = $("#mineSummary");
+  if (!recs || !me) return (box.hidden = true);
+  const mine = recs.filter((r) => r.applicantId === me && !isRejected(r));
+  box.innerHTML =
+    `<span>今月のあなたの申請　<b>${mine.length}件　${yen(mine.reduce((s, r) => s + r.amount, 0))}</b></span>` +
+    "<span>一覧で見る ›</span>";
+  box.hidden = false;
 }
 
 /* ---------- 一覧 ---------- */
@@ -539,7 +644,19 @@ function sortRecords(list, key) {
   );
 }
 
+/** 絞り込みに合うか。except に挙げた条件は見ない（集計の各内訳は、自分以外の条件で絞る） */
+function passes(r, except) {
+  const { depts, people, cats } = state.filters;
+  return (
+    (except === "dept" || !depts.size || depts.has(r.department)) &&
+    (except === "person" || !isAdmin() || !people.size || people.has(r.applicantId)) &&
+    (except === "cat" || !cats.size || cats.has(r.category))
+  );
+}
+
 function render() {
+  renderMine();
+  $("#allMonthsBtn").classList.toggle("is-on", !$("#month").value);
   const month = $("#month").value;
   const key = $("#sortKey").value;
   const me = state.session ? state.session.user.username : "";
@@ -548,18 +665,17 @@ function render() {
     // まだ取得できていない月（取得に失敗したときは、その旨を出す）
     const failed = state.failedKey === monthKey();
     $("#total").textContent = failed ? "" : "読み込み中…";
-    $("#rows").innerHTML = `<li class="empty">${failed ? "取得できませんでした。「再読込」を押してください" : "読み込み中…"}</li>`;
+    $("#rows").innerHTML = `<li class="empty">${failed ? "取得できませんでした。↻ を押してください" : "読み込み中…"}</li>`;
+    $("#summary").hidden = true;
+    $("#totalClear").hidden = true;
     return;
   }
   renderNarrow(recs);
-  const { depts, people } = state.filters;
-  const narrowed = depts.size > 0 || (isAdmin() && people.size > 0);
-  const list = sortRecords(
-    recs.filter(
-      (r) => (!depts.size || depts.has(r.department)) && (!isAdmin() || !people.size || people.has(r.applicantId))
-    ),
-    key
-  );
+  const { depts, people, cats } = state.filters;
+  const narrowed = depts.size > 0 || cats.size > 0 || (isAdmin() && people.size > 0);
+  const list = sortRecords(recs.filter((r) => passes(r)), key);
+  renderSummary(recs, list);
+  $("#totalClear").hidden = !narrowed;
   state.shown = list; // 領収書の拡大表示が、いま並んでいる順に前後へ移るために持つ
   const sum = (rs) => rs.reduce((s, r) => s + (isRejected(r) ? 0 : r.amount), 0);
   $("#total").textContent = `${month ? month.replace("-", "年") + "月" : "全期間"}　${
@@ -570,7 +686,11 @@ function render() {
     $("#rows").innerHTML = `<li class="empty">${narrowed ? "条件に合う申請はありません" : "この月の申請はありません"}</li>`;
     return;
   }
-  const html = [];
+  // PCでは表の見出し（スマホでは隠れる）
+  const html = [
+    '<li class="list__head" aria-hidden="true"><span>領収書</span><span>日付</span><span>支払先・摘要</span>' +
+      '<span class="h-person">申請者</span><span>事業部</span><span>費目</span><span>金額</span><span></span></li>',
+  ];
   let current = null;
   list.forEach((r) => {
     if (GROUP_KEYS[key] && r[key] !== current) {
@@ -583,31 +703,118 @@ function render() {
       );
     }
     const canDelete = isAdmin() || r.applicantId === me;
-    // 申請者は管理者にだけ出す（一般ユーザーは自分の分しか見ないため）
-    const meta = [r.date.slice(5).replace("-", "/"), isAdmin() && r.applicant, r.department, r.category, isRejected(r) && "却下"]
-      .filter(Boolean)
-      .map(esc)
-      .join("・");
     const fid = fileIdOf(r);
+    // 日付・申請者・事業部・費目は、スマホでは1行に並べ、PCでは表の列になる（CSSで切り替え）。
+    // 申請者は管理者にだけ出す（一般ユーザーは自分の分しか見ないため）
+    const meta =
+      `<span class="m-date">${esc(r.date.slice(5).replace("-", "/"))}</span>` +
+      (isAdmin() ? `<span class="m-person">${esc(r.applicant)}</span>` : "") +
+      `<span class="m-dept">${esc(r.department || "（未設定）")}</span>` +
+      `<span class="m-cat"><span class="tag" data-cat="${esc(r.category)}">${esc(r.category || "（なし）")}</span></span>` +
+      (isRejected(r) ? '<span class="m-flag flag">却下</span>' : "");
     html.push(
-      `<li class="item${isRejected(r) ? " is-rejected" : ""}">` +
+      `<li class="item exp${isRejected(r) ? " is-rejected" : ""}">` +
         (fid
           ? `<button type="button" class="thumb" data-view="${esc(r.id)}" aria-label="領収書を拡大">` +
             `<img src="${esc(thumbUrl(fid, 160))}" alt="領収書" loading="lazy" referrerpolicy="no-referrer" /></button>`
-          : "") +
-        `<div class="item__main"><div class="item__title">${esc(r.vendor || r.category || "（支払先なし）")}` +
+          : r.imageUrl
+            ? `<a class="thumb-none" href="${esc(r.imageUrl)}" target="_blank" rel="noopener" title="領収書を開く">🧾</a>`
+            : '<span class="thumb-none" title="領収書なし">なし</span>') +
+        `<div class="item__title">${esc(r.vendor || r.category || "（支払先なし）")}` +
         `${r.description ? `<small>${esc(r.description)}</small>` : ""}</div>` +
-        `<div class="item__meta">${meta}</div></div>` +
-        `<div class="item__side">${yen(r.amount)}<div class="acts">` +
-        `${!fid && r.imageUrl ? `<a href="${esc(r.imageUrl)}" target="_blank" rel="noopener">🧾領収書</a>` : ""}` +
-        `${canDelete ? `<button type="button" class="link danger" data-del="${esc(r.id)}">削除</button>` : ""}` +
-        `</div></div></li>`
+        `<div class="item__meta">${meta}</div>` +
+        `<div class="item__side">${yen(r.amount)}</div>` +
+        `<div class="acts">${canDelete ? `<button type="button" class="link danger" data-del="${esc(r.id)}">削除</button>` : ""}</div>` +
+        `</li>`
     );
   });
   $("#rows").innerHTML = html.join("");
 }
 
-/* ---------- 絞り込み（事業部・人を複数選ぶ） ---------- */
+/* ---------- 集計（合計・件数・内訳の棒） ---------- */
+/**
+ * 一覧の上（PCでは左）に出す。合計・件数は絞り込んだ後の値。内訳の棒は、その内訳以外の
+ * 条件で絞った値にする（「事業部別」を見ながら事業部を2つ3つ選び足せるように）。
+ * 棒を押すと、その条件で絞り込む（もう一度押すと外れる）。計算は手元だけで、通信は増えない。
+ */
+function renderSummary(recs, list) {
+  const box = $("#summary");
+  const live = (rs) => rs.filter((r) => !isRejected(r));
+  const total = live(list).reduce((s, r) => s + r.amount, 0);
+  const people = new Set(live(list).map((r) => r.applicantId)).size;
+  const noReceipt = live(list).filter((r) => !fileIdOf(r) && !r.imageUrl).length;
+  const kpi = (label, value, cls) =>
+    `<div class="kpi${cls ? " " + cls : ""}"><span class="kpi__label">${label}</span><span class="kpi__value">${value}</span></div>`;
+  const facet = (title, kind, keyOf, labelOf) => {
+    const sums = new Map();
+    live(recs.filter((r) => passes(r, kind))).forEach((r) => {
+      const k = keyOf(r);
+      const cur = sums.get(k) || { sum: 0, label: labelOf(r) };
+      cur.sum += r.amount;
+      sums.set(k, cur);
+    });
+    const rows = [...sums.entries()].sort((a, b) => b[1].sum - a[1].sum);
+    if (!rows.length) return "";
+    const max = rows[0][1].sum || 1;
+    const on = state.filters[{ dept: "depts", person: "people", cat: "cats" }[kind]];
+    const shown = rows.slice(0, 8);
+    const rest = rows.slice(8);
+    return (
+      `<section class="bars"><h3>${title}</h3>` +
+      shown
+        .map(
+          ([k, v]) =>
+            `<button type="button" class="barRow${on.has(k) ? " is-on" : ""}" data-facet="${kind}" data-v="${esc(k)}" title="${esc(v.label)}で絞り込む">` +
+            `<span class="barRow__label">${esc(v.label)}</span>` +
+            `<span class="barRow__track"><span class="barRow__fill" style="width:${Math.round((v.sum / max) * 100)}%"></span></span>` +
+            `<span class="barRow__val">${yen(v.sum)}</span></button>`
+        )
+        .join("") +
+      (rest.length ? `<div class="bars__rest">ほか ${rest.length}件 ${yen(rest.reduce((s, [, v]) => s + v.sum, 0))}</div>` : "") +
+      "</section>"
+    );
+  };
+  const kpis =
+    '<div class="kpis">' +
+    kpi("合計", yen(total), "kpi--main") +
+    kpi("件数", `${live(list).length}件`) +
+    (isAdmin() ? kpi("申請した人", `${people}人`) : "") +
+    kpi("領収書なし", `${noReceipt}件`, noReceipt ? "kpi--warn" : "") +
+    "</div>";
+  const facets =
+    (isAdmin() ? facet("事業部別", "dept", (r) => r.department, (r) => r.department || "（未設定）") : "") +
+    facet("費目別", "cat", (r) => r.category, (r) => r.category || "（なし）") +
+    (isAdmin() ? facet("人別", "person", (r) => r.applicantId, (r) => r.applicant || r.applicantId) : "");
+  const open = box.querySelector(".breakdown") ? box.querySelector(".breakdown").open : state.wideScreen;
+  box.innerHTML =
+    kpis +
+    (facets
+      ? `<details class="breakdown"${open ? " open" : ""}><summary>内訳（${isAdmin() ? "事業部・費目・人" : "費目"}）</summary>${facets}</details>`
+      : "");
+  box.hidden = !recs.length;
+}
+
+function onSummaryClick(e) {
+  const bar = e.target.closest("[data-facet]");
+  if (!bar) return;
+  const set = state.filters[{ dept: "depts", person: "people", cat: "cats" }[bar.dataset.facet]];
+  const v = bar.dataset.v;
+  if (set.has(v)) set.delete(v);
+  else set.add(v);
+  state.narrowSig = ""; // 絞り込み欄のチェックも合わせる
+  render();
+}
+
+/** 月を1つ前・次へ（全期間を表示中なら今月から） */
+function shiftMonth(d) {
+  const base = $("#month").value || today().slice(0, 7);
+  const [y, m] = base.split("-").map(Number);
+  const t = new Date(y, m - 1 + d, 1);
+  $("#month").value = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}`;
+  loadMonth();
+}
+
+/* ---------- 絞り込み（事業部・人・費目を複数選ぶ） ---------- */
 /**
  * 選択肢は、いま読み込んでいる月の申請に出てくる事業部・人。選んだものは、
  * 別の月へ切り替えて申請が無くても選択肢に残す（絞り込み中なのに見えない、を避ける）。
@@ -621,7 +828,10 @@ function renderNarrow(recs) {
   const depts = [...deptSet].sort((a, b) => a.localeCompare(b, "ja"));
   const names = [...people.entries()].sort((a, b) => a[1].localeCompare(b[1], "ja"));
   const dup = (name) => names.filter((n) => n[1] === name).length > 1; // 同名がいれば IDも添える
-  const sig = JSON.stringify([depts, names, isAdmin()]);
+  const cats = [...new Set([...recs.map((r) => r.category), ...state.filters.cats])].sort(
+    (a, b) => CATEGORIES.indexOf(a) - CATEGORIES.indexOf(b)
+  );
+  const sig = JSON.stringify([depts, names, cats, isAdmin()]);
   if (sig !== state.narrowSig) {
     state.narrowSig = sig;
     const box = (name, value, label, on) =>
@@ -636,23 +846,29 @@ function renderNarrow(recs) {
         .map(([id, name]) => box("np", id, dup(name) ? `${name}（${id}）` : name, state.filters.people.has(id)))
         .join("") +
       "</div>";
+    $("#narrowCats").innerHTML =
+      '<div class="checkList">' + cats.map((c) => box("nc", c, c || "（なし）", state.filters.cats.has(c))).join("") + "</div>";
   }
   $("#narrowPeopleBox").hidden = !isAdmin(); // 一般ユーザーは自分の分しか見ないので、人では絞らない
   const nd = state.filters.depts.size;
   const np = isAdmin() ? state.filters.people.size : 0;
-  $("#narrow").classList.toggle("is-active", nd + np > 0);
+  const nc = state.filters.cats.size;
+  $("#narrow").classList.toggle("is-active", nd + np + nc > 0);
   $("#narrowSummary").textContent =
-    nd + np > 0 ? `絞り込み中（${[nd && `事業部 ${nd}`, np && `人 ${np}`].filter(Boolean).join("・")}）` : "絞り込み";
+    nd + np + nc > 0
+      ? `絞り込み中（${[nd && `事業部 ${nd}`, np && `人 ${np}`, nc && `費目 ${nc}`].filter(Boolean).join("・")}）`
+      : "絞り込み";
 }
 
 function onNarrowChange() {
   state.filters.depts = new Set(checkedValues($("#narrowDepts"), "nd"));
   state.filters.people = new Set(checkedValues($("#narrowPeople"), "np"));
+  state.filters.cats = new Set(checkedValues($("#narrowCats"), "nc"));
   render();
 }
 
 function clearNarrow() {
-  state.filters = { depts: new Set(), people: new Set() };
+  state.filters = { depts: new Set(), people: new Set(), cats: new Set() };
   state.narrowSig = ""; // 選択肢を作り直して、チェックを外す
   render();
 }
@@ -950,7 +1166,30 @@ $("#copyInviteBtn").addEventListener("click", onCopyInvite);
 $("#addDeptForm").addEventListener("submit", onAddDept);
 $("#deptRows").addEventListener("click", onDeptRowsClick);
 $("#closeIssuedBtn").addEventListener("click", () => ($("#issued").hidden = true));
-$("#photo").addEventListener("change", onPhoto);
+["#photo", "#photoCam", "#photoRetake"].forEach((s) => $(s).addEventListener("change", onPhoto));
+$("#fAmount").addEventListener("input", updateSubmit);
+// 領収書がないとき（交通費など）は、写真なしで入力欄を開く
+$("#manualBtn").addEventListener("click", () => {
+  $("#applyFields").hidden = false;
+  $("#manualBtn").hidden = true;
+  $("#fAmount").focus();
+});
+$("#catChips").addEventListener("click", (e) => {
+  const c = e.target.closest(".chip");
+  if (c) setCategory(c.dataset.v);
+});
+$("#deptChips").addEventListener("click", (e) => {
+  const c = e.target.closest(".chip");
+  if (c) setChip("#deptChips", "#fDept", c.dataset.v);
+});
+$("#mineSummary").addEventListener("click", () => {
+  $("#month").value = today().slice(0, 7);
+  switchTab("list");
+  loadMonth();
+});
+$("#summary").addEventListener("click", onSummaryClick);
+$("#monthPrev").addEventListener("click", () => shiftMonth(-1));
+$("#monthNext").addEventListener("click", () => shiftMonth(1));
 $("#applyForm").addEventListener("submit", onSubmit);
 $("#month").addEventListener("change", loadMonth);
 $("#sortKey").addEventListener("change", render);
@@ -966,6 +1205,7 @@ $("#rows").addEventListener(
 );
 $("#narrow").addEventListener("change", onNarrowChange);
 $("#narrowClear").addEventListener("click", clearNarrow);
+$("#totalClear").addEventListener("click", clearNarrow);
 $("#allMonthsBtn").addEventListener("click", () => {
   $("#month").value = "";
   loadMonth();
