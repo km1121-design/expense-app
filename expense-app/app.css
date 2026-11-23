@@ -139,6 +139,49 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .apply__fields { display: flex; flex-direction: column; gap: 12px; }
 #manualBtn { font-size: 13px; }
 .amount { gap: 4px; }
+
+/* よく使う申請 */
+.quick { display: flex; flex-direction: column; gap: 8px; }
+.quick__head { display: flex; justify-content: space-between; align-items: center; }
+.quick__head .link { font-size: 13px; padding: 0; }
+.quick__list { display: flex; flex-direction: column; gap: 6px; }
+.quickItem {
+  font: inherit; text-align: left; cursor: pointer; color: var(--text); width: 100%;
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 12px; background: #fff;
+}
+.quickItem:hover { border-color: var(--accent); }
+.quickItem__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.quickItem__amt { font-variant-numeric: tabular-nums; color: var(--muted); }
+.quickItem__del { color: var(--danger); font-size: 13px; }
+.tplBar {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 10px 12px; border-radius: 10px; background: var(--accent-weak); font-size: 14px;
+}
+.tplBar .link { white-space: nowrap; flex-shrink: 0; }
+.link--left { align-self: flex-start; padding: 0; font-size: 14px; }
+
+/* 日付を複数選ぶカレンダー */
+.cal { border: 1px solid var(--line); border-radius: 12px; padding: 8px; background: #fff; }
+.cal__head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-weight: 600; }
+.cal__head .icon-btn { width: 34px; height: 34px; font-size: 18px; }
+.cal__grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.cal__dow { text-align: center; font-size: 11px; color: var(--muted); padding: 2px 0; }
+.cal__dow:first-child { color: var(--danger); }
+.cal__day {
+  font: inherit; font-size: 14px; aspect-ratio: 1 / 1; min-height: 36px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 10px; background: #f6f7f9; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cal__day.is-today { border-color: var(--accent); }
+.cal__day.is-on { background: var(--accent); color: #fff; font-weight: 700; }
+.cal__day:disabled { background: none; color: #c9ced6; cursor: default; }
+.cal__foot { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; font-size: 13px; color: var(--muted); }
+.cal__foot .link { font-size: 13px; padding: 0; }
+
+.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; cursor: pointer; }
+.check input { width: 20px; height: 20px; margin: 0; flex: none; }
+.check small { color: var(--muted); margin-left: 4px; }
 .amount__box {
   display: flex; align-items: center; gap: 6px; padding: 4px 12px;
   border: 1px solid var(--line); border-radius: 12px; background: #fff;
