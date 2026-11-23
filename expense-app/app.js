@@ -31,6 +31,12 @@ const state = {
   editing: "", // 事業部を編集中の利用者（username）
   filters: { depts: new Set(), people: new Set(), cats: new Set() }, // 絞り込み（事業部名・申請者ID・費目。空 = 絞らない）
   reading: false, // AIが読み取り中（申請ボタンを止める）
+  templates: [], // よく使う申請（自分の分。起動時に bootstrap で受け取る）
+  quickEdit: false, // よく使う申請の編集中（✕で消せる）
+  mode: "", // 入力の始め方: "photo" / "manual" / "template"
+  datesMode: false, // 日付を複数選んでまとめて申請する
+  dates: new Set(), // 選んだ日付（yyyy-MM-dd）
+  calMonth: "", // カレンダーに出している月（yyyy-MM）
   sending: false, // 申請を送信中
   narrowSig: "", // 絞り込みの選択肢を作り直す必要があるかの判定用
 };
@@ -238,6 +244,7 @@ function showApp() {
   if (!isAdmin() && !$('[data-panel="accounts"]').hidden) switchTab("apply");
   fillDepartments();
   updateSubmit();
+  renderQuick();
   render();
 }
 
@@ -339,6 +346,7 @@ async function sync() {
   state.departments = data.departments || [];
   setMonth(key, data.records || []);
   persistMonths();
+  if (Array.isArray(data.templates)) setTemplates(data.templates); // 読めなかったとき（null）は手元の分のまま
   showApp();
 }
 
@@ -375,6 +383,7 @@ async function start() {
   if (!state.endpoint || !state.session) return showLogin("");
 
   // 通信の前に前回の一覧を描く（白い画面を見せない）
+  state.templates = readJson(templatesKey(), []) || []; // よく使う申請も、通信の前に出す
   const cache = readJson(CACHE_KEY, null);
   if (cache && cache.user === state.session.user.username && cache.months) {
     // 古い版が残したキャッシュは項目が足りないので、今の形へ作り直す
@@ -446,6 +455,7 @@ function toggleLoginMode() {
 function logout() {
   state.session = null;
   state.users = [];
+  state.templates = [];
   $("#issued").hidden = true;
   state.months = {};
   writeJson(SESSION_KEY, null);
@@ -503,7 +513,7 @@ async function onPhoto(e) {
   $("#preview").src = dataUrl;
   $("#photoHint").hidden = true;
   $("#shotDone").hidden = false;
-  $("#applyFields").hidden = false;
+  openFields("photo");
 
   setAiMsg("AIで読み取り中…", "reading");
   state.reading = true;
@@ -536,14 +546,19 @@ async function onPhoto(e) {
 function updateSubmit() {
   const btn = $("#submitBtn");
   const amount = Math.round(Number($("#fAmount").value) || 0);
-  btn.disabled = state.reading || state.sending;
+  const days = state.datesMode ? state.dates.size : 1;
+  btn.disabled = state.reading || state.sending || days === 0;
   btn.textContent = state.sending
     ? "送信中…"
     : state.reading
       ? "読み取り中…"
-      : amount > 0
-        ? `申請する（${yen(amount)}）`
-        : "申請する";
+      : days === 0
+        ? "日付を選んでください"
+        : days > 1
+          ? `${days}日分を申請する（${yen(amount * days)}）`
+          : amount > 0
+            ? `申請する（${yen(amount)}）`
+            : "申請する";
 }
 
 function resetForm() {
@@ -556,11 +571,216 @@ function resetForm() {
   $("#photoHint").hidden = false;
   $("#applyFields").hidden = true; // 次のレシートは、また「撮る」から
   $("#manualBtn").hidden = false;
+  $("#tplBar").hidden = true;
+  $(".shot").hidden = false;
+  state.mode = "";
+  setDatesMode(false);
   setAiMsg("");
   $("#fDate").value = today();
   setCategory("");
   fillDepartments();
   updateSubmit();
+  renderQuick();
+}
+
+/* ---------- 入力の始め方（写真・写真なし・よく使う申請） ---------- */
+function openFields(mode) {
+  state.mode = mode;
+  $("#applyFields").hidden = false;
+  $("#quick").hidden = true;
+  $("#multiDateBtn").hidden = mode !== "manual"; // 領収書の写真は1日分なので、まとめて申請は写真なしのときだけ
+  $("#saveTplRow").hidden = mode === "template"; // よく使う申請から始めたときは、もう登録済み
+}
+
+function openManual() {
+  $("#manualBtn").hidden = true;
+  openFields("manual");
+  $("#fAmount").focus();
+}
+
+/** よく使う申請から始める: 内容を入れ、日付は今日を選んだカレンダーにする */
+function startTemplate(id) {
+  const t = state.templates.find((x) => x.id === id);
+  if (!t) return;
+  $(".shot").hidden = true;
+  $("#tplBar").hidden = false;
+  $("#tplName").textContent = t.name;
+  openFields("template");
+  $("#fAmount").value = t.amount;
+  $("#fVendor").value = t.vendor;
+  $("#fDesc").value = t.description;
+  setCategory(t.category);
+  const depts = [...$("#deptChips").querySelectorAll(".chip")].map((c) => c.dataset.v);
+  if (t.department && depts.includes(t.department)) setChip("#deptChips", "#fDept", t.department);
+  setDatesMode(true);
+  updateSubmit();
+  window.scrollTo(0, 0);
+}
+
+/** よく使う申請のボタン（写真・入力を始める前だけ出す） */
+function renderQuick() {
+  const box = $("#quick");
+  const list = state.templates || [];
+  if (!list.length) state.quickEdit = false;
+  box.hidden = !list.length || !$("#applyFields").hidden;
+  $("#quickEdit").textContent = state.quickEdit ? "完了" : "編集";
+  $("#quickList").innerHTML = list
+    .map(
+      (t) =>
+        `<button type="button" class="quickItem" data-tpl="${esc(t.id)}">` +
+        `<span aria-hidden="true">${t.category === "交通費" ? "🚃" : "⭐"}</span>` +
+        `<span class="quickItem__name">${esc(t.name)}</span>` +
+        `<span class="quickItem__amt">${yen(t.amount)}</span>` +
+        (state.quickEdit ? '<span class="quickItem__del">✕ 消す</span>' : "") +
+        "</button>"
+    )
+    .join("");
+}
+
+const templatesKey = () => "expense-app:templates:" + ((state.session && state.session.user.username) || "");
+function setTemplates(list) {
+  state.templates = list || [];
+  writeJson(templatesKey(), state.templates); // 次に開いたとき、通信を待たずに出す
+  renderQuick();
+}
+
+async function onQuickClick(e) {
+  const item = e.target.closest("[data-tpl]");
+  if (!item) return;
+  const t = state.templates.find((x) => x.id === item.dataset.tpl);
+  if (!t) return;
+  if (!state.quickEdit) return startTemplate(t.id);
+  if (!confirm(`「${t.name}」をよく使う申請から消しますか？`)) return;
+  try {
+    const data = await api({ action: "deleteTemplate", id: t.id });
+    setTemplates(data.templates);
+    toast("消しました");
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("消せませんでした: " + err.message);
+  }
+}
+
+/* ---------- 日付を複数選ぶ ---------- */
+function setDatesMode(on) {
+  state.datesMode = on;
+  $("#dateField").hidden = on;
+  $("#fDate").required = !on; // 隠した必須項目があると、ブラウザが送信を止めてしまう
+  $("#datesField").hidden = !on;
+  if (on) {
+    state.dates = new Set([$("#fDate").value || today()]);
+    state.calMonth = [...state.dates][0].slice(0, 7);
+    $("#multiDateBtn").hidden = true;
+    renderCal();
+  } else {
+    state.dates = new Set();
+  }
+  updateSubmit();
+}
+
+function renderCal() {
+  const [y, m] = state.calMonth.split("-").map(Number);
+  const first = new Date(y, m - 1, 1);
+  const days = new Date(y, m, 0).getDate();
+  const t = today();
+  const p = (n) => String(n).padStart(2, "0");
+  const cells = [];
+  for (let i = 0; i < first.getDay(); i++) cells.push("<span></span>");
+  for (let d = 1; d <= days; d++) {
+    const ds = `${y}-${p(m)}-${p(d)}`;
+    cells.push(
+      `<button type="button" class="cal__day${state.dates.has(ds) ? " is-on" : ""}${ds === t ? " is-today" : ""}" ` +
+        `data-day="${ds}" aria-pressed="${state.dates.has(ds)}"${ds > t ? " disabled" : ""}>${d}</button>`
+    );
+  }
+  const n = state.dates.size;
+  $("#cal").innerHTML =
+    `<div class="cal__head"><button type="button" class="icon-btn" data-cal="-1" aria-label="前の月">‹</button>` +
+    `<span>${y}年${m}月</span>` +
+    `<button type="button" class="icon-btn" data-cal="1" aria-label="次の月"${state.calMonth >= t.slice(0, 7) ? " disabled" : ""}>›</button></div>` +
+    '<div class="cal__grid">' +
+    ["日", "月", "火", "水", "木", "金", "土"].map((w) => `<span class="cal__dow">${w}</span>`).join("") +
+    cells.join("") +
+    "</div>" +
+    `<div class="cal__foot"><span>${n ? `${n}日選択中` : "日付をタップして選んでください"}</span>` +
+    (n ? '<button type="button" class="link" data-cal-clear="1">選び直す</button>' : "") +
+    "</div>";
+}
+
+function onCalClick(e) {
+  const day = e.target.closest("[data-day]");
+  const nav = e.target.closest("[data-cal]");
+  if (day) {
+    const v = day.dataset.day;
+    if (state.dates.has(v)) state.dates.delete(v);
+    else state.dates.add(v);
+  } else if (nav) {
+    const [y, m] = state.calMonth.split("-").map(Number);
+    const d = new Date(y, m - 1 + Number(nav.dataset.cal), 1);
+    state.calMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  } else if (e.target.closest("[data-cal-clear]")) {
+    state.dates = new Set();
+  } else return;
+  renderCal();
+  updateSubmit();
+}
+
+/** 申請のあと「よく使う申請に登録する」に印があれば登録する（失敗しても申請は済んでいる） */
+async function saveTemplateFrom(record) {
+  try {
+    const data = await api({
+      action: "saveTemplate",
+      template: {
+        category: record.category,
+        vendor: record.vendor,
+        amount: record.amount,
+        description: record.description,
+        department: record.department,
+      },
+    });
+    setTemplates(data.templates);
+    return true;
+  } catch (err) {
+    toast("よく使う申請に登録できませんでした: " + err.message);
+    return false;
+  }
+}
+
+/** まとめて申請（1日1件）。古いバックエンドなら1件ずつ送る */
+async function submitMany(base, wantTpl) {
+  const dates = [...state.dates].sort();
+  const records = dates.map((d, i) => ({
+    ...base,
+    id: "e" + Date.now().toString(36) + i.toString(36) + Math.random().toString(36).slice(2, 5),
+    createdAt: new Date().toISOString(),
+    date: d,
+  }));
+  state.sending = true;
+  updateSubmit();
+  try {
+    let saved;
+    try {
+      saved = (await api({ action: "createMany", records })).records;
+    } catch (err) {
+      if (!/unknown action/i.test(err.message)) throw err;
+      saved = [];
+      for (const r of records) saved.push((await api({ action: "create", record: r })).record || r);
+    }
+    saved.forEach((r) => addToMonths(normalize(r)));
+    persistMonths();
+    const tplOk = wantTpl && (await saveTemplateFrom(base));
+    state.sending = false;
+    resetForm();
+    render();
+    window.scrollTo(0, 0);
+    toast(`✓ ${saved.length}日分を申請しました（${yen(base.amount * saved.length)}）${tplOk ? "。よく使う申請に登録しました" : ""}`);
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました。もう一度ログインして申請してください");
+    toast("申請できませんでした: " + err.message);
+  } finally {
+    state.sending = false;
+    updateSubmit();
+  }
 }
 
 /* ---------- 申請 ---------- */
@@ -571,6 +791,19 @@ async function onSubmit(e) {
     $("#catChips").closest(".field").classList.add("is-missing");
     $("#catChips").scrollIntoView({ behavior: "smooth", block: "center" });
     return toast("費目を選んでください");
+  }
+  const wantTpl = $("#saveTpl").checked && state.mode !== "template";
+  if (state.datesMode) {
+    return submitMany(
+      {
+        amount: Math.round(Number($("#fAmount").value) || 0),
+        category: $("#fCategory").value,
+        department: $("#fDept").value,
+        vendor: $("#fVendor").value.trim(),
+        description: $("#fDesc").value.trim(),
+      },
+      wantTpl
+    );
   }
   const record = {
     id: "e" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -598,11 +831,12 @@ async function onSubmit(e) {
     // 保存済みのレコードが返るので、一覧を取り直さずにそのまま加える
     addToMonths(normalize(data.record || record));
     persistMonths();
+    const tplOk = wantTpl && (await saveTemplateFrom(record));
     state.sending = false;
     resetForm();
     render();
     window.scrollTo(0, 0); // 続けて次のレシートを撮れるように
-    toast(`✓ 申請しました（${yen(record.amount)}）`);
+    toast(`✓ 申請しました（${yen(record.amount)}）${tplOk ? "。よく使う申請に登録しました" : ""}`);
   } catch (err) {
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました。もう一度ログインして申請してください");
     toast("申請できませんでした: " + err.message);
@@ -1169,11 +1403,15 @@ $("#closeIssuedBtn").addEventListener("click", () => ($("#issued").hidden = true
 ["#photo", "#photoCam", "#photoRetake"].forEach((s) => $(s).addEventListener("change", onPhoto));
 $("#fAmount").addEventListener("input", updateSubmit);
 // 領収書がないとき（交通費など）は、写真なしで入力欄を開く
-$("#manualBtn").addEventListener("click", () => {
-  $("#applyFields").hidden = false;
-  $("#manualBtn").hidden = true;
-  $("#fAmount").focus();
+$("#manualBtn").addEventListener("click", openManual);
+$("#quickList").addEventListener("click", onQuickClick);
+$("#quickEdit").addEventListener("click", () => {
+  state.quickEdit = !state.quickEdit;
+  renderQuick();
 });
+$("#tplCancel").addEventListener("click", resetForm);
+$("#multiDateBtn").addEventListener("click", () => setDatesMode(true));
+$("#cal").addEventListener("click", onCalClick);
 $("#catChips").addEventListener("click", (e) => {
   const c = e.target.closest(".chip");
   if (c) setCategory(c.dataset.v);

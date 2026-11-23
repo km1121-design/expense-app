@@ -354,6 +354,12 @@ createdAt, department`。`department` は `人材,BAR` のようにカンマ区�
   - `{action:"list", token, month?}` … 一覧（`month` の扱いは同上）
   - `{action:"create", token, record:{...}}` … 申請の作成（`record.imageBase64` が
     あればドライブへ画像保存。申請者はセッションから強制）
+  - `{action:"createMany", token, records:[{...}]}` … 同じ内容を日付違いでまとめて申請
+    （最大31件・画像なし。1往復で全件を保存し、保存済みの `records` を返す）
+  - `{action:"saveTemplate", token, template:{id?, amount, vendor, category, description, department}}`
+    / `{action:"deleteTemplate", token, id}` … よく使う申請の登録・上書き・削除（本人の分だけ。
+    1人20件まで。同じ内容は重ねない）。どちらも本人の `templates` を返す。
+    `bootstrap` も `templates` を返す
   - `{action:"delete", token, id}` … 取消（user は自分の申請だけ、admin は全件。
     画像もゴミ箱へ）
   - `{action:"analyzeReceipt", token, imageBase64, imageMime}` … AIレシート解析

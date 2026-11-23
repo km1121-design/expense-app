@@ -89,6 +89,30 @@ const USER_HEADERS = USER_COLUMNS.map(function (c) {
   return c[0];
 });
 
+/**
+ * よく使う申請（電車の往復など、決まった金額の申請のひな形）。利用者ごとに持つ。
+ * 申請画面のボタンから、内容が入った状態で申請を始められる（日付は複数選べる）。
+ */
+const TEMPLATES_SHEET = "よく使う申請";
+const TEMPLATE_COLUMNS = [
+  ["id", "登録ID"],
+  ["username", "ユーザーID"],
+  ["name", "名前"],
+  ["category", "科目"],
+  ["vendor", "支払先"],
+  ["amount", "金額"],
+  ["description", "摘要"],
+  ["department", "事業部"],
+  ["createdAt", "登録日時"],
+];
+const TEMPLATE_HEADERS = TEMPLATE_COLUMNS.map(function (c) {
+  return c[0];
+});
+/** 1人あたりの登録数の上限（申請画面のボタンが並びすぎないように） */
+const TEMPLATES_MAX = 20;
+/** まとめて申請（createMany）で一度に受け付ける件数の上限（1か月分） */
+const CREATE_MANY_MAX = 31;
+
 const DEPARTMENTS_SHEET = "事業部マスタ";
 const DEPARTMENTS_SHEET_LEGACY = "departments";
 const DEPARTMENT_COLUMNS = [["name", "事業部名"]];
@@ -211,7 +235,7 @@ function getUsersSheet_() {
 /**
  * シート名・見出しの定義の版。ここを変えると次のリクエストで全シートを移行する。
  */
-const SCHEMA_VERSION = "2026-08-ja-2";
+const SCHEMA_VERSION = "2026-11-ja-3"; // よく使う申請のシートを追加
 
 /**
  * 全シートのタブ名と見出しを現在の定義に揃える。
@@ -236,6 +260,11 @@ function migrateSheets() {
   getSheet_();
   getUsersSheet_();
   getDepartmentsSheet_();
+  getTemplatesSheet_();
+}
+
+function getTemplatesSheet_() {
+  return ensureSheet_(TEMPLATES_SHEET, TEMPLATE_COLUMNS);
 }
 
 /** 移行の失敗でリクエスト自体を落とさないためのラッパー */
@@ -931,6 +960,7 @@ function statusPayload_() {
       bootstrap: true, // 起動を1往復にまとめられるか
       list: true, // 月ごとの一覧
       accessCode: true, // 利用コードでのログイン
+      templates: true, // よく使う申請・まとめて申請
     },
   };
 }
@@ -961,6 +991,11 @@ function actionBootstrap_(body) {
   };
   out.departments = listDepartments_();
   out.records = recordsForUser_(u, body.month);
+  try {
+    out.templates = templatesFor_(u.username); // よく使う申請（別の往復にしない）
+  } catch (err) {
+    out.templates = null; // 読めなくても起動は成立させる
+  }
   out.month = normalizeMonth_(body.month); // 返した範囲（空 = 全期間）
   // 残りの有効期間が半分を切っていたら新しいトークンを返す（使うたびに延びる）
   if (u.exp && u.exp - Date.now() < TOKEN_RENEW_MS) {
@@ -1024,6 +1059,16 @@ function doPost(e) {
         const u = requireUser_(body.token, false);
         return json_(deleteExpense_(body.id, u));
       }
+      // まとめて申請（よく使う申請を、複数の日付で一度に）
+      case "createMany": {
+        const u = requireUser_(body.token, false);
+        return json_(createExpenses_(body.records, u));
+      }
+      // ---- よく使う申請 ----
+      case "saveTemplate":
+        return json_(actionSaveTemplate_(body));
+      case "deleteTemplate":
+        return json_(actionDeleteTemplate_(body));
       default:
         return json_({ ok: false, error: "unknown action" });
     }
@@ -1036,6 +1081,44 @@ function doPost(e) {
 
 function createExpense_(record, user) {
   const sheet = getSheet_();
+  const rec = buildExpense_(record, user, true);
+  sheet.appendRow(expenseRow_(rec));
+  return { ok: true, record: rec };
+}
+
+/** シートへ書く1行（列の位置は HEADERS の順。undefined は書かない） */
+function expenseRow_(rec) {
+  return HEADERS.map(function (h) {
+    return rec[h] === undefined ? "" : rec[h];
+  });
+}
+
+/**
+ * まとめて申請（よく使う申請を、複数の日付で一度に）。1日1件の申請になる。
+ * 領収書の画像は受け付けない（1枚のレシートを何日分にも付けることになるため）。
+ * 行はまとめて1回で書く（1件ずつ書くと、件数のぶん保存が遅くなる）。
+ */
+function createExpenses_(records, user) {
+  if (!Array.isArray(records) || !records.length) throw new Error("申請がありません");
+  if (records.length > CREATE_MANY_MAX) {
+    throw new Error("一度に申請できるのは" + CREATE_MANY_MAX + "件までです");
+  }
+  const recs = records.map(function (record) {
+    if (record && record.imageBase64) throw new Error("まとめて申請では、領収書の画像は付けられません");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String((record && record.date) || ""))) {
+      throw new Error("日付が正しくありません");
+    }
+    if (!(Math.round(Number(record.amount) || 0) > 0)) throw new Error("金額が正しくありません");
+    return buildExpense_(record, user, false);
+  });
+  const sheet = getSheet_();
+  const rows = recs.map(expenseRow_);
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
+  return { ok: true, records: recs };
+}
+
+/** 申請1件を組み立てる（withImage が真なら、領収書の画像をドライブへ保存する） */
+function buildExpense_(record, user, withImage) {
   // 認証有効時は申請者名・事業部をサーバー側で強制（なりすまし防止）
   const applicant = user.legacy
     ? String(record.applicant || "")
@@ -1052,7 +1135,7 @@ function createExpense_(record, user) {
   // 領収書画像: 経費領収書/<事業部>/<yyyy-MM>/日付_申請者_採番 で保存
   let imageUrl = "";
   let imageFileId = "";
-  if (record.imageBase64) {
+  if (withImage && record.imageBase64) {
     const folder = getReceiptMonthFolder_(department, record.date);
     const fileName = buildReceiptFileName_(
       folder,
@@ -1091,12 +1174,109 @@ function createExpense_(record, user) {
     applicantId: applicantId,
     department: department,
   };
-  sheet.appendRow(
-    HEADERS.map(function (h) {
-      return rec[h] === undefined ? "" : rec[h];
-    })
-  );
-  return { ok: true, record: rec };
+  return rec;
+}
+
+/* ==================== よく使う申請（ひな形） ==================== */
+
+/** その人の登録（登録順） */
+function readTemplates_(username) {
+  const sheet = getTemplatesSheet_();
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const head = headerKeys_(values[0], TEMPLATE_COLUMNS);
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    if (!values[i][0]) continue;
+    const t = { _row: i + 1 };
+    head.forEach(function (h, j) {
+      t[h] = values[i][j];
+    });
+    if (String(t.username) === String(username)) out.push(t);
+  }
+  return out;
+}
+
+function publicTemplate_(t) {
+  return {
+    id: String(t.id),
+    name: String(t.name || ""),
+    category: String(t.category || ""),
+    vendor: String(t.vendor || ""),
+    amount: Number(t.amount) || 0,
+    description: String(t.description || ""),
+    department: String(t.department || ""),
+  };
+}
+
+function templatesFor_(username) {
+  return readTemplates_(username).map(publicTemplate_);
+}
+
+/**
+ * 登録・更新（本人の分だけ）。id があればその登録を上書き、なければ追加する。
+ * 名前が空なら「支払先・摘要」から作る（申請画面のボタンに出る文字）。
+ */
+function actionSaveTemplate_(body) {
+  const u = requireUser_(body.token, false);
+  const t = body.template || {};
+  const amount = Math.round(Number(t.amount) || 0);
+  if (!(amount > 0)) throw new Error("金額を入力してください");
+  if (RECEIPT_CATEGORIES.indexOf(String(t.category)) < 0) throw new Error("費目を選んでください");
+  const name = String(t.name || [t.vendor, t.description].filter(Boolean).join(" ") || t.category)
+    .trim()
+    .slice(0, 40);
+  const rec = {
+    username: u.username,
+    name: name,
+    category: String(t.category),
+    vendor: String(t.vendor || "").slice(0, 60),
+    amount: amount,
+    description: String(t.description || "").slice(0, 60),
+    department: String(t.department || ""),
+  };
+  const sheet = getTemplatesSheet_();
+  const mine = readTemplates_(u.username);
+  const existing = t.id
+    ? mine.filter(function (x) {
+        return String(x.id) === String(t.id);
+      })[0]
+    : null;
+  // 同じ内容がもうあれば、増やさずにそれを返す（同じボタンが2つ並ばないように）
+  const same = mine.filter(function (x) {
+    return (
+      String(x.category) === rec.category &&
+      String(x.vendor) === rec.vendor &&
+      Number(x.amount) === rec.amount &&
+      String(x.description) === rec.description &&
+      String(x.department) === rec.department
+    );
+  })[0];
+  if (existing) {
+    rec.id = String(existing.id);
+    rec.createdAt = existing.createdAt;
+    sheet
+      .getRange(existing._row, 1, 1, TEMPLATE_HEADERS.length)
+      .setValues([TEMPLATE_HEADERS.map(function (h) { return rec[h] === undefined ? "" : rec[h]; })]);
+  } else if (!same) {
+    if (mine.length >= TEMPLATES_MAX) {
+      throw new Error("よく使う申請は" + TEMPLATES_MAX + "件までです。使わないものを消してください");
+    }
+    rec.id = "t" + Utilities.getUuid().replace(/-/g, "").slice(0, 12);
+    rec.createdAt = new Date().toISOString();
+    sheet.appendRow(TEMPLATE_HEADERS.map(function (h) { return rec[h] === undefined ? "" : rec[h]; }));
+  }
+  return { ok: true, templates: templatesFor_(u.username) };
+}
+
+/** 削除（本人の分だけ） */
+function actionDeleteTemplate_(body) {
+  const u = requireUser_(body.token, false);
+  const hit = readTemplates_(u.username).filter(function (x) {
+    return String(x.id) === String(body.id);
+  })[0];
+  if (hit) getTemplatesSheet_().deleteRow(hit._row);
+  return { ok: true, templates: templatesFor_(u.username) };
 }
 
 function deleteExpense_(id, user) {

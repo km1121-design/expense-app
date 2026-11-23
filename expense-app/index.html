@@ -75,6 +75,19 @@
             </div>
           </div>
 
+          <!-- よく使う申請（電車の往復など）。押すと内容が入り、日付を複数選んでまとめて申請できる -->
+          <div class="quick" id="quick" hidden>
+            <div class="quick__head">
+              <span class="field__label">よく使う申請</span>
+              <button type="button" class="link link--muted" id="quickEdit">編集</button>
+            </div>
+            <div class="quick__list" id="quickList"></div>
+          </div>
+          <div class="tplBar" id="tplBar" hidden>
+            <span>よく使う申請：<b id="tplName"></b></span>
+            <button type="button" class="link" id="tplCancel">やめる</button>
+          </div>
+
           <!-- 入力欄は、写真を選んだとき（または写真なしで入力するとき）に開く -->
           <div class="apply__fields" id="applyFields" hidden>
           <label class="amount">
@@ -85,8 +98,14 @@
             </span>
           </label>
           <div class="grid2">
-            <label><span class="field__label">日付</span><input id="fDate" type="date" required /></label>
+            <label id="dateField"><span class="field__label">日付</span><input id="fDate" type="date" required /></label>
             <label><span class="field__label">支払先</span><input id="fVendor" maxlength="60" placeholder="例: ドトール" /></label>
+          </div>
+          <button type="button" class="link link--left" id="multiDateBtn" hidden>📅 日付を複数選んで、まとめて申請する</button>
+          <!-- 日付を複数選ぶ（1日1件の申請になる） -->
+          <div class="field" id="datesField" hidden>
+            <span class="field__label">日付（複数選べます。1日1件で申請します）</span>
+            <div class="cal" id="cal"></div>
           </div>
           <div class="field">
             <span class="field__label">費目</span>
@@ -100,6 +119,10 @@
             <input type="hidden" id="fDept" />
           </div>
           <label><span class="field__label">摘要（任意）</span><input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
+          <label class="check" id="saveTplRow">
+            <input type="checkbox" id="saveTpl" />
+            <span>よく使う申請に登録する<small>（次から1タップで入力できます）</small></span>
+          </label>
           <div class="apply__bar">
             <button class="btn btn--big" type="submit" id="submitBtn">申請する</button>
           </div>

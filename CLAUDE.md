@@ -191,6 +191,17 @@ Apps Script の実行時間の枠を使い切られるおそれがある。得�
 **隠し入力にはブラウザの `required` が効かない**ので、費目の未選択は `onSubmit` で止めている。
 選択肢を足すときは `renderChips` / `setChip` を通すこと（`is-on` と値がずれないように）。
 
+### よく使う申請・まとめて申請
+
+- よく使う申請はシート『よく使う申請』に本人の分として入る（`saveTemplate` / `deleteTemplate`。
+  1人20件まで）。起動時は `bootstrap` が `templates` も返す（**別の往復を足さない**）。
+  端末にも `expense-app:templates:<ユーザーID>` で残し、通信の前に出す。
+- 日付を複数選ぶモードでは、日付入力（`#fDate`）を隠してカレンダー（`#cal`）を出す。
+  **隠した入力に `required` が残るとフォームが送れなくなる**ので、`setDatesMode` が
+  `fDate.required` を切り替えている。モードを足すときはここを通すこと。
+- まとめて申請は `createMany`（1往復・最大31件・画像なし）。古いバックエンドが
+  `unknown action` を返したら1件ずつ `create` を送る（`submitMany`）。
+
 ### 一覧の1行は、スマホは2段・PCは表（CSSで切り替え）
 
 `.exp` は CSS グリッド。PC（幅900px以上）では `.item__meta` を `display: contents` にして、

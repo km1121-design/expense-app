@@ -774,6 +774,7 @@ console.log("✓ ログイン30日・失効（再発行/パスワード変更）
   [
     "status", "bootstrap", "list", "setup", "login", "loginCode", "listUsers", "upsertUser",
     "issueAccessCode", "addDepartment", "deleteDepartment", "analyzeReceipt", "create", "delete",
+    "createMany", "saveTemplate", "deleteTemplate",
   ].forEach((a) => assert.ok(known(a), `画面が使う ${a} が残っている`));
   [
     "me", "changePassword", "listDepartments", "lookupFare", "listFares", "upsertFare", "deleteFare",
@@ -785,5 +786,73 @@ console.log("✓ ログイン30日・失効（再発行/パスワード変更）
   assert.strictEqual(st.autoApprove, undefined, "承認の設定は返さない");
 }
 console.log("✓ 申請の保存（事業部の既定・列の位置）・削除の権限・画面が使うアクションの一覧");
+
+/* -------- よく使う申請・まとめて申請 -------- */
+{
+  const adminToken = g.actionLogin_({ username: "boss", password: bossPassword }).token;
+  const p1 = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "電車の人", department: ["人材", "BAR"] } });
+  const t1 = g.actionLoginCode_({ code: p1.code }).token;
+  const p2 = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "別の人" } });
+  const t2 = g.actionLoginCode_({ code: p2.code }).token;
+
+  // 登録（名前が無ければ支払先・摘要から作る）
+  let r = g.actionSaveTemplate_({ token: t1, template: { category: "交通費", vendor: "JR", description: "新井薬師前⇄西武新宿 往復", amount: 414, department: "BAR" } });
+  assert.strictEqual(r.templates.length, 1);
+  const tpl = r.templates[0];
+  assert.strictEqual(tpl.name, "JR 新井薬師前⇄西武新宿 往復");
+  assert.deepStrictEqual([tpl.category, tpl.amount, tpl.department], ["交通費", 414, "BAR"]);
+  assert.ok(sheets["よく使う申請"], "シートが作られる");
+  assert.strictEqual(sheets["よく使う申請"].rows[0][0], "登録ID", "見出しは日本語");
+  // 同じ内容は増やさない
+  r = g.actionSaveTemplate_({ token: t1, template: { category: "交通費", vendor: "JR", description: "新井薬師前⇄西武新宿 往復", amount: 414, department: "BAR" } });
+  assert.strictEqual(r.templates.length, 1, "同じ内容の登録は増えない");
+  // 上書き（id 指定）
+  r = g.actionSaveTemplate_({ token: t1, template: { id: tpl.id, name: "電車（往復）", category: "交通費", vendor: "JR", amount: 420, department: "BAR" } });
+  assert.deepStrictEqual([r.templates.length, r.templates[0].name, r.templates[0].amount], [1, "電車（往復）", 420], "id で上書き");
+  // 入力の誤りは弾く
+  assert.throws(() => g.actionSaveTemplate_({ token: t1, template: { category: "交通費", amount: 0 } }), /金額/);
+  assert.throws(() => g.actionSaveTemplate_({ token: t1, template: { category: "なにか", amount: 100 } }), /費目/);
+  // 他人の登録は見えない・消せない
+  assert.strictEqual(g.actionBootstrap_({ token: t2 }).templates.length, 0, "他人の登録は返さない");
+  assert.strictEqual(g.actionDeleteTemplate_({ token: t2, id: tpl.id }).templates.length, 0);
+  assert.strictEqual(g.actionBootstrap_({ token: t1 }).templates.length, 1, "他人からは消せない");
+  // 起動（bootstrap）に自分の登録が入る（別の往復にしない）
+  assert.strictEqual(g.actionBootstrap_({ token: t1 }).templates[0].id, tpl.id);
+  // 上限
+  for (let i = 0; i < val("TEMPLATES_MAX") - 1; i++) {
+    g.actionSaveTemplate_({ token: t1, template: { category: "その他", vendor: "店" + i, amount: 100 + i } });
+  }
+  assert.throws(() => g.actionSaveTemplate_({ token: t1, template: { category: "その他", vendor: "あふれ", amount: 999 } }), /までです/);
+  // 本人は消せる
+  r = g.actionDeleteTemplate_({ token: t1, id: tpl.id });
+  assert.ok(!r.templates.some((x) => x.id === tpl.id), "本人は消せる");
+
+  // まとめて申請: 1日1件、申請者はサーバーで決まり、行はまとめて書く
+  const exp = sheets["経費データ"];
+  const before = exp.rows.length;
+  const u1 = g.requireUser_(t1, false);
+  const base = { category: "交通費", vendor: "JR", amount: 414, description: "往復" };
+  const res = g.createExpenses_(
+    ["2026-11-17", "2026-11-18", "2026-11-19"].map((d, i) => ({ ...base, id: "m" + i, date: d, applicant: "なりすまし" })),
+    u1
+  );
+  assert.strictEqual(res.records.length, 3);
+  assert.strictEqual(exp.rows.length, before + 3, "3行増える");
+  assert.ok(res.records.every((x) => x.applicantId === p1.username && x.applicant === "電車の人"), "申請者はサーバーで決まる");
+  assert.ok(res.records.every((x) => x.department === "人材"), "事業部を指定しなければ割り当ての先頭");
+  assert.deepStrictEqual(res.records.map((x) => x.date), ["2026-11-17", "2026-11-18", "2026-11-19"]);
+  assert.ok(exp.rows.slice(-3).every((row) => row.length === val("HEADERS").length && row.every((v) => v !== undefined)), "列の位置をそろえる");
+  // 誤りは1件も書かない
+  const n = exp.rows.length;
+  assert.throws(() => g.createExpenses_([{ ...base, id: "x1", date: "2026-11-20" }, { ...base, id: "x2", date: "11/21" }], u1), /日付/);
+  assert.throws(() => g.createExpenses_([{ ...base, id: "x3", date: "2026-11-20", imageBase64: "AAA" }], u1), /画像/);
+  assert.throws(() => g.createExpenses_([{ ...base, id: "x4", date: "2026-11-20", amount: 0 }], u1), /金額/);
+  assert.throws(() => g.createExpenses_([], u1), /申請がありません/);
+  assert.throws(() => g.createExpenses_(Array.from({ length: 32 }, (_, i) => ({ ...base, id: "y" + i, date: "2026-11-01" })), u1), /31件まで/);
+  assert.strictEqual(exp.rows.length, n, "誤りがあれば1件も書かない");
+  // 月ごとの一覧にも出る
+  assert.strictEqual(g.recordsForUser_(u1, "2026-11").filter((x) => /^m\d$/.test(x.id)).length, 3);
+}
+console.log("✓ よく使う申請（登録・上書き・重複・上限・本人だけ）とまとめて申請（1日1件・一括で書く・誤りは書かない）");
 
 console.log("\nすべて成功");
