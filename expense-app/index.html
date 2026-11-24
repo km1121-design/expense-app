@@ -118,6 +118,12 @@
             <div class="chipset" id="deptChips" role="radiogroup" aria-label="事業部"></div>
             <input type="hidden" id="fDept" />
           </div>
+          <!-- 支払区分は管理者だけ（スタッフは常に立替なので出さない） -->
+          <div class="field" id="payField" hidden>
+            <span class="field__label">支払区分</span>
+            <div class="chipset" id="payChips" role="radiogroup" aria-label="支払区分"></div>
+            <input type="hidden" id="fPayment" value="立替" />
+          </div>
           <label><span class="field__label">摘要（任意）</span><input id="fDesc" maxlength="60" placeholder="例: 取引先との会食" /></label>
           <label class="check" id="saveTplRow">
             <input type="checkbox" id="saveTpl" />
@@ -171,6 +177,13 @@
               <legend>費目（複数選べます）</legend>
               <div id="narrowCats"></div>
             </fieldset>
+            <fieldset class="checks" id="narrowPaysBox" hidden>
+              <legend>支払区分</legend>
+              <div id="narrowPays"><div class="checkList">
+                <label><input type="checkbox" name="nk" value="立替" />立替（スタッフへ精算）</label>
+                <label><input type="checkbox" name="nk" value="会社払い" />会社払い</label>
+              </div></div>
+            </fieldset>
             <button type="button" class="link" id="narrowClear">絞り込みをやめる</button>
           </details>
         </div>
@@ -221,6 +234,48 @@
         <div class="card">
           <h2>利用者一覧</h2>
           <ul class="list" id="userRows"></ul>
+        </div>
+
+        <!-- 定期経費（サブスクなど会社が払うもの）。毎月の支払日を過ぎたら、会社払いとして自動で計上する -->
+        <div class="card">
+          <div class="cardHead">
+            <h2>定期経費（サブスクなど会社払い）</h2>
+            <span class="note" id="recTotal"></span>
+          </div>
+          <ul class="list" id="recRows"></ul>
+          <form class="recForm" id="recForm">
+            <h3 id="recFormTitle">定期経費を登録</h3>
+            <label>サービス名<input id="rName" maxlength="60" placeholder="例: Slack" required /></label>
+            <div class="grid2">
+              <label>支払通貨
+                <select id="rCurrency">
+                  <option value="JPY">円</option>
+                  <option value="USD">ドル</option>
+                </select>
+              </label>
+              <label id="rForeignField" hidden>ドルの金額（毎月）<input id="rForeign" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="20" /></label>
+            </div>
+            <label><span id="rAmountLabel">金額（円・毎月）</span><input id="rAmount" type="number" min="1" step="1" inputmode="numeric" required /></label>
+            <div class="grid2">
+              <label>事業部<select id="rDept"></select></label>
+              <label>費目<select id="rCategory"></select></label>
+            </div>
+            <div class="grid2">
+              <label>支払日（毎月）<input id="rPayDay" type="number" min="1" max="31" inputmode="numeric" placeholder="例: 5" required /></label>
+              <label>担当者（任意）<input id="rOwner" maxlength="40" placeholder="解約・更新の窓口" /></label>
+            </div>
+            <div class="grid2">
+              <label>計上を始める月<input id="rStart" type="month" required /></label>
+              <label>終了月（解約したら）<input id="rEnd" type="month" /></label>
+            </div>
+            <p class="note">支払日を過ぎると、その月の分を会社払いとして自動で計上します（一覧で「会社払い・定期」と出ます）。
+              全社で使うものは事業部「本部」に付けてください（無ければ下の「事業部」で追加）。
+              ドル払いは目安の円で計上して「金額未確定」になるので、明細が来たら一覧で金額を直してください。</p>
+            <div class="row">
+              <button class="btn" type="submit" id="recSubmit">登録</button>
+              <button type="button" class="link" id="recCancel" hidden>編集をやめる</button>
+            </div>
+          </form>
         </div>
 
         <!-- 事業部マスタ。申請と利用者の事業部はここから選ぶ -->

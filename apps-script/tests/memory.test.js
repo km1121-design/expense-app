@@ -774,7 +774,7 @@ console.log("✓ ログイン30日・失効（再発行/パスワード変更）
   [
     "status", "bootstrap", "list", "setup", "login", "loginCode", "listUsers", "upsertUser",
     "issueAccessCode", "addDepartment", "deleteDepartment", "analyzeReceipt", "create", "delete",
-    "createMany", "saveTemplate", "deleteTemplate",
+    "createMany", "saveTemplate", "deleteTemplate", "listRecurring", "saveRecurring", "deleteRecurring", "updateAmount",
   ].forEach((a) => assert.ok(known(a), `画面が使う ${a} が残っている`));
   [
     "me", "changePassword", "listDepartments", "lookupFare", "listFares", "upsertFare", "deleteFare",
@@ -854,5 +854,86 @@ console.log("✓ 申請の保存（事業部の既定・列の位置）・削除
   assert.strictEqual(g.recordsForUser_(u1, "2026-11").filter((x) => /^m\d$/.test(x.id)).length, 3);
 }
 console.log("✓ よく使う申請（登録・上書き・重複・上限・本人だけ）とまとめて申請（1日1件・一括で書く・誤りは書かない）");
+
+/* -------- 支払区分・定期経費・金額の確定 -------- */
+{
+  const same = (a, b, m) => assert.deepStrictEqual(JSON.parse(JSON.stringify(a)), b, m); // vm の中の配列は別物なので
+  const adminToken = g.actionLogin_({ username: "boss", password: bossPassword }).token;
+  const admin = g.requireUser_(adminToken, false);
+  const ps = g.actionIssueAccessCode_({ token: adminToken, user: { displayName: "スタッフ", department: ["BAR"] } });
+  const ts = g.actionLoginCode_({ code: ps.code }).token;
+  const staff = g.requireUser_(ts, false);
+  const exp = sheets["経費データ"];
+  const col = (k) => val("HEADERS").indexOf(k);
+
+  // スタッフは常に立替（会社払いを送っても立替になる）。管理者は会社払いを付けられる
+  assert.strictEqual(g.createExpense_({ id: "p1", date: "2026-11-02", amount: 500, category: "その他", payment: "会社払い" }, staff).record.payment, "立替");
+  assert.strictEqual(g.createExpense_({ id: "p2", date: "2026-11-02", amount: 500, category: "その他", payment: "会社払い" }, admin).record.payment, "会社払い");
+  assert.strictEqual(g.createExpense_({ id: "p3", date: "2026-11-02", amount: 500, category: "その他" }, admin).record.payment, "立替", "既定は立替");
+  assert.ok(val("RECEIPT_CATEGORIES").includes("システム利用料"));
+
+  // 管理者だけが扱える
+  assert.throws(() => g.actionListRecurring_({ token: ts }), /forbidden|権限|管理者/);
+  assert.throws(() => g.actionSaveRecurring_({ token: ts, item: {} }), /forbidden|権限|管理者/);
+  assert.throws(() => g.actionUpdateAmount_({ token: ts, id: "p1", amount: 1 }), /forbidden|権限|管理者/);
+
+  // 登録（開始月が先なので、保存しても計上しない）
+  const base = { name: "Slack", category: "システム利用料", amount: 12000, department: "本部", payDay: 5, startMonth: "2099-01" };
+  let r = g.actionSaveRecurring_({ token: adminToken, item: base });
+  assert.strictEqual(r.posted.length, 0);
+  assert.strictEqual(sheets["定期経費"].rows[0][0], "登録ID", "見出しは日本語");
+  const slack = r.recurring[0];
+  same([slack.name, slack.amount, slack.currency, slack.startMonth, slack.lastPosted], ["Slack", 12000, "JPY", "2099-01", ""]);
+  r = g.actionSaveRecurring_({ token: adminToken, item: { name: "ChatGPT", category: "システム利用料", amount: 3100, currency: "USD", foreignAmount: 20, department: "BAR", payDay: 31, startMonth: "2099-02" } });
+  const gpt = r.recurring.find((x) => x.name === "ChatGPT");
+  // 入力の誤り
+  assert.throws(() => g.actionSaveRecurring_({ token: adminToken, item: { ...base, name: "" } }), /サービス名/);
+  assert.throws(() => g.actionSaveRecurring_({ token: adminToken, item: { ...base, payDay: 32 } }), /支払日/);
+  assert.throws(() => g.actionSaveRecurring_({ token: adminToken, item: { ...base, currency: "USD" } }), /ドル/);
+  assert.throws(() => g.actionSaveRecurring_({ token: adminToken, item: { ...base, endMonth: "2098-12" } }), /終了月/);
+
+  // 支払日を過ぎた月の分だけ計上する（3/4 時点: Slack は1・2月、ChatGPT は2月=月末28日）
+  const n0 = exp.rows.length;
+  let posted = g.postRecurring_({ force: true, today: "2099-03-04" });
+  same(posted.map((x) => x.id).sort(), ["r-" + gpt.id + "-2099-02", "r-" + slack.id + "-2099-01", "r-" + slack.id + "-2099-02"].sort());
+  assert.strictEqual(exp.rows.length, n0 + 3);
+  const g2 = posted.find((x) => x.recurringId === gpt.id);
+  same([g2.date, g2.amount, g2.estimated, g2.payment, g2.applicantId], ["2099-02-28", 3100, "未確定", "会社払い", ""], "31日払いは月末、ドルは未確定");
+  assert.strictEqual(posted.find((x) => x.id.endsWith("2099-01")).estimated, "", "円払いは確定");
+  // 同じ日にもう一度呼んでも、二重に計上しない（1日1回・計上済みの月を覚えている）
+  assert.strictEqual(g.postRecurring_({ today: "2099-03-04" }).length, 0);
+  assert.strictEqual(g.postRecurring_({ force: true, today: "2099-03-04" }).length, 0);
+  // 支払日（5日）を過ぎると3月分
+  same(g.postRecurring_({ today: "2099-03-05" }).map((x) => x.date), ["2099-03-05"]);
+  // スタッフの一覧には出ない（会社払いの定期経費は、申請者IDが空）
+  assert.ok(!g.recordsForUser_(staff, "2099-03").length);
+  assert.strictEqual(g.recordsForUser_(admin, "2099-02").length, 2);
+
+  // 金額の確定（管理者）: 金額が変わり、未確定の印が消える
+  r = g.actionUpdateAmount_({ token: adminToken, id: g2.id, amount: 3088 });
+  same([r.record.amount, r.record.estimated], [3088, ""]);
+  const row = exp.rows.find((x) => x[0] === g2.id);
+  same([row[col("amount")], row[col("estimated")]], [3088, ""]);
+  assert.throws(() => g.actionUpdateAmount_({ token: adminToken, id: g2.id, amount: 0 }), /金額/);
+
+  // 更新しても計上済みの月は引き継ぐ。終了月を入れると、それより後は計上しない
+  r = g.actionSaveRecurring_({ token: adminToken, item: { ...base, id: slack.id, amount: 15000, endMonth: "2099-04" } });
+  assert.strictEqual(r.recurring.find((x) => x.id === slack.id).lastPosted, "2099-03");
+  posted = g.postRecurring_({ force: true, today: "2099-07-20" });
+  same(posted.filter((x) => x.recurringId === slack.id).map((x) => [x.date, x.amount]), [["2099-04-05", 15000]], "終了月まで・新しい金額で");
+  // 長く誰も開かなかったときも、さかのぼるのは上限まで
+  g.actionDeleteRecurring_({ token: adminToken, id: slack.id });
+  r = g.actionDeleteRecurring_({ token: adminToken, id: gpt.id });
+  assert.strictEqual(r.recurring.length, 0, "登録は消せる");
+  assert.ok(exp.rows.some((x) => x[0] === g2.id), "計上済みの申請は残る");
+  g.actionSaveRecurring_({ token: adminToken, item: { ...base, name: "古い契約", startMonth: "2098-01" } });
+  posted = g.postRecurring_({ force: true, today: "2099-12-31" }).filter((x) => x.vendor === "古い契約");
+  assert.strictEqual(posted.length, val("RECURRING_CATCHUP_MAX"));
+  assert.strictEqual(posted[0].date, "2099-01-05");
+  // 起動でも計上する（失敗しても起動は落とさない）
+  assert.ok(Array.isArray(g.actionBootstrap_({ token: adminToken }).records));
+  assert.strictEqual(g.statusPayload_().features.recurring, true);
+}
+console.log("✓ 支払区分（スタッフは立替のみ）・定期経費（支払日・月末・ドルは未確定・二重計上なし・終了月・さかのぼり上限）・金額の確定");
 
 console.log("\nすべて成功");

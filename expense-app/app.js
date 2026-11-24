@@ -14,7 +14,9 @@ const CONFIG_KEY = "expense-app:config";
 const SESSION_KEY = "expense-app:session";
 const CACHE_KEY = "expense-lite:months"; // 一覧キャッシュ（月ごと）。旧名のまま（変えると一度キャッシュが消える）
 
-const CATEGORIES = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他"];
+const CATEGORIES = ["交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "システム利用料", "その他"];
+const PAY_ADVANCE = "立替"; // スタッフが払い、本人へ精算する（スタッフの申請は常にこれ）
+const PAY_COMPANY = "会社払い"; // 会社のカード・引き落とし（管理者だけが付けられる）
 const GROUP_KEYS = { month: "月", department: "事業部", applicant: "申請者", category: "費目" };
 
 const state = {
@@ -29,7 +31,9 @@ const state = {
   loginMode: "code", // "code" = 利用コード / "password" = IDとパスワード（管理者用）/ "setup" = 最初の管理者の作成
   users: [], // アカウント画面の利用者一覧（管理者のみ）
   editing: "", // 事業部を編集中の利用者（username）
-  filters: { depts: new Set(), people: new Set(), cats: new Set() }, // 絞り込み（事業部名・申請者ID・費目。空 = 絞らない）
+  filters: { depts: new Set(), people: new Set(), cats: new Set(), pays: new Set() }, // 絞り込み（事業部名・申請者ID・費目・支払区分。空 = 絞らない）
+  recurring: null, // 定期経費（管理者のみ。アカウント画面を開いたときに読む）
+  recurringEdit: "", // 編集中の定期経費の登録ID
   reading: false, // AIが読み取り中（申請ボタンを止める）
   templates: [], // よく使う申請（自分の分。起動時に bootstrap で受け取る）
   quickEdit: false, // よく使う申請の編集中（✕で消せる）
@@ -127,6 +131,9 @@ function normalize(r) {
     imageFileId: String(r.imageFileId || ""),
     month: String(r.date || "").slice(0, 7), // 「月ごと」の並べ替え用
     createdAt: String(r.createdAt || ""),
+    payment: r.payment === PAY_COMPANY ? PAY_COMPANY : PAY_ADVANCE, // 空（古い行）は立替
+    recurringId: String(r.recurringId || ""),
+    estimated: !!r.estimated, // ドル払いなど、目安の金額で計上したもの
   };
 }
 
@@ -253,7 +260,10 @@ function switchTab(name) {
   document.body.classList.toggle("on-list", name === "list"); // PCでは一覧だけ横幅を広く使う
   window.scrollTo(0, 0);
   document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = p.dataset.panel !== name));
-  if (name === "accounts") loadUsers();
+  if (name === "accounts") {
+    loadUsers();
+    loadRecurring();
+  }
 }
 
 /** 利用者の事業部は複数持てる（シートには「人材,BAR」で入っている） */
@@ -304,6 +314,10 @@ function fillDepartments() {
   $("#fDept").value = initial;
   renderChips("#deptChips", "#fDept", list, (d) => d || "（未設定）");
   $("#deptField").hidden = mine.length === 1;
+  // 支払区分は管理者だけが選ぶ（スタッフは常に立替なので、欄を出さない）
+  $("#fPayment").value = PAY_ADVANCE;
+  renderChips("#payChips", "#fPayment", [PAY_ADVANCE, PAY_COMPANY]);
+  $("#payField").hidden = !isAdmin();
 }
 
 /** 事業部のチェックボックス群。/** 事業部のチェックボックス群。マスタから消えた事業部も、付いていれば外せるように出す */
@@ -456,6 +470,7 @@ function logout() {
   state.session = null;
   state.users = [];
   state.templates = [];
+  state.recurring = null;
   $("#issued").hidden = true;
   state.months = {};
   writeJson(SESSION_KEY, null);
@@ -801,6 +816,7 @@ async function onSubmit(e) {
         department: $("#fDept").value,
         vendor: $("#fVendor").value.trim(),
         description: $("#fDesc").value.trim(),
+        payment: $("#fPayment").value || PAY_ADVANCE,
       },
       wantTpl
     );
@@ -814,6 +830,7 @@ async function onSubmit(e) {
     department: $("#fDept").value,
     vendor: $("#fVendor").value.trim(),
     description: $("#fDesc").value.trim(),
+    payment: $("#fPayment").value || PAY_ADVANCE,
   };
   if (state.image) {
     record.imageBase64 = state.image.base64;
@@ -880,8 +897,9 @@ function sortRecords(list, key) {
 
 /** 絞り込みに合うか。except に挙げた条件は見ない（集計の各内訳は、自分以外の条件で絞る） */
 function passes(r, except) {
-  const { depts, people, cats } = state.filters;
+  const { depts, people, cats, pays } = state.filters;
   return (
+    (except === "pay" || !isAdmin() || !pays.size || pays.has(r.payment)) &&
     (except === "dept" || !depts.size || depts.has(r.department)) &&
     (except === "person" || !isAdmin() || !people.size || people.has(r.applicantId)) &&
     (except === "cat" || !cats.size || cats.has(r.category))
@@ -905,8 +923,8 @@ function render() {
     return;
   }
   renderNarrow(recs);
-  const { depts, people, cats } = state.filters;
-  const narrowed = depts.size > 0 || cats.size > 0 || (isAdmin() && people.size > 0);
+  const { depts, people, cats, pays } = state.filters;
+  const narrowed = depts.size > 0 || cats.size > 0 || (isAdmin() && (people.size > 0 || pays.size > 0));
   const list = sortRecords(recs.filter((r) => passes(r)), key);
   renderSummary(recs, list);
   $("#totalClear").hidden = !narrowed;
@@ -944,8 +962,16 @@ function render() {
       `<span class="m-date">${esc(r.date.slice(5).replace("-", "/"))}</span>` +
       (isAdmin() ? `<span class="m-person">${esc(r.applicant)}</span>` : "") +
       `<span class="m-dept">${esc(r.department || "（未設定）")}</span>` +
-      `<span class="m-cat"><span class="tag" data-cat="${esc(r.category)}">${esc(r.category || "（なし）")}</span></span>` +
-      (isRejected(r) ? '<span class="m-flag flag">却下</span>' : "");
+      `<span class="m-cat"><span class="tag" data-cat="${esc(r.category)}">${esc(r.category || "（なし）")}</span></span>`;
+    // 印（スマホでは日付などの後ろ、PCでは支払先の下に出る）。会社払い・未確定は管理者にだけ出す
+    const badges = [
+      isRejected(r) && '<span class="flag">却下</span>',
+      isAdmin() && r.payment === PAY_COMPANY && `<span class="badge">${r.recurringId ? "会社払い・定期" : "会社払い"}</span>`,
+      isAdmin() &&
+        r.estimated &&
+        `<button type="button" class="badge badge--warn" data-fix="${esc(r.id)}" title="カードの明細の金額に直す">金額未確定・直す</button>`,
+    ].filter(Boolean);
+    const flags = badges.length ? `<span class="m-flag">${badges.join("")}</span>` : "";
     html.push(
       `<li class="item exp${isRejected(r) ? " is-rejected" : ""}">` +
         (fid
@@ -956,7 +982,7 @@ function render() {
             : '<span class="thumb-none" title="領収書なし">なし</span>') +
         `<div class="item__title">${esc(r.vendor || r.category || "（支払先なし）")}` +
         `${r.description ? `<small>${esc(r.description)}</small>` : ""}</div>` +
-        `<div class="item__meta">${meta}</div>` +
+        `<div class="item__meta">${meta}${flags}</div>` +
         `<div class="item__side">${yen(r.amount)}</div>` +
         `<div class="acts">${canDelete ? `<button type="button" class="link danger" data-del="${esc(r.id)}">削除</button>` : ""}</div>` +
         `</li>`
@@ -975,7 +1001,7 @@ function renderSummary(recs, list) {
   const box = $("#summary");
   const live = (rs) => rs.filter((r) => !isRejected(r));
   const total = live(list).reduce((s, r) => s + r.amount, 0);
-  const people = new Set(live(list).map((r) => r.applicantId)).size;
+  const people = new Set(live(list).map((r) => r.applicantId).filter(Boolean)).size; // 定期経費（申請者IDなし）は人に数えない
   const noReceipt = live(list).filter((r) => !fileIdOf(r) && !r.imageUrl).length;
   const kpi = (label, value, cls) =>
     `<div class="kpi${cls ? " " + cls : ""}"><span class="kpi__label">${label}</span><span class="kpi__value">${value}</span></div>`;
@@ -1008,12 +1034,24 @@ function renderSummary(recs, list) {
       "</section>"
     );
   };
+  // 支払区分（管理者のみ）。押すとその区分で絞り込む。立替の合計がスタッフへ払い戻す額
+  const payKpi = (label, pay) => {
+    const rs = live(recs.filter((r) => r.payment === pay && passes(r, "pay")));
+    const on = state.filters.pays.has(pay);
+    return (
+      `<button type="button" class="kpi kpi--btn${on ? " is-on" : ""}" data-facet="pay" data-v="${pay}" title="${pay}だけを表示">` +
+      `<span class="kpi__label">${label}</span><span class="kpi__value">${yen(rs.reduce((s, r) => s + r.amount, 0))}</span></button>`
+    );
+  };
+  const pending = isAdmin() ? live(list).filter((r) => r.estimated).length : 0;
   const kpis =
     '<div class="kpis">' +
     kpi("合計", yen(total), "kpi--main") +
     kpi("件数", `${live(list).length}件`) +
+    (isAdmin() ? payKpi("立替（精算する額）", PAY_ADVANCE) + payKpi("会社払い", PAY_COMPANY) : "") +
     (isAdmin() ? kpi("申請した人", `${people}人`) : "") +
     kpi("領収書なし", `${noReceipt}件`, noReceipt ? "kpi--warn" : "") +
+    (pending ? kpi("金額未確定", `${pending}件`, "kpi--warn") : "") +
     "</div>";
   const facets =
     (isAdmin() ? facet("事業部別", "dept", (r) => r.department, (r) => r.department || "（未設定）") : "") +
@@ -1031,7 +1069,7 @@ function renderSummary(recs, list) {
 function onSummaryClick(e) {
   const bar = e.target.closest("[data-facet]");
   if (!bar) return;
-  const set = state.filters[{ dept: "depts", person: "people", cat: "cats" }[bar.dataset.facet]];
+  const set = state.filters[{ dept: "depts", person: "people", cat: "cats", pay: "pays" }[bar.dataset.facet]];
   const v = bar.dataset.v;
   if (set.has(v)) set.delete(v);
   else set.add(v);
@@ -1087,10 +1125,15 @@ function renderNarrow(recs) {
   const nd = state.filters.depts.size;
   const np = isAdmin() ? state.filters.people.size : 0;
   const nc = state.filters.cats.size;
-  $("#narrow").classList.toggle("is-active", nd + np + nc > 0);
+  const nk = isAdmin() ? state.filters.pays.size : 0;
+  $("#narrowPaysBox").hidden = !isAdmin();
+  $("#narrowPays")
+    .querySelectorAll("input")
+    .forEach((i) => (i.checked = state.filters.pays.has(i.value)));
+  $("#narrow").classList.toggle("is-active", nd + np + nc + nk > 0);
   $("#narrowSummary").textContent =
-    nd + np + nc > 0
-      ? `絞り込み中（${[nd && `事業部 ${nd}`, np && `人 ${np}`, nc && `費目 ${nc}`].filter(Boolean).join("・")}）`
+    nd + np + nc + nk > 0
+      ? `絞り込み中（${[nd && `事業部 ${nd}`, np && `人 ${np}`, nc && `費目 ${nc}`, nk && "支払区分"].filter(Boolean).join("・")}）`
       : "絞り込み";
 }
 
@@ -1098,11 +1141,12 @@ function onNarrowChange() {
   state.filters.depts = new Set(checkedValues($("#narrowDepts"), "nd"));
   state.filters.people = new Set(checkedValues($("#narrowPeople"), "np"));
   state.filters.cats = new Set(checkedValues($("#narrowCats"), "nc"));
+  state.filters.pays = new Set(checkedValues($("#narrowPays"), "nk"));
   render();
 }
 
 function clearNarrow() {
-  state.filters = { depts: new Set(), people: new Set(), cats: new Set() };
+  state.filters = { depts: new Set(), people: new Set(), cats: new Set(), pays: new Set() };
   state.narrowSig = ""; // 選択肢を作り直して、チェックを外す
   render();
 }
@@ -1110,6 +1154,8 @@ function clearNarrow() {
 async function onRowsClick(e) {
   const view = e.target.closest && e.target.closest("[data-view]");
   if (view) return openLightbox(view.dataset.view, view);
+  const fix = e.target.closest && e.target.closest("[data-fix]");
+  if (fix) return fixAmount(fix.dataset.fix, fix);
   const id = e.target.dataset && e.target.dataset.del;
   if (!id) return;
   const r = (state.months[monthKey()] || []).find((x) => x.id === id);
@@ -1125,6 +1171,32 @@ async function onRowsClick(e) {
     e.target.disabled = false;
     if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
     toast("削除できませんでした: " + err.message);
+  }
+}
+
+/** 金額を直す（管理者）。ドル払いの「未確定」を、カードの明細の円の金額で確定する */
+async function fixAmount(id, btn) {
+  const r = (state.months[monthKey()] || []).find((x) => x.id === id);
+  if (!r) return;
+  const input = prompt(
+    `${r.vendor}（${r.date}）\n${r.description ? r.description + "\n" : ""}カードの明細の金額（円）を入力してください`,
+    String(r.amount)
+  );
+  if (input == null) return;
+  const amount = Math.round(Number(String(input).replace(/[^\d.]/g, "")) || 0);
+  if (!(amount > 0)) return toast("金額を数字で入力してください");
+  btn.disabled = true;
+  try {
+    const data = await api({ action: "updateAmount", id, amount });
+    const rec = normalize(data.record || { ...r, amount, estimated: "" });
+    Object.keys(state.months).forEach((k) => (state.months[k] = state.months[k].map((x) => (x.id === id ? rec : x))));
+    persistMonths();
+    render();
+    toast(`✓ ${yen(amount)} で確定しました`);
+  } catch (err) {
+    btn.disabled = false;
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("直せませんでした: " + err.message);
   }
 }
 
@@ -1358,6 +1430,12 @@ async function updateDepartments(payload, done) {
     renderDepartments();
     renderUsers();
     fillDepartments();
+    if (!state.recurringEdit) {
+      // 定期経費の登録欄の事業部も、追加・削除を反映する（入力中の値は残す）
+      const keep = $("#rDept").value;
+      $("#rDept").innerHTML = state.departments.map((d) => `<option>${esc(d)}</option>`).join("");
+      if (state.departments.includes(keep)) $("#rDept").value = keep;
+    }
     toast(done);
     return true;
   } catch (err) {
@@ -1390,6 +1468,153 @@ async function onCopyInvite() {
   }
 }
 
+/* ---------- 定期経費（サブスクなど会社払い。管理者のみ） ---------- */
+const thisMonth = () => today().slice(0, 7);
+const isActiveRecurring = (t) => !t.endMonth || t.endMonth >= thisMonth();
+const priceText = (t) => (t.currency === "USD" ? `US$${t.foreignAmount}（目安 ${yen(t.amount)}）` : yen(t.amount));
+
+async function loadRecurring() {
+  fillRecurringForm();
+  if (!state.recurring) $("#recRows").innerHTML = '<li class="empty">読み込み中…</li>';
+  try {
+    const data = await api({ action: "listRecurring" });
+    state.recurring = data.recurring || [];
+    renderRecurring();
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    $("#recRows").innerHTML = `<li class="empty">${
+      /unknown action/i.test(err.message) ? "バックエンドの更新を待っています" : "読み込めませんでした: " + esc(err.message)
+    }</li>`;
+  }
+}
+
+function renderRecurring() {
+  const list = (state.recurring || [])
+    .slice()
+    .sort(
+      (a, b) =>
+        (isActiveRecurring(b) ? 1 : 0) - (isActiveRecurring(a) ? 1 : 0) ||
+        a.department.localeCompare(b.department, "ja") ||
+        b.amount - a.amount
+    );
+  const active = list.filter(isActiveRecurring);
+  $("#recTotal").textContent = active.length ? `使用中 ${active.length}件　月 ${yen(active.reduce((s, t) => s + t.amount, 0))}` : "";
+  $("#recRows").innerHTML = list.length
+    ? list
+        .map((t) => {
+          const meta = [
+            t.department || "事業部未設定",
+            t.category,
+            `毎月${t.payDay}日`,
+            `${t.startMonth.replace("-", "/")}〜${t.endMonth ? t.endMonth.replace("-", "/") : ""}`,
+            t.owner && `担当 ${t.owner}`,
+            !isActiveRecurring(t) && "終了",
+          ]
+            .filter(Boolean)
+            .map(esc)
+            .join("・");
+          return (
+            `<li class="item${isActiveRecurring(t) ? "" : " is-inactive"}">` +
+            `<div class="item__main"><div class="item__title">${esc(t.name)}</div><div class="item__meta">${meta}</div></div>` +
+            `<div class="item__side">${esc(priceText(t))}<div class="acts">` +
+            `<button type="button" class="link" data-recedit="${esc(t.id)}">編集</button>` +
+            `<button type="button" class="link danger" data-recdel="${esc(t.id)}">削除</button>` +
+            `</div></div></li>`
+          );
+        })
+        .join("")
+    : '<li class="empty">まだ登録がありません。下から登録すると、毎月の支払日に自動で計上します</li>';
+}
+
+/** 登録欄（t があれば編集、無ければ新規） */
+function fillRecurringForm(t) {
+  state.recurringEdit = t ? t.id : "";
+  const f = $("#recForm");
+  f.reset();
+  $("#rCategory").innerHTML = CATEGORIES.map((c) => `<option>${esc(c)}</option>`).join("");
+  const depts = [...state.departments];
+  if (t && t.department && !depts.includes(t.department)) depts.push(t.department);
+  $("#rDept").innerHTML = depts.map((d) => `<option>${esc(d)}</option>`).join("");
+  $("#rName").value = t ? t.name : "";
+  $("#rCurrency").value = t ? t.currency : "JPY";
+  $("#rForeign").value = t && t.currency === "USD" ? t.foreignAmount : "";
+  $("#rAmount").value = t ? t.amount : "";
+  $("#rCategory").value = t ? t.category : "システム利用料";
+  $("#rDept").value = t ? t.department : depts.includes("本部") ? "本部" : depts[0] || "";
+  $("#rPayDay").value = t ? t.payDay : "";
+  $("#rStart").value = t ? t.startMonth : thisMonth();
+  $("#rEnd").value = t ? t.endMonth : "";
+  $("#rOwner").value = t ? t.owner : "";
+  $("#recFormTitle").textContent = t ? `「${t.name}」を編集` : "定期経費を登録";
+  $("#recSubmit").textContent = t ? "保存" : "登録";
+  $("#recCancel").hidden = !t;
+  onCurrencyChange();
+}
+
+function onCurrencyChange() {
+  const usd = $("#rCurrency").value === "USD";
+  $("#rForeignField").hidden = !usd;
+  $("#rForeign").required = usd;
+  $("#rAmountLabel").textContent = usd ? "円換算の目安（毎月この金額で計上し、明細を見て確定します）" : "金額（円・毎月）";
+}
+
+async function onRecSubmit(e) {
+  e.preventDefault();
+  const item = {
+    id: state.recurringEdit || undefined,
+    name: $("#rName").value.trim(),
+    currency: $("#rCurrency").value,
+    foreignAmount: Number($("#rForeign").value) || 0,
+    amount: Math.round(Number($("#rAmount").value) || 0),
+    category: $("#rCategory").value,
+    department: $("#rDept").value,
+    payDay: Number($("#rPayDay").value) || 0,
+    startMonth: $("#rStart").value,
+    endMonth: $("#rEnd").value,
+    owner: $("#rOwner").value.trim(),
+  };
+  const btn = $("#recSubmit");
+  btn.disabled = true;
+  try {
+    const data = await api({ action: "saveRecurring", item });
+    state.recurring = data.recurring || [];
+    // 支払日を過ぎた月の分は、保存と同時に計上される。一覧を取り直さずに加える
+    const posted = data.posted || [];
+    posted.forEach((r) => addToMonths(normalize(r)));
+    if (posted.length) persistMonths();
+    renderRecurring();
+    render();
+    fillRecurringForm();
+    toast(`✓ 「${item.name}」を${item.id ? "保存" : "登録"}しました${posted.length ? `（${posted.length}件を計上）` : ""}`);
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("保存できませんでした: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function onRecRowsClick(e) {
+  const t = (state.recurring || []).find((x) => x.id === (e.target.dataset.recedit || e.target.dataset.recdel));
+  if (!t) return;
+  if (e.target.dataset.recedit) {
+    fillRecurringForm(t);
+    $("#recForm").scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (!confirm(`「${t.name}」の登録を削除しますか？\nこれまでに計上した分は一覧に残ります。解約したときは、削除せずに「終了月」を入れることもできます。`)) return;
+  try {
+    const data = await api({ action: "deleteRecurring", id: t.id });
+    state.recurring = data.recurring || [];
+    if (state.recurringEdit === t.id) fillRecurringForm();
+    renderRecurring();
+    toast(`「${t.name}」を削除しました`);
+  } catch (err) {
+    if (err instanceof AuthError) return showLogin("ログインの有効期限が切れました");
+    toast("削除できませんでした: " + err.message);
+  }
+}
+
 /* ---------- イベント ---------- */
 $("#loginForm").addEventListener("submit", onLogin);
 $("#logoutBtn").addEventListener("click", logout);
@@ -1415,6 +1640,14 @@ $("#cal").addEventListener("click", onCalClick);
 $("#catChips").addEventListener("click", (e) => {
   const c = e.target.closest(".chip");
   if (c) setCategory(c.dataset.v);
+});
+$("#recForm").addEventListener("submit", onRecSubmit);
+$("#recCancel").addEventListener("click", () => fillRecurringForm());
+$("#rCurrency").addEventListener("change", onCurrencyChange);
+$("#recRows").addEventListener("click", onRecRowsClick);
+$("#payChips").addEventListener("click", (e) => {
+  const c = e.target.closest(".chip");
+  if (c) setChip("#payChips", "#fPayment", c.dataset.v);
 });
 $("#deptChips").addEventListener("click", (e) => {
   const c = e.target.closest(".chip");

@@ -326,7 +326,25 @@ body:not(.is-admin) .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } 
 .tag[data-cat="消耗品費"] { background: #dcfce7; color: #166534; }
 .tag[data-cat="通信費"] { background: #fef3c7; color: #92400e; }
 .tag[data-cat="宿泊費"] { background: #e0e7ff; color: #3730a3; }
+.tag[data-cat="システム利用料"] { background: #ccfbf1; color: #115e59; }
 .flag { color: var(--danger); }
+/* 会社払い・金額未確定の印（管理者の一覧） */
+.m-flag { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.badge {
+  display: inline-block; font: inherit; font-size: 11px; line-height: 1.6; padding: 0 8px; border-radius: 999px;
+  border: 1px solid var(--line); background: #f3f4f6; color: #374151;
+}
+.badge--warn { background: var(--warn-weak); color: var(--warn); border-color: transparent; cursor: pointer; font-weight: 600; }
+.badge--warn:hover { text-decoration: underline; }
+.kpi--btn { font: inherit; text-align: left; border: 1px solid transparent; cursor: pointer; }
+.kpi--btn:hover { border-color: var(--accent); }
+.kpi--btn.is-on { border-color: var(--accent); background: var(--accent-weak); }
+
+/* ---------- 定期経費（アカウント画面） ---------- */
+.cardHead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.cardHead h2 { margin-bottom: 0; }
+.recForm { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+.recForm h3 { margin: 0; font-size: 15px; }
 
 /* ---------- アカウント ---------- */
 .issued { border-color: var(--accent); }
@@ -396,7 +414,7 @@ fieldset.checks legend { font-size: 13px; color: var(--muted); margin-bottom: 6p
   /* 明細を表の列にそろえる（日付・支払先・申請者・事業部・費目・金額） */
   .rows .exp, .rows .list__head {
     display: grid; grid-template-areas: none; align-items: center; column-gap: 12px;
-    grid-template-columns: 44px 52px minmax(0, 2fr) var(--col-person, 0px) minmax(0, 1fr) 84px 96px 44px;
+    grid-template-columns: 44px 52px minmax(0, 2fr) var(--col-person, 0px) minmax(0, 1fr) 104px 96px 44px;
   }
   body.is-admin .rows { --col-person: minmax(0, 1fr); }
   .rows .exp > .thumb, .rows .exp > .thumb-none { width: 44px; height: 44px; grid-column: 1; grid-row: 1; }
