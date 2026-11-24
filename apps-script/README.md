@@ -287,6 +287,11 @@ JSON API・CSV が返すキー名は英語のまま固定なので、分析ツ�
 | 領収書ファイルID | `imageFileId` | 同 ファイルID |
 | 申請者ID | `applicantId` | ユーザーID（権限フィルタに使用） |
 | 事業部 | `department` | |
+| 支払区分 | `payment` | `立替`（本人へ精算）／`会社払い`。空（古い行）は立替。スタッフの申請は常に立替 |
+| 定期経費ID | `recurringId` | 定期経費から自動で計上した行だけに入る |
+| 金額未確定 | `estimated` | ドル払いの定期経費を目安の円で計上した行は `未確定`。管理者が金額を直すと消える |
+
+（最後の3列は 2.6.0 で追加。下の運賃照合の7列より**右**にあります。）
 
 この表の右側に、`fareFrom`(出発駅) / `fareTo`(到着駅) / `fareRound`(往復) /
 `fareTrips`(回数) / `fareUnit`(片道運賃) / `fareExpected`(想定金額) / `fareCheck`(運賃照合)
@@ -295,7 +300,9 @@ JSON API・CSV が返すキー名は英語のまま固定なので、分析ツ�
 
 このほか **ユーザー**（`username, displayName, passwordHash, salt, role, active,
 createdAt, department`。`department` は `人材,BAR` のようにカンマ区切りで複数持てます）と
-**事業部マスタ** のシートが同じスプレッドシートに作成されます。
+**事業部マスタ**・**よく使う申請**・**定期経費** のシートが同じスプレッドシートに作成されます。
+定期経費の「計上済みの月」は、どの月まで自動で計上したかの記録です（ここを消すと、
+開始月からもう一度計上されます）。
 
 > **使われなくなったタブ**
 > 過去の版で作られた **運賃マスタ**・**AI学習ログ**・**PL連携マッピング**・
@@ -360,6 +367,13 @@ createdAt, department`。`department` は `人材,BAR` のようにカンマ区�
     / `{action:"deleteTemplate", token, id}` … よく使う申請の登録・上書き・削除（本人の分だけ。
     1人20件まで。同じ内容は重ねない）。どちらも本人の `templates` を返す。
     `bootstrap` も `templates` を返す
+  - `{action:"listRecurring", token}` / `{action:"saveRecurring", token, item:{id?, name, amount,
+    currency:"JPY"|"USD", foreignAmount?, department, category, payDay, startMonth, endMonth?, owner?}}` /
+    `{action:"deleteRecurring", token, id}` … 定期経費（サブスクなど会社払い）の一覧・登録・削除
+    （admin のみ）。保存すると支払日を過ぎた月の分をすぐに計上し、`posted` で返す。
+    `bootstrap` / `list` も、その日に初めて呼ばれたときに計上する
+  - `{action:"updateAmount", token, id, amount}` … 金額を直して「金額未確定」を消す
+    （ドル払いの確定用。admin のみ）
   - `{action:"delete", token, id}` … 取消（user は自分の申請だけ、admin は全件。
     画像もゴミ箱へ）
   - `{action:"analyzeReceipt", token, imageBase64, imageMime}` … AIレシート解析

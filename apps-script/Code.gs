@@ -68,6 +68,10 @@ const EXPENSE_COLUMNS = [
   ["fareUnit", "片道運賃"],
   ["fareExpected", "想定金額"],
   ["fareCheck", "運賃照合"],
+  // 2.6.0 で追加（列は位置で読み書きするので、必ず末尾に足す）
+  ["payment", "支払区分"], // 立替（本人へ精算）／会社払い（カード・引き落とし）。空は立替
+  ["recurringId", "定期経費ID"], // 定期経費から自動で計上した行だけに入る
+  ["estimated", "金額未確定"], // ドル払いなど、目安の金額で計上した行は「未確定」
 ];
 const HEADERS = EXPENSE_COLUMNS.map(function (c) {
   return c[0];
@@ -112,6 +116,34 @@ const TEMPLATE_HEADERS = TEMPLATE_COLUMNS.map(function (c) {
 const TEMPLATES_MAX = 20;
 /** まとめて申請（createMany）で一度に受け付ける件数の上限（1か月分） */
 const CREATE_MANY_MAX = 31;
+
+/**
+ * 定期経費（サブスクなど会社が払うもの）。管理者が登録し、毎月の支払日を過ぎたら
+ * 会社払いの申請として自動で計上する。ドル払いは目安の円で計上し「未確定」を付ける。
+ */
+const RECURRING_SHEET = "定期経費";
+const RECURRING_COLUMNS = [
+  ["id", "登録ID"],
+  ["name", "サービス名"],
+  ["category", "科目"],
+  ["amount", "金額（円・目安）"],
+  ["currency", "通貨"], // JPY / USD
+  ["foreignAmount", "外貨金額"],
+  ["department", "事業部"],
+  ["payDay", "支払日"],
+  ["startMonth", "開始月"],
+  ["endMonth", "終了月"],
+  ["owner", "担当者"],
+  ["lastPosted", "計上済みの月"],
+  ["createdAt", "登録日時"],
+];
+const RECURRING_HEADERS = RECURRING_COLUMNS.map(function (c) {
+  return c[0];
+});
+/** 何か月も誰も開かなかったときに、さかのぼって計上する上限 */
+const RECURRING_CATCHUP_MAX = 12;
+const PAYMENT_ADVANCE = "立替";
+const PAYMENT_COMPANY = "会社払い";
 
 const DEPARTMENTS_SHEET = "事業部マスタ";
 const DEPARTMENTS_SHEET_LEGACY = "departments";
@@ -235,7 +267,7 @@ function getUsersSheet_() {
 /**
  * シート名・見出しの定義の版。ここを変えると次のリクエストで全シートを移行する。
  */
-const SCHEMA_VERSION = "2026-11-ja-3"; // よく使う申請のシートを追加
+const SCHEMA_VERSION = "2026-11-ja-4"; // 支払区分・定期経費の列とシートを追加
 
 /**
  * 全シートのタブ名と見出しを現在の定義に揃える。
@@ -261,6 +293,11 @@ function migrateSheets() {
   getUsersSheet_();
   getDepartmentsSheet_();
   getTemplatesSheet_();
+  getRecurringSheet_();
+}
+
+function getRecurringSheet_() {
+  return ensureSheet_(RECURRING_SHEET, RECURRING_COLUMNS);
 }
 
 function getTemplatesSheet_() {
@@ -961,6 +998,7 @@ function statusPayload_() {
       list: true, // 月ごとの一覧
       accessCode: true, // 利用コードでのログイン
       templates: true, // よく使う申請・まとめて申請
+      recurring: true, // 支払区分・定期経費・金額の確定
     },
   };
 }
@@ -990,6 +1028,7 @@ function actionBootstrap_(body) {
     department: String(u.department || ""), // requireUser_ が読み取り済み
   };
   out.departments = listDepartments_();
+  postRecurringSafe_(); // 支払日を過ぎた定期経費を計上してから一覧を読む（1日1回だけ見る）
   out.records = recordsForUser_(u, body.month);
   try {
     out.templates = templatesFor_(u.username); // よく使う申請（別の往復にしない）
@@ -1022,6 +1061,7 @@ function doPost(e) {
       // 月ごとの一覧（軽量版）。月を切り替えたときに、その月の分だけ取得する
       case "list": {
         const u = requireUser_(body.token, false);
+        postRecurringSafe_();
         return json_({
           ok: true,
           month: normalizeMonth_(body.month),
@@ -1069,6 +1109,15 @@ function doPost(e) {
         return json_(actionSaveTemplate_(body));
       case "deleteTemplate":
         return json_(actionDeleteTemplate_(body));
+      // ---- 定期経費・金額の確定（管理者のみ） ----
+      case "listRecurring":
+        return json_(actionListRecurring_(body));
+      case "saveRecurring":
+        return json_(actionSaveRecurring_(body));
+      case "deleteRecurring":
+        return json_(actionDeleteRecurring_(body));
+      case "updateAmount":
+        return json_(actionUpdateAmount_(body));
       default:
         return json_({ ok: false, error: "unknown action" });
     }
@@ -1173,6 +1222,9 @@ function buildExpense_(record, user, withImage) {
     imageFileId: imageFileId,
     applicantId: applicantId,
     department: department,
+    // スタッフの申請は常に立替（選ばせない）。会社払いを付けられるのは管理者だけ
+    payment:
+      user.role === "admin" && record.payment === PAYMENT_COMPANY ? PAYMENT_COMPANY : PAYMENT_ADVANCE,
   };
   return rec;
 }
@@ -1279,6 +1331,251 @@ function actionDeleteTemplate_(body) {
   return { ok: true, templates: templatesFor_(u.username) };
 }
 
+/* ==================== 定期経費（サブスクなど会社払い） ==================== */
+
+/** シートが "2026-04" を日付に変えてしまった場合も含めて、"yyyy-MM" に戻す */
+function monthText_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM");
+  const t = String(v == null ? "" : v).replace(/^'/, "").trim();
+  return normalizeMonth_(t.slice(0, 7));
+}
+
+/** 月を n か月ずらす（"2026-12" + 1 → "2027-01"） */
+function addMonths_(month, n) {
+  const y = Number(month.slice(0, 4));
+  const m = Number(month.slice(5, 7)) - 1 + n;
+  const yy = y + Math.floor(m / 12);
+  const mm = ((m % 12) + 12) % 12;
+  return yy + "-" + String(mm + 1).padStart(2, "0");
+}
+
+/** その月の支払日（31日払いを2月に計上するときは月末にする） */
+function payDate_(month, payDay) {
+  const y = Number(month.slice(0, 4));
+  const m = Number(month.slice(5, 7));
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const d = Math.min(Math.max(Number(payDay) || 1, 1), last);
+  return month + "-" + String(d).padStart(2, "0");
+}
+
+function readRecurring_() {
+  const values = getRecurringSheet_().getDataRange().getValues();
+  if (values.length < 2) return [];
+  const head = headerKeys_(values[0], RECURRING_COLUMNS);
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    if (!values[i][0]) continue;
+    const t = { _row: i + 1 };
+    head.forEach(function (h, j) {
+      t[h] = values[i][j];
+    });
+    ["startMonth", "endMonth", "lastPosted"].forEach(function (k) {
+      t[k] = monthText_(t[k]);
+    });
+    out.push(t);
+  }
+  return out;
+}
+
+function publicRecurring_(t) {
+  return {
+    id: String(t.id),
+    name: String(t.name || ""),
+    category: String(t.category || ""),
+    amount: Number(t.amount) || 0,
+    currency: String(t.currency || "JPY"),
+    foreignAmount: Number(t.foreignAmount) || 0,
+    department: String(t.department || ""),
+    payDay: Number(t.payDay) || 1,
+    startMonth: t.startMonth,
+    endMonth: t.endMonth,
+    owner: String(t.owner || ""),
+    lastPosted: t.lastPosted,
+  };
+}
+
+/** シートへ書く1行。月は文字列のまま残す（' を付けないと日付に変わる） */
+function recurringRow_(t) {
+  return RECURRING_HEADERS.map(function (h) {
+    const v = t[h] === undefined || t[h] === null ? "" : t[h];
+    return /Month$|^lastPosted$/.test(h) && v ? "'" + v : v;
+  });
+}
+
+/** 定期経費から作る1か月分の申請（会社払い。申請者IDは空なのでスタッフには見えない） */
+function recurringExpense_(t, month) {
+  const usd = String(t.currency) === "USD";
+  return {
+    id: "r-" + t.id + "-" + month,
+    createdAt: new Date().toISOString(),
+    applicant: "定期経費",
+    date: payDate_(month, t.payDay),
+    category: String(t.category || ""),
+    vendor: String(t.name || ""),
+    amount: Math.round(Number(t.amount) || 0),
+    description: usd ? "US$" + Number(t.foreignAmount || 0) + "（目安の円換算）" : "",
+    status: "approved",
+    reviewedAt: new Date().toISOString(),
+    reviewer: "自動計上",
+    reviewComment: "",
+    imageUrl: "",
+    imageFileId: "",
+    applicantId: "",
+    department: String(t.department || ""),
+    payment: PAYMENT_COMPANY,
+    recurringId: String(t.id),
+    estimated: usd ? "未確定" : "",
+  };
+}
+
+/**
+ * 支払日を過ぎた月の分を計上する。どこまで計上したかは定期経費の行（計上済みの月）に
+ * 持つので、経費データを読み直さずに二重計上を防げる。同時に2つの要求が来ても重ならない
+ * ようにロックを取る。普段は1日1回だけシートを見る（opts.force で必ず見る）。
+ */
+function postRecurring_(opts) {
+  opts = opts || {};
+  const props = PropertiesService.getScriptProperties();
+  const today = opts.today || todayStr_();
+  if (!opts.force && props.getProperty("RECURRING_CHECKED") === today) return [];
+  const lock = typeof LockService !== "undefined" ? LockService.getScriptLock() : null;
+  if (lock && !lock.tryLock(10000)) return [];
+  try {
+    if (!opts.force && props.getProperty("RECURRING_CHECKED") === today) return [];
+    const sheet = getRecurringSheet_();
+    const posted = [];
+    const thisMonth = today.slice(0, 7);
+    readRecurring_().forEach(function (t) {
+      if (!t.startMonth) return;
+      let m = t.lastPosted ? addMonths_(t.lastPosted, 1) : t.startMonth;
+      if (m < t.startMonth) m = t.startMonth;
+      // 長く誰も開かなかったときも、さかのぼるのは上限まで
+      const oldest = addMonths_(thisMonth, -(RECURRING_CATCHUP_MAX - 1));
+      if (m < oldest) m = oldest;
+      let last = "";
+      while (m <= thisMonth && (!t.endMonth || m <= t.endMonth)) {
+        if (payDate_(m, t.payDay) > today) break; // 支払日がまだ来ていない
+        posted.push(recurringExpense_(t, m));
+        last = m;
+        m = addMonths_(m, 1);
+      }
+      if (last) {
+        sheet.getRange(t._row, RECURRING_HEADERS.indexOf("lastPosted") + 1).setValue("'" + last);
+      }
+    });
+    if (posted.length) {
+      const exp = getSheet_();
+      const rows = posted.map(expenseRow_);
+      exp.getRange(exp.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
+    }
+    props.setProperty("RECURRING_CHECKED", today);
+    return posted;
+  } finally {
+    if (lock) lock.releaseLock();
+  }
+}
+
+/** 計上に失敗しても、起動や一覧の取得は落とさない */
+function postRecurringSafe_() {
+  try {
+    return postRecurring_();
+  } catch (err) {
+    return [];
+  }
+}
+
+function actionListRecurring_(body) {
+  requireUser_(body.token, true);
+  return { ok: true, recurring: readRecurring_().map(publicRecurring_) };
+}
+
+/**
+ * 登録・更新（管理者のみ）。id があれば上書き。保存したらすぐに計上を見直し、
+ * 計上した申請を返す（画面は一覧を取り直さずに、それを加える）。
+ */
+function actionSaveRecurring_(body) {
+  requireUser_(body.token, true);
+  const t = body.item || {};
+  const name = String(t.name || "").trim().slice(0, 60);
+  if (!name) throw new Error("サービス名を入力してください");
+  const amount = Math.round(Number(t.amount) || 0);
+  if (!(amount > 0)) throw new Error("金額（円）を入力してください");
+  if (RECEIPT_CATEGORIES.indexOf(String(t.category)) < 0) throw new Error("費目を選んでください");
+  const currency = String(t.currency) === "USD" ? "USD" : "JPY";
+  const foreignAmount = currency === "USD" ? Number(t.foreignAmount) || 0 : "";
+  if (currency === "USD" && !(foreignAmount > 0)) throw new Error("ドルの金額を入力してください");
+  const payDay = Math.round(Number(t.payDay) || 0);
+  if (!(payDay >= 1 && payDay <= 31)) throw new Error("支払日は1〜31日で入力してください");
+  const startMonth = normalizeMonth_(t.startMonth);
+  if (!startMonth) throw new Error("開始月を入力してください");
+  const endMonth = normalizeMonth_(t.endMonth);
+  if (endMonth && endMonth < startMonth) throw new Error("終了月が開始月より前です");
+  const rec = {
+    name: name,
+    category: String(t.category),
+    amount: amount,
+    currency: currency,
+    foreignAmount: foreignAmount,
+    department: String(t.department || "").trim(),
+    payDay: payDay,
+    startMonth: startMonth,
+    endMonth: endMonth,
+    owner: String(t.owner || "").trim().slice(0, 40),
+  };
+  const sheet = getRecurringSheet_();
+  const existing = t.id
+    ? readRecurring_().filter(function (x) {
+        return String(x.id) === String(t.id);
+      })[0]
+    : null;
+  if (t.id && !existing) throw new Error("登録が見つかりません");
+  if (existing) {
+    rec.id = String(existing.id);
+    rec.createdAt = existing.createdAt;
+    rec.lastPosted = existing.lastPosted; // 計上済みの月は引き継ぐ（同じ月を二重に計上しない）
+    sheet.getRange(existing._row, 1, 1, RECURRING_HEADERS.length).setValues([recurringRow_(rec)]);
+  } else {
+    rec.id = "s" + Utilities.getUuid().replace(/-/g, "").slice(0, 12);
+    rec.createdAt = new Date().toISOString();
+    rec.lastPosted = "";
+    sheet.appendRow(recurringRow_(rec));
+  }
+  const posted = postRecurring_({ force: true });
+  return { ok: true, recurring: readRecurring_().map(publicRecurring_), posted: posted };
+}
+
+/** 登録の削除（管理者のみ）。計上済みの申請は残る（消すなら一覧から） */
+function actionDeleteRecurring_(body) {
+  requireUser_(body.token, true);
+  const hit = readRecurring_().filter(function (x) {
+    return String(x.id) === String(body.id);
+  })[0];
+  if (hit) getRecurringSheet_().deleteRow(hit._row);
+  return { ok: true, recurring: readRecurring_().map(publicRecurring_) };
+}
+
+/**
+ * 金額を直す（管理者のみ）。ドル払いの「未確定」を、カードの明細の円の金額で確定する。
+ * 直すと「未確定」の印は消える。
+ */
+function actionUpdateAmount_(body) {
+  requireUser_(body.token, true);
+  const amount = Math.round(Number(body.amount) || 0);
+  if (!(amount > 0)) throw new Error("金額を入力してください");
+  const sheet = getSheet_();
+  const row = findRow_(sheet, body.id);
+  if (row < 0) throw new Error("申請が見つかりません");
+  sheet.getRange(row, HEADERS.indexOf("amount") + 1).setValue(amount);
+  sheet.getRange(row, HEADERS.indexOf("estimated") + 1).setValue("");
+  const values = sheet.getRange(row, 1, 1, HEADERS.length).getValues()[0];
+  const rec = {};
+  HEADERS.forEach(function (h, j) {
+    rec[h] = normalizeValue_(h, values[j]);
+  });
+  rec.amount = Number(rec.amount) || 0;
+  return { ok: true, record: rec };
+}
+
 function deleteExpense_(id, user) {
   const sheet = getSheet_();
   const row = findRow_(sheet, id);
@@ -1309,7 +1606,7 @@ function deleteExpense_(id, user) {
 /* ========================= AIレシート解析 ========================= */
 
 const RECEIPT_CATEGORIES = [
-  "交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "その他",
+  "交通費", "交際費", "会議費", "消耗品費", "通信費", "宿泊費", "システム利用料", "その他",
 ];
 
 /** 今日の日付（JST等スクリプトTZ）をプロンプトに渡すためのヘルパ */
